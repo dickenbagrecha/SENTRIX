@@ -81,11 +81,14 @@ On a native Windows host without Linux kernel namespaces / cgroups, live untrust
 ## 3. NEXUS Security Assessment Methodology
 
 ### Scope & Target Files
-The NEXUS platform was assessed using source-first static code review against:
-- `tests/mock-target/server.js` (The operational NEXUS staging gateway and endpoint controller)
-- `deploy/docker/docker-compose.nexus.yml` (The multi-service orchestration manifest)
+The architectural patterns were evaluated using source-first inspection against:
+- `tests/mock-target/server.js` (The SENTRIX synthetic multi-tenant test target simulating NEXUS architecture)
+- `deploy/docker/docker-compose.nexus.yml` (The illustrative multi-service orchestration manifest)
 - `deploy/docker/Dockerfile.nexus-backend` (Container build posture)
 - `documentation/NEXUS-DEPLOYMENT-RUNBOOK.md` & `PHASE-6-ADVANCED-NEXUS-SECURITY-ASSESSMENT.md`
+
+> [!NOTE]
+> **Synthetic Target Distinction:** `tests/mock-target/server.js` is SENTRIX's controlled synthetic test target designed to evaluate vulnerability patterns and verification mechanisms. It must not be conflated with the genuine, proprietary NEXUS application repository.
 
 ### Synthetic Identities & Data Boundaries
 All tests, traces, and exploit perspectives relied exclusively on synthetic, non-production test personas:
@@ -117,32 +120,29 @@ No customer data was accessed, no production systems were targeted, and no destr
 
 ---
 
-## 5. Mapping to SENTRIX Vulnerability Remediation Lifecycle
+## 5. Mapping to SENTRIX 9-Stage Vulnerability Remediation Lifecycle
 
-SENTRIX implements a 9-stage vulnerability management and remediation verification lifecycle. Findings discovered via the Cloudflare skill directly feed into this pipeline:
+SENTRIX implements the 9-stage vulnerability remediation lifecycle defined in `core/pkg/models/vulnerability.go` (`Detected` → `Confirmed` → `Reported` → `Assigned` → `Fix In Progress` → `Fixed` → `Retesting` → `Verified` → `Closed`):
 
 ```
-[ 1. Ingestion ] ---> [ 2. Deduplication ] ---> [ 3. SCSE Normalization ]
-                                                          |
-                                                          v
-[ 6. Advisory ] <--- [ 5. Verification Plan ] <--- [ 4. Severity Scoring ]
-       |
-       v
-[ 7. Fix Implementation ] ---> [ 8. Regression Suite ] ---> [ 9. Resolution ]
+[ 1. Detected ] ──> [ 2. Confirmed ] ──> [ 3. Reported ] ──> [ 4. Assigned ]
+                                                                     │
+                                                                     ▼
+[ 8. Verified ] <── [ 7. Retesting ] <── [ 6. Fixed ] <── [ 5. Fix In Progress ]
+       │
+       ▼
+[ 9. Closed ]
 ```
 
-1. **Stage 1 — Ingestion:** The Cloudflare `findings.json` artifact is ingested via the SENTRIX Core ingestion API (`POST /api/v1/findings/import`).
-2. **Stage 2 — Deduplication & Fingerprinting:** The Cloudflare `fingerprint` (e.g. `nexus.idor.conversation.leak`) serves as the deterministic idempotency key, preventing duplicate tickets when re-auditing successive code commits.
-3. **Stage 3 — SCSE Event Normalization:** Finding objects are mapped into SENTRIX Common Security Event (SCSE) format v1.0.0, capturing source coordinates, timestamps, target endpoints, and evidence payloads.
-4. **Stage 4 — Severity Scoring:** Confirmed findings map Cloudflare impact and likelihood ranks directly to CVSS v3.1 base scores:
-   - Critical: Score 9.0–10.0 (IDOR, Privilege Escalation, Zip Bomb, Root Container)
-   - High: Score 7.0–8.9 (Prompt Injection, Citation Poisoning, Stored XSS, Session Replay)
-   - Medium: Score 4.0–6.9 (Race Conditions, Cache Collision)
-5. **Stage 5 — Verification Planning:** Candidates with `needs_validation` verdict utilize the validation plans defined in [`NEEDS-VALIDATION.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/NEEDS-VALIDATION.md) to generate automated test runner templates.
-6. **Stage 6 — Security Advisory Generation:** Concrete code diffs from [`FINDINGS-DETAIL.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/FINDINGS-DETAIL.md) are bundled into actionable developer remediations.
-7. **Stage 7 — Fix Implementation:** Developers apply code patches to `tests/mock-target/server.js` or production microservices.
-8. **Stage 8 — Regression Testing:** SENTRIX Core executes the synthetic test suite against the target in `secure` mode (`http://localhost:9500/?mode=secure`).
-9. **Stage 9 — Closure & Verification:** The finding status transitions from `OPEN` -> `VERIFYING` -> `RESOLVED` in SENTRIX, and the Cloudflare ledger records the unit as `covered`.
+1. **Stage 1 — Detected:** The Cloudflare `findings.json` artifact captures initial detections with source coordinates, request parameters, and response samples. *(Note: Direct REST endpoint `POST /api/v1/findings/import` is a proposed interface; findings are currently ingested via direct JSON import or normalized via `POST /api/v1/events/normalize`)*.
+2. **Stage 2 — Confirmed:** Deterministic verification proves exploitability on synthetic target (e.g. `nexus.idor.conversation.leak` confirmed via cross-tenant response match).
+3. **Stage 3 — Reported:** Finding details are compiled into structured developer markdown advisories via `GET /api/v1/findings/:id/report` with redacted technical evidence.
+4. **Stage 4 — Assigned:** Finding is routed to development owners with associated regression scenario ID (`ADV-IDOR-01` through `ADV-DEP-01`).
+5. **Stage 5 — Fix In Progress:** Development team begins remediation; regression retests during this stage confirm ongoing vulnerability and prevent premature closure.
+6. **Stage 6 — Fixed:** Remediation diffs (such as those documented in `FINDINGS-DETAIL.md`) are applied to the target codebase.
+7. **Stage 7 — Retesting:** SENTRIX Core executes the automated regression test against the target in secure mode (`POST /api/v1/remediation/retest/:id`).
+8. **Stage 8 — Verified:** Regression retest succeeds with HTTP 403 / sanitized output; status transitions to `Verified`.
+9. **Stage 9 — Closed:** All validation criteria met; finding is formally archived and closed.
 
 ---
 

@@ -1,11 +1,9 @@
-# NEXUS — PRODUCTION-GRADE DEPLOYMENT & OPERATION RUNBOOK
+# NEXUS — Engineering Deployment & Operations Runbook (Illustrative Reference Specification)
 
-**Target Platform:** NEXUS Enterprise AI Document Intelligence & Retrieval-Augmented Generation (RAG) Platform  
-**Document Type:** Engineering Deployment Runbook & Environment Operations Manual  
-**Author / DevOps Lead:** Antigravity Engineering Team  
-**Primary Recipient:** Nikhil (Lead Developer & Operations Engineer)  
-**Date & Timestamp:** 2026-10-31 03:20 UTC+05:30  
-**Status:** Validated Technical Specification & Deployment Guide  
+> [!IMPORTANT]
+> **Illustrative Architectural Specification:**  
+> This runbook and its accompanying configuration templates represent an **illustrative engineering reference specification** developed to guide staging setups, container architectures, and security assessments. It has been tested against the SENTRIX synthetic multi-tenant target (`tests/mock-target/server.js`).  
+> **These instructions must be adapted and verified against the genuine external NEXUS repository once access is provisioned.**
 
 ---
 
@@ -13,9 +11,9 @@
 
 NEXUS is designed as a secure, multi-tenant enterprise intelligence platform consisting of:
 1. **Frontend:** Modern Single-Page Application (React 18 / Vite / TypeScript / Tailwind CSS).
-2. **Backend API:** High-performance asynchronous API gateway (Python 3.11 / FastAPI or Node.js / Express).
+2. **Backend API:** Asynchronous API gateway (Python 3.11 / FastAPI or Node.js / Express).
 3. **Primary Database:** PostgreSQL 16 with the `pgvector` extension for semantic embedding storage and Row-Level Security (RLS) policies.
-4. **Cache & State Store:** Redis 7 (Alpine) for token blacklisting, session validation, and tenant-scoped caching.
+4. **Cache & State Store:** Redis 7 (Alpine) for token revocation blacklisting, session validation, and tenant-scoped caching.
 5. **Local Inference Engine:** Ollama running quantized embedding models (`nomic-embed-text`) and LLM chat models (`llama3.2:3b` or `mistral:7b`).
 
 ### Minimum Hardware & Environment Requirements
@@ -28,17 +26,31 @@ NEXUS is designed as a secure, multi-tenant enterprise intelligence platform con
   - Node.js v20.x or v22.x LTS & npm v10+
   - Python 3.11+
   - PostgreSQL 16 client tools (`psql`)
-  - `curl` / `git`
+  - `curl` / `git` / `openssl`
 
 ---
 
 ## 2. Environment Configuration (`.env`)
 
-Create `.env` in the NEXUS root directory. Use the following validated template. **Never commit `.env` to source control.**
+Create `.env` in the NEXUS root directory using the template below.  
+**Security Mandatory:** Never commit `.env` or production credentials to source control. Generate cryptographically strong random secrets for all credentials.
 
+### Credential Generation Commands:
+```bash
+# Generate JWT Secret (32 bytes hex):
+openssl rand -hex 32
+
+# Generate Database Password (24 bytes base64):
+openssl rand -base64 24
+
+# Generate Redis Password (24 bytes base64):
+openssl rand -base64 24
+```
+
+### Validated Environment Template:
 ```bash
 # ==============================================================================
-# NEXUS PLATFORM CONFIGURATION (STAGING & PRODUCTION TEMPLATE)
+# NEXUS PLATFORM CONFIGURATION (STAGING TEMPLATE)
 # ==============================================================================
 
 # Application Environment
@@ -50,7 +62,7 @@ HOST=0.0.0.0
 
 # Security & Cryptography
 # Generate via: openssl rand -hex 32
-JWT_SECRET_KEY=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+JWT_SECRET_KEY=${NEXUS_JWT_SECRET}
 JWT_ALGORITHM=HS256
 JWT_EXPIRATION_MINUTES=60
 REFRESH_TOKEN_EXPIRATION_DAYS=7
@@ -60,16 +72,18 @@ DATABASE_HOST=127.0.0.1
 DATABASE_PORT=5432
 DATABASE_NAME=nexus_db
 DATABASE_USER=nexus_user
-DATABASE_PASSWORD=NexusSecureDbPassword2026!
-DATABASE_URL=postgresql://nexus_user:NexusSecureDbPassword2026!@127.0.0.1:5432/nexus_db
+# Generate via: openssl rand -base64 24
+DATABASE_PASSWORD=${NEXUS_DB_PASSWORD}
+DATABASE_URL=postgresql://nexus_user:${NEXUS_DB_PASSWORD}@127.0.0.1:5432/nexus_db
 DATABASE_POOL_SIZE=20
 DATABASE_MAX_OVERFLOW=10
 
 # Redis Cache & Token Revocation
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
-REDIS_PASSWORD=NexusRedisSecurePassword2026!
-REDIS_URL=redis://:NexusRedisSecurePassword2026!@127.0.0.1:6379/0
+# Generate via: openssl rand -base64 24
+REDIS_PASSWORD=${NEXUS_REDIS_PASSWORD}
+REDIS_URL=redis://:${NEXUS_REDIS_PASSWORD}@127.0.0.1:6379/0
 
 # Generative AI & Local Ollama Inference
 OLLAMA_BASE_URL=http://127.0.0.1:11434
@@ -85,7 +99,7 @@ DECOMPRESSION_MAX_RATIO=20
 DECOMPRESSION_MAX_BYTES=52428800 # 50 MB
 
 # SENTRIX Security Auditing Scope Guardrail
-SENTRIX_SCOPE_TOKEN=AUTH-SCOPE-NEXUS-STAGING-CONFIRMED
+SENTRIX_SCOPE_TOKEN=${SENTRIX_SCOPE_TOKEN}
 SENTRIX_ALLOWED_AUDIT_HOSTS=127.0.0.1,localhost,staging.nexus.local
 ```
 
@@ -93,16 +107,16 @@ SENTRIX_ALLOWED_AUDIT_HOSTS=127.0.0.1,localhost,staging.nexus.local
 
 ## 3. Database Setup: PostgreSQL 16 with pgvector & RLS
 
-Execute the following commands to provision the database, install the vector extension, and configure tenant Row-Level Security.
+Execute the following commands to provision the database container with secure environment variables, install the vector extension, and configure tenant Row-Level Security.
 
 ### 3.1 Provision Database Container
 ```bash
 docker run -d \
   --name nexus-postgres \
-  -p 5432:5432 \
+  -p 127.0.0.1:5432:5432 \
   -e POSTGRES_DB=nexus_db \
   -e POSTGRES_USER=nexus_user \
-  -e POSTGRES_PASSWORD=NexusSecureDbPassword2026! \
+  -e POSTGRES_PASSWORD="${NEXUS_DB_PASSWORD}" \
   -v nexus_pgdata:/var/lib/postgresql/data \
   --restart unless-stopped \
   pgvector/pgvector:pg16
@@ -114,7 +128,7 @@ Connect via `psql` and execute the schema initialization script:
 -- Connect to nexus_db
 \c nexus_db;
 
--- 1. Install pgvector extension
+-- 1. Install pgvector and uuid extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -161,15 +175,15 @@ ON CONFLICT (slug) DO NOTHING;
 ```bash
 docker run -d \
   --name nexus-redis \
-  -p 6379:6379 \
+  -p 127.0.0.1:6379:6379 \
   -v nexus_redisdata:/data \
   --restart unless-stopped \
-  redis:7-alpine redis-server --requirepass "NexusRedisSecurePassword2026!" --appendonly yes
+  redis:7-alpine redis-server --requirepass "${NEXUS_REDIS_PASSWORD}" --appendonly yes
 ```
 
 Verify Redis connectivity:
 ```bash
-docker exec -it nexus-redis redis-cli -a "NexusRedisSecurePassword2026!" PING
+docker exec -it nexus-redis redis-cli -a "${NEXUS_REDIS_PASSWORD}" PING
 # Expected response: PONG
 ```
 
@@ -181,7 +195,7 @@ docker exec -it nexus-redis redis-cli -a "NexusRedisSecurePassword2026!" PING
 ```bash
 docker run -d \
   --name nexus-ollama \
-  -p 11434:11434 \
+  -p 127.0.0.1:11434:11434 \
   -v nexus_ollama:/root/.ollama \
   --restart unless-stopped \
   ollama/ollama:latest
@@ -207,9 +221,9 @@ curl -s http://127.0.0.1:11434/api/generate -d '{
 
 ---
 
-## 6. Docker Compose Deployment (Recommended)
+## 6. Illustrative Docker Compose Template
 
-To deploy the entire NEXUS backend stack in a single reproducible command, use `deploy/docker/docker-compose.nexus.yml`:
+Below is the illustrative Compose manifest for staging deployment. Ensure all secrets are passed via `.env`:
 
 ```yaml
 version: '3.8'
@@ -222,7 +236,7 @@ services:
     environment:
       POSTGRES_DB: nexus_db
       POSTGRES_USER: nexus_user
-      POSTGRES_PASSWORD: NexusSecureDbPassword2026!
+      POSTGRES_PASSWORD: ${NEXUS_DB_PASSWORD}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -237,13 +251,13 @@ services:
     image: redis:7-alpine
     container_name: nexus-redis
     restart: unless-stopped
-    command: ["redis-server", "--requirepass", "NexusRedisSecurePassword2026!", "--appendonly", "yes"]
+    command: ["redis-server", "--requirepass", "${NEXUS_REDIS_PASSWORD}", "--appendonly", "yes"]
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "NexusRedisSecurePassword2026!", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${NEXUS_REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -263,6 +277,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.nexus-backend
     container_name: nexus-backend
     restart: unless-stopped
+    user: "10001:10001"
     ports:
       - "9500:9500"
     env_file:
@@ -277,11 +292,6 @@ volumes:
   pgdata:
   redisdata:
   ollamadata:
-```
-
-### Execution Command:
-```bash
-docker compose -f deploy/docker/docker-compose.nexus.yml up -d
 ```
 
 ---
@@ -313,13 +323,11 @@ npm run dev   # Starts dev server on http://localhost:5173
 
 ## 8. Post-Deployment Verification Checklist
 
-Execute these exact verification commands to confirm all NEXUS subsystems are healthy before running SENTRIX security audits:
-
 | Component | Test Command | Expected Output |
 | :--- | :--- | :--- |
 | **API Health** | `curl -i http://127.0.0.1:9500/healthz` | `HTTP/1.1 200 OK` `{"status":"HEALTHY"}` |
 | **PostgreSQL RLS** | `docker exec nexus-postgres psql -U nexus_user -d nexus_db -c "SELECT relname, relrowsecurity FROM pg_class WHERE relname='documents';"` | `documents \| t` |
-| **Redis Auth** | `docker exec nexus-redis redis-cli -a "NexusRedisSecurePassword2026!" ping` | `PONG` |
+| **Redis Auth** | `docker exec nexus-redis redis-cli -a "${NEXUS_REDIS_PASSWORD}" ping` | `PONG` |
 | **Ollama Health** | `curl -s http://127.0.0.1:11434/api/tags` | List of models including `nomic-embed-text` |
 
 ---

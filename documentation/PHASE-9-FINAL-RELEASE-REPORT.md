@@ -6,13 +6,16 @@
 **Handover Recipient:** Nikhil & Engineering Team  
 **Author:** Antigravity Pair-Programming Assistant  
 **Release Date:** 2026-10-31 04:20:00 UTC+05:30  
-**Overall Status:** PRODUCTION READY FOR DEMONSTRATION & CONTINUED DEVELOPMENT  
+**Overall Status:** SENTRIX v0.1.0-alpha — FOR DEVELOPMENT, STAGING, AND DEMONSTRATION USE ONLY (NOT PRODUCTION-CERTIFIED)  
 
 ---
 
 ## 1. Product Overview & Architecture
 
 SENTRIX is an independent, automated security auditing, adversarial testing, vulnerability assessment, reporting, and remediation verification platform. It operates as an external, authorized security evaluator. It is **not** part of any client application's production dependencies.
+
+> [!NOTE]
+> **Synthetic Target Distinction:** All tests, attack simulations, and verification scenarios are executed against the internal SENTRIX synthetic target (`tests/mock-target/server.js`). This target exercises architectural boundaries and vulnerability categories in a controlled test harness. It is **not** the actual, external NEXUS production application.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -113,9 +116,11 @@ HTTP/1.1 403 Forbidden
 
 ## 5. Security Limitations & Known Constraints
 
-1. **Docker Desktop on Windows Host:** Docker Desktop is currently stopped on the Windows host (`Docker Desktop is unable to start`). The platform operates with 100% functional fidelity using native Python and Node.js process runners.
-2. **Mock Engine Designations:** Wazuh (Port 55000) and CrowdSec (Port 8085) are running schema-compliant mock services in this environment. They truthfully report `"is_mock_service": true` via Core telemetry.
-3. **OS-Enforced Sandboxing:** Native Windows lacks kernel namespaces / cgroups. Untrusted binary execution or multi-gigabyte zip decompression should run inside Linux container boundaries.
+1. **Development & Demonstration Status:** SENTRIX v0.1.0-alpha is designed and validated for development, staging, and demonstration environments. It is not production-certified.
+2. **Docker Desktop on Windows Host:** Docker Desktop is currently stopped on the Windows host (`Docker Desktop is unable to start`). The platform operates with 100% functional fidelity using native Python and Node.js process runners.
+3. **Mock Engine Designations:** Wazuh (Port 55000) and CrowdSec (Port 8085) are running schema-compliant mock services in this environment. They truthfully report `"is_mock_service": true` via Core telemetry.
+4. **Cryptographic Authorization & Evidence Bounds:** Scope guardrails and redactions are implemented and verified. Full asymmetric cryptographic HMAC request signing is an architectural specification; current authorization relies on Bearer JWT and scope header enforcement. Evidence logs are kept in-memory with sanitization rather than on immutable hardware.
+5. **OS-Enforced Sandboxing:** Native Windows lacks kernel namespaces / cgroups. Untrusted binary execution or multi-gigabyte zip decompression should run inside Linux container boundaries.
 
 ---
 
