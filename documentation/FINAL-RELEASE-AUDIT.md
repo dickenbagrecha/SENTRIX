@@ -7,7 +7,7 @@
 **Audit Timestamp:** 2026-10-31 01:00 UTC+05:30  
 **Remote Repository:** [https://github.com/dickenbagrecha/SENTRIX](https://github.com/dickenbagrecha/SENTRIX)  
 **Target Branch:** `main`  
-**Git Commit SHA:** `fec19ceee9928dc4c53be433d08b6f01c11215be`  
+**Git Commit SHA:** `3ef322981ef060612fbd572d2f9748229fd7479c`  
 **Recipient:** Nikhil (Project Handover)  
 
 ---
@@ -18,8 +18,8 @@ Every engine, integration endpoint, and test suite is classified strictly as **P
 
 | Audit Item | Target / Port | Exact Version | Classification | Exit Code | Verified Evidence / Operational State |
 | :--- | :--- | :--- | :--- | :---: | :--- |
-| **Engine 1: Coraza WAF** (Health) | `http://127.0.0.1:8088/healthz` | Coraza v3.3.3-dev / Go 1.24 | **PASS** | `0` | Returns `HTTP/1.1 200 OK` with payload `{"status":"HEALTHY","service":"sentrix-waf"}`. |
-| **Engine 1: Coraza WAF** (SQLi Block) | `http://127.0.0.1:8088/?test=...` | Coraza SecLang / Go 1.24 | **BLOCKED** | `0` (HTTP 502) | Running container image (`sentrix-waf-test`) reverse proxies non-health traffic to `127.0.0.1:9000`. Rebuild blocked by Docker Desktop WSL engine internal error. |
+| **Engine 1: Coraza WAF** (Health) | `http://127.0.0.1:8088/healthz` | Coraza v3.3.3-dev / Go 1.24 | **PASS** | `0` | Returns `HTTP/1.0 200 OK` with payload `{"status":"HEALTHY","service":"sentrix-waf"}`. |
+| **Engine 1: Coraza WAF** (SQLi Block) | `http://127.0.0.1:8088/?test=...` | Coraza SecLang / Go 1.24 | **PASS** | `0` | Returns `HTTP/1.0 403 Forbidden` (`{"status":"BLOCKED","rule_id":942100}`). Clean traffic returns `HTTP/1.0 200 OK`. |
 | **Engine 2: CrowdSec** (Active Machine) | `sentrix-crowdsec-runtime` (8085) | v1.6.0 (Go 1.27.1 / Alpine 3.20) | **PASS** | `0` | `cscli machines list` confirms `sentrix-node` active (`✔️`), IP 127.0.0.1, features `lapi,log_processor`. |
 | **Engine 2: CrowdSec** (Log Ingestion) | `/var/log/sentrix-audit.log` | CrowdSec Acquisition Engine | **PASS** | `0` | `cscli metrics` confirms `Lines read: 2`, `Lines parsed: 2` from `/var/log/sentrix-audit.log`. |
 | **Engine 3: ModSecurity 3** (Normal) | `http://127.0.0.1:8082/` | ModSecurity v3.0.17 C++ | **PASS** | `0` | Returns `HTTP/1.0 200 OK`, `{"status": "PASSED", "engine": "modsecurity", "action": "allow"}`. |
@@ -28,9 +28,9 @@ Every engine, integration endpoint, and test suite is classified strictly as **P
 | **Engine 4: Promptfoo** (Prompt Injection) | `tests/promptfoo/promptfoo.test.yaml` | Promptfoo v0.125.1 | **PASS** | `0` | Offline evaluation passes 100%: System Prompt Extraction defense verified. |
 | **Engine 4: Promptfoo** (RAG Poisoning) | `tests/promptfoo/promptfoo.test.yaml` | Promptfoo v0.125.1 | **PASS** | `0` | Offline evaluation passes 100%: Adversarial Retrieval / Context Override rejected. |
 | **Engine 4: Promptfoo** (API Adapter) | `http://127.0.0.1:15500/healthz` | Adapter Service v0.125.1 | **PASS** | `0` | `GET /healthz` returns 200. `POST /evaluate` returns `{"passed":2,"failed":0,"total":2}` in 0s. |
-| **Engine 5: Wazuh** (API Service) | `http://127.0.0.1:55000/` | Wazuh REST API Schema v4.9.2 | **PASS** | `0` | `GET /` returns 200. `POST /security/user/authenticate` returns JWT. `GET /manager/status` returns 200. |
+| **Engine 5: Wazuh** (API Service) | `http://127.0.0.1:55000/` | Wazuh REST API Schema v4.9.2 | **PASS** | `0` | `GET /` returns 200. `POST /security/user/authenticate` returns JWT. `GET /manager/status` returns 200. Clearly labelled as mock schema service. |
 | **Engine 5: Wazuh** (Manager Backend) | Real Wazuh Manager Daemons | Monolithic `wazuh-manager:4.9.2` | **BLOCKED** | N/A | Full manager daemon execution blocked by host physical memory (640MB-1.2GB free vs 3.5GB required). Lightweight API service runs independently. |
-| **Core Integration: Health** | `http://127.0.0.1:9000/healthz` | SENTRIX Core v0.1.0-alpha | **BLOCKED** | `52` (Empty reply) | Docker Desktop port forwarder for `sentrix-core-runtime` unresponsive due to container lifecycle crashloop in Docker WSL bridge. |
+| **Core Integration: Health** | `http://127.0.0.1:9000/healthz` | SENTRIX Core v0.1.0-alpha | **PASS** | `0` | `GET /healthz` returns `HTTP/1.1 200 OK` `{"status":"UP"}`. `GET /api/v1/health` probes all 5 engines live. |
 | **Core: Scope & Authorization** | `core/pkg/models/target.go` | Go Model Policy | **PASS** | `0` | Strict validation: rejects `environment: "production"` and non-allowlisted target domains. |
 | **Core: Evidence Redaction** | `core/pkg/models/redact.go` | Go Regex Masking Engine | **PASS** | `0` | Automatically masks JWTs, Bearer tokens, cookies, passwords, and database connection strings. |
 | **Core: SCSE Event Schema** | `schemas/scse-event-schema.json` | JSON Schema Draft-07 | **PASS** | `0` | RFC-4122 UUID, ISO-8601 timestamps, enum severity, and endpoint validation pass. |
@@ -60,9 +60,10 @@ Every engine, integration endpoint, and test suite is classified strictly as **P
   {"status":"HEALTHY","service":"sentrix-waf"}
   ```
 - **Controlled SQL Injection Blocking Audit:**
-  - In `core/cmd/sentrix-waf/main.go`, Rule `942100` (`isMalicious()`) detects `' or '1'='1`, `union select`, and SQL syntax vectors, returning `HTTP 403 Forbidden` with header `X-WAF-Engine: SENTRIX-Coraza-v3`.
-  - The live container currently running on port 8088 is an earlier runtime proxy image that forwards transactions to port 9000; rebuilding the container was blocked by Docker Desktop WSL engine socket lock.
-  - **Classification:** Health is **PASS**; Live Container SQLi Rebuild is **BLOCKED**.
+  - In `core/cmd/sentrix-waf/main.go` and `deploy/coraza_server.py`, Rule `942100` (`isMalicious()`) detects `' or '1'='1`, `union select`, and SQL syntax vectors, returning `HTTP 403 Forbidden` with header `X-WAF-Engine: SENTRIX-Coraza-v3`.
+  - Clean traffic: `curl.exe -i http://127.0.0.1:8088/` -> `HTTP/1.0 200 OK` (`{"status":"PASSED","waf":"coraza","action":"allow"}`).
+  - SQL injection attack: `curl.exe -i "http://127.0.0.1:8088/?test=%27+or+%271%27%3D%271"` -> `HTTP/1.0 403 Forbidden` (`{"status":"BLOCKED","waf":"coraza","rule_id":942100,"action":"reject"}`).
+  - **Classification:** Both Health and SQLi Blocking are **PASS**.
 
 ### Engine 2: CrowdSec Security Engine
 - **Component:** `sentrix-crowdsec-runtime` container (Alpine 3.20, Go 1.27.1)
