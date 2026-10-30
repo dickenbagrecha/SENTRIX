@@ -1,9 +1,13 @@
 # NEXUS — Engineering Deployment & Operations Runbook (Illustrative Reference Specification)
 
 > [!IMPORTANT]
-> **Illustrative Architectural Specification:**  
-> This runbook and its accompanying configuration templates represent an **illustrative engineering reference specification** developed to guide staging setups, container architectures, and security assessments. It has been tested against the SENTRIX synthetic multi-tenant target (`tests/mock-target/server.js`).  
-> **These instructions must be adapted and verified against the genuine external NEXUS repository once access is provisioned.**
+> **Authoritative NEXUS Repository & Deployment Reference:**  
+> The authoritative NEXUS application repository is located at **`https://github.com/NikhilMana/NEXUS`** (default branch: `main`).  
+> **Current Assessment Baseline Commit:** [`cb24f5caf980a513f2e76decedac0021ef7dea35`](https://github.com/NikhilMana/NEXUS/commit/cb24f5caf980a513f2e76decedac0021ef7dea35).  
+> 
+> This runbook and its accompanying configuration templates provide an engineering deployment specification for setting up and validating the platform stack.  
+> - **Source-Code Inspection vs. Dynamic Staging Validation:** A comprehensive security audit requires inspecting the real NEXUS source tree (backend, frontend, database migrations, Docker configuration, and tests). Synthetic-target findings (`tests/mock-target/server.js`) are illustrative evaluation benchmarks and must **not** be transferred into NEXUS as confirmed vulnerabilities.  
+> - **Separate Runtime Tasks:** Real NEXUS staging deployment, PostgreSQL RLS connection pool verification, and GPU token flooding load tests remain separate staging execution tasks.
 
 ---
 

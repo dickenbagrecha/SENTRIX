@@ -112,6 +112,9 @@ The documentation integrity pass modified or created the following files:
 
 ## 4. Unresolved Blockers & Handover Readiness
 
-- **Host Docker Desktop:** Docker Desktop remains unable to start on this Windows workstation (`Docker Desktop is unable to start`). The entire platform operates with 100% functional fidelity using native Python and Node.js process runners.
-- **Real NEXUS Repository Access:** Staging deployment and live audits against the genuine NEXUS codebase await provisioning of access to the external repository.
+- **Host Docker Desktop:** Docker Desktop remains unable to start on this Windows workstation (`Docker Desktop is unable to start`). The entire platform operates with 100% functional fidelity using native Python and Node.js process runners (`deploy/coraza_server.py`, `deploy/modsec_server.py`, `tests/promptfoo/adapter_server.js`, `deploy/wazuh_api_service.py`, `deploy/crowdsec_server.py`, `deploy/core_server.js`).
+- **Authoritative NEXUS Repository Access:** The genuine NEXUS application repository is now confirmed and available at **[`https://github.com/NikhilMana/NEXUS`](https://github.com/NikhilMana/NEXUS)** (default branch: `main`). The current assessment baseline commit retrieved from GitHub is **[`cb24f5caf980a513f2e76decedac0021ef7dea35`](https://github.com/NikhilMana/NEXUS/commit/cb24f5caf980a513f2e76decedac0021ef7dea35)**.
+  - An authentic NEXUS source audit must directly inspect the real backend, frontend, database schema/migrations, Docker configurations, and test suites across this repository.
+  - Synthetic-target findings (`tests/mock-target/server.js`) are illustrative evaluation benchmarks and must **not** be transferred into NEXUS as confirmed vulnerabilities.
+  - Dynamic staging validation (PostgreSQL RLS connection pooling and GPU token flooding load tests) remains a separate staging runtime task.
 - **Handover Readiness:** **100% READY.** All tests pass, all reports are reconciled, and documentation integrity is verified.

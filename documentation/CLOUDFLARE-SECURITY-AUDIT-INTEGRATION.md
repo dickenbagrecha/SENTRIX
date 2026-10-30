@@ -80,6 +80,11 @@ On a native Windows host without Linux kernel namespaces / cgroups, live untrust
 
 ## 3. NEXUS Security Assessment Methodology
 
+### Authoritative Target Repository
+- **Authoritative Repository URL:** [`https://github.com/NikhilMana/NEXUS`](https://github.com/NikhilMana/NEXUS)
+- **Default Branch:** `main`
+- **Assessment Baseline Commit:** [`cb24f5caf980a513f2e76decedac0021ef7dea35`](https://github.com/NikhilMana/NEXUS/commit/cb24f5caf980a513f2e76decedac0021ef7dea35)
+
 ### Scope & Target Files
 The architectural patterns were evaluated using source-first inspection against:
 - `tests/mock-target/server.js` (The SENTRIX synthetic multi-tenant test target simulating NEXUS architecture)
@@ -88,7 +93,7 @@ The architectural patterns were evaluated using source-first inspection against:
 - `documentation/NEXUS-DEPLOYMENT-RUNBOOK.md` & `PHASE-6-ADVANCED-NEXUS-SECURITY-ASSESSMENT.md`
 
 > [!NOTE]
-> **Synthetic Target Distinction:** `tests/mock-target/server.js` is SENTRIX's controlled synthetic test target designed to evaluate vulnerability patterns and verification mechanisms. It must not be conflated with the genuine, proprietary NEXUS application repository.
+> **Synthetic Target Distinction:** `tests/mock-target/server.js` is SENTRIX's controlled synthetic test target designed to evaluate vulnerability patterns and verification mechanisms. Findings discovered against the synthetic target serve as illustrative architectural benchmarks and must **not** be transferred into the genuine NEXUS repository as confirmed vulnerabilities. A true NEXUS audit must directly inspect the real backend, frontend, database migrations, Docker manifests, and tests in `https://github.com/NikhilMana/NEXUS`.
 
 ### Synthetic Identities & Data Boundaries
 All tests, traces, and exploit perspectives relied exclusively on synthetic, non-production test personas:
@@ -189,11 +194,12 @@ node tests/mock-target/test-runner.js --mode secure
 ---
 
 ## 7. Next Actions for Nikhil
-
-1. **Immediate Code Remediation:**
-   - Apply the code patches detailed in [`FINDINGS-DETAIL.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/FINDINGS-DETAIL.md) for the 4 Critical vulnerabilities (`nexus.idor.conversation.leak`, `nexus.auth.privilege.escalation`, `nexus.parser.zip.bomb`, `nexus.container.root.posture`).
-2. **Staging Environment Validation:**
-   - Follow [`NEEDS-VALIDATION.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/NEEDS-VALIDATION.md) to provision a test PostgreSQL 16 instance and verify connection pool RLS reset behavior.
-   - Run the Ollama prompt size limit test on staging GPU hardware.
+ 
+1. **Independent Source Code Audit of NEXUS:**
+   - With the genuine NEXUS repository available at [`https://github.com/NikhilMana/NEXUS`](https://github.com/NikhilMana/NEXUS) (`main`, baseline `cb24f5caf980a513f2e76decedac0021ef7dea35`), perform an independent read-only source inspection across the actual backend, frontend, database models, Docker manifests, and test suites.
+   - Use the 12 advanced security requirements as the evaluation checklist. Do **not** transfer synthetic-target findings as assumed vulnerabilities without source-grounded verification.
+2. **Staging Environment Validation (Separate Runtime Task):**
+   - Real staging validation, PostgreSQL RLS connection pool verification, and GPU token flooding load tests remain separate staging execution tasks.
+   - Follow [`NEEDS-VALIDATION.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/NEEDS-VALIDATION.md) when staging hardware and container clusters are provisioned.
 3. **Automated CI Integration:**
    - Add `node assessments/nexus-security-audit/run-validator.cjs` to the GitHub Actions CI pipeline to ensure any newly added findings strictly conform to the Cloudflare schema.

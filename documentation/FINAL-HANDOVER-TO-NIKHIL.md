@@ -15,10 +15,11 @@
 Nikhil, this document is the definitive technical handover manual for the SENTRIX platform. It consolidates all engineering deliverables, architecture specifications, test suites, engine integrations, and operational runbooks into a single authoritative guide.
 
 ### Key Architectural Truths & Scope Enforcements
-1. **Target Distinction:** All adversarial tests, finding lifecycles, and automated evaluations were executed against the internal **SENTRIX Synthetic Multi-Tenant Staging Target** (`tests/mock-target/server.js`). This synthetic target exercises architectural boundaries and vulnerability classes in a controlled test harness. It is **not** the actual, proprietary NEXUS production application.
-2. **Product Independence:** SENTRIX is an external automated security auditing and remediation platform. It does not alter client architectures or inject itself into client runtime dependencies.
-3. **Cloudflare Security Audit Skill Decoupling:** The official Cloudflare Security Audit Skill is installed globally in the user's Antigravity AI-agent environment (`~/.agents/skills/security-audit`). It is **not** a dependency of SENTRIX, **not** copied into `engines/`, and **not** coupled to the SENTRIX runtime core.
-4. **Development Alpha Posture:** SENTRIX v0.1.0-alpha is fully stabilized for development, staging, and demonstration purposes. It is **not** certified for unconstrained production use.
+1. **Authoritative NEXUS Repository Access:** The genuine NEXUS application repository is available at **[`https://github.com/NikhilMana/NEXUS`](https://github.com/NikhilMana/NEXUS)** (default branch: `main`). The current assessment baseline commit is **[`cb24f5caf980a513f2e76decedac0021ef7dea35`](https://github.com/NikhilMana/NEXUS/commit/cb24f5caf980a513f2e76decedac0021ef7dea35)**.
+2. **Target Distinction:** All adversarial tests, finding lifecycles, and automated evaluations were executed against the internal **SENTRIX Synthetic Multi-Tenant Staging Target** (`tests/mock-target/server.js`). This synthetic target exercises architectural boundaries and vulnerability classes in a controlled test harness. It is **not** the actual, proprietary NEXUS production application. Synthetic-target findings must **not** be transferred into NEXUS as confirmed vulnerabilities.
+3. **Product Independence:** SENTRIX is an external automated security auditing and remediation platform. It does not alter client architectures or inject itself into client runtime dependencies.
+4. **Cloudflare Security Audit Skill Decoupling:** The official Cloudflare Security Audit Skill is installed globally in the user's Antigravity AI-agent environment (`~/.agents/skills/security-audit`). It is **not** a dependency of SENTRIX, **not** copied into `engines/`, and **not** coupled to the SENTRIX runtime core.
+5. **Development Alpha Posture:** SENTRIX v0.1.0-alpha is fully stabilized for development, staging, and demonstration purposes. It is **not** certified for unconstrained production use.
 
 ---
 
@@ -155,7 +156,15 @@ node assessments/nexus-security-audit/run-validator.cjs
 
 ## 7. Next Actions for Nikhil
 
-1. **NEXUS Repository Integration:** When access to the genuine NEXUS repository is available, register its staging endpoint with SENTRIX via `POST /api/v1/audits/run` (`{"base_url": "http://staging.nexus.internal:9500", "environment": "staging"}`).
-2. **Apply Architectural Remediations:** Utilize the concrete code diffs cataloged in [`assessments/nexus-security-audit/FINDINGS-DETAIL.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/FINDINGS-DETAIL.md) to harden NEXUS against IDOR, privilege escalation, and prompt injection.
-3. **Deploy Staging Validation:** Follow the validation procedures in [`assessments/nexus-security-audit/NEEDS-VALIDATION.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/NEEDS-VALIDATION.md) on staging hardware with PostgreSQL RLS connection poolers and local GPU inference.
-4. **Git Repository Status:** The repository on branch `main` at `https://github.com/dickenbagrecha/SENTRIX.git` is clean, synchronized, and ready for development.
+1. **Independent Source Code Audit of NEXUS:**
+   - Access the genuine NEXUS repository at [`https://github.com/NikhilMana/NEXUS`](https://github.com/NikhilMana/NEXUS) (default branch `main`, assessment baseline commit [`cb24f5caf980a513f2e76decedac0021ef7dea35`](https://github.com/NikhilMana/NEXUS/commit/cb24f5caf980a513f2e76decedac0021ef7dea35)).
+   - Conduct an independent source inspection of the real backend, frontend, database models, Docker configuration, and test suites.
+2. **Assessment Checklist & Finding Disambiguation:**
+   - Utilize the 12 advanced security requirements as the authoritative assessment checklist.
+   - Do **not** transfer synthetic-target findings into NEXUS as assumed vulnerabilities.
+   - Do **not** directly apply mock-target patches without source-grounded verification against the real NEXUS codebase.
+3. **Staging Environment Validation (Separate Runtime Task):**
+   - Real NEXUS staging validation, PostgreSQL RLS connection pool verification, and GPU token flooding load tests remain separate staging execution tasks.
+   - Follow [`assessments/nexus-security-audit/NEEDS-VALIDATION.md`](file:///c:/DICKEN-BAGRECHA/Local%20Disk%20%28D%29/Projects/SENTRIX/assessments/nexus-security-audit/NEEDS-VALIDATION.md) when staging hardware and container clusters are provisioned.
+4. **Git Repository Status:**
+   - The SENTRIX repository on branch `main` at `https://github.com/dickenbagrecha/SENTRIX.git` is clean, synchronized, and ready for development.
