@@ -34,8 +34,8 @@ const ENGINES = {
     type: 'crowdsec',
     url: 'http://127.0.0.1:8085/v1/heartbeat',
     enabled: true,
-    is_mock: false,
-    label: 'CrowdSec Security Engine LAPI (Port 8085)'
+    is_mock: true,
+    label: 'CrowdSec Security Engine LAPI (Port 8085 - Mock/Schema Service)'
   },
   modsecurity: {
     name: 'modsecurity',
