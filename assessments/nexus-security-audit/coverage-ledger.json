@@ -1,0 +1,602 @@
+[
+  {
+    "coverage_id": "GET%20%2Fapi%2Fv1%2Fcache%2Ftenant-summary::Cache%20Namespace%20Isolation::Redis%20Cache%20Layer::Cross-Tenant%20Information%20Disclosure",
+    "canonical_refs": {
+      "surface": "GET /api/v1/cache/tenant-summary",
+      "boundary": "Cache Namespace Isolation",
+      "subsystem": "Redis Cache Layer",
+      "attack_class": "Cross-Tenant Information Disclosure"
+    },
+    "surface": "GET /api/v1/cache/tenant-summary",
+    "boundary": "Cache Namespace Isolation",
+    "subsystem": "Redis Cache Layer",
+    "attack_class": "Cross-Tenant Information Disclosure",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "DATA-ISOLATION-AND-LIFECYCLE.md#Multi-Tenant Isolation",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Cross-Tenant Information Disclosure via Unnamespaced Cache Keys: Cache lookups utilize global static keys, allowing Tenant Alpha to retrieve executive analytics cached by Tenant Beta.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.cache.namespace.collision"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "GET%20%2Fapi%2Fv1%2Fconversations%2F%3Aid::Object-Level%20Tenant%20Authorization::Conversation%20History%20Store::Insecure%20Direct%20Object%20Reference%20%28IDOR%29",
+    "canonical_refs": {
+      "surface": "GET /api/v1/conversations/:id",
+      "boundary": "Object-Level Tenant Authorization",
+      "subsystem": "Conversation History Store",
+      "attack_class": "Insecure Direct Object Reference (IDOR)"
+    },
+    "surface": "GET /api/v1/conversations/:id",
+    "boundary": "Object-Level Tenant Authorization",
+    "subsystem": "Conversation History Store",
+    "attack_class": "Insecure Direct Object Reference (IDOR)",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "ATTACK-CLASSES.md#Insecure Direct Object References",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Insecure Direct Object Reference Exposing Foreign Tenant Conversation Transcripts: An authenticated user belonging to Tenant Alpha can retrieve confidential conversation history belonging to Tenant Beta by supplying Tenant Beta ident",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.idor.conversation.leak"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "GET%20%2Fapi%2Fv1%2Fdatabase%2Ftenant-records::Row-Level%20Security%20Session%20Binding::PostgreSQL%20Connection%20Pooling::Multi-Tenant%20Database%20Bypass",
+    "canonical_refs": {
+      "surface": "GET /api/v1/database/tenant-records",
+      "boundary": "Row-Level Security Session Binding",
+      "subsystem": "PostgreSQL Connection Pooling",
+      "attack_class": "Multi-Tenant Database Bypass"
+    },
+    "surface": "GET /api/v1/database/tenant-records",
+    "boundary": "Row-Level Security Session Binding",
+    "subsystem": "PostgreSQL Connection Pooling",
+    "attack_class": "Multi-Tenant Database Bypass",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "DATA-ISOLATION-AND-LIFECYCLE.md#Database RLS",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "PostgreSQL Row-Level Security Isolation Bypass in Connection Pooling: Cross-tenant record leakage may occur if asynchronous database connection poolers reuse connection threads without resetting app.current_tenant_id ses",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.db.rls.bypass"
+    ],
+    "unresolved": [
+      "Requires live deployment/hardware environment for dynamic confirmation."
+    ]
+  },
+  {
+    "coverage_id": "POST%20%2Fapi%2Fv1%2Fassistant%2Fchat-stream::Inference%20Input%20Size%20Enforcement::Ollama%20LLM%20Gateway::Denial%20of%20Service%20via%20Token%20Flooding",
+    "canonical_refs": {
+      "surface": "POST /api/v1/assistant/chat-stream",
+      "boundary": "Inference Input Size Enforcement",
+      "subsystem": "Ollama LLM Gateway",
+      "attack_class": "Denial of Service via Token Flooding"
+    },
+    "surface": "POST /api/v1/assistant/chat-stream",
+    "boundary": "Inference Input Size Enforcement",
+    "subsystem": "Ollama LLM Gateway",
+    "attack_class": "Denial of Service via Token Flooding",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "RESOURCE-EXHAUSTION-AND-AVAILABILITY.md#Resource Exhaustion",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "LLM Inference Denial of Service via Massive Token Flooding: Submitting oversized prompts (e.g., 50,000+ characters) causes GPU out-of-memory or excessive thread blocking if input character limits are not enforc",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.llm.token.flooding"
+    ],
+    "unresolved": [
+      "Requires live deployment/hardware environment for dynamic confirmation."
+    ]
+  },
+  {
+    "coverage_id": "POST%20%2Fapi%2Fv1%2Fassistant%2Fchat::Output%20Encoding%20and%20Sanitization::AI%20Assistant%20Frontend%20Gateway::Cross-Site%20Scripting%20%28XSS%29",
+    "canonical_refs": {
+      "surface": "POST /api/v1/assistant/chat",
+      "boundary": "Output Encoding and Sanitization",
+      "subsystem": "AI Assistant Frontend Gateway",
+      "attack_class": "Cross-Site Scripting (XSS)"
+    },
+    "surface": "POST /api/v1/assistant/chat",
+    "boundary": "Output Encoding and Sanitization",
+    "subsystem": "AI Assistant Frontend Gateway",
+    "attack_class": "Cross-Site Scripting (XSS)",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "CLIENT-SIDE.md#Cross-Site Scripting",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Reflected Cross-Site Scripting (XSS) via Unsanitized LLM Markdown Output: Assistant output returns raw script and event handler tags without contextual HTML escaping, enabling client-side code execution.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.ai.output.xss"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "POST%20%2Fapi%2Fv1%2Fauth%2Flogout::Session%20Lifecycle%20and%20Token%20Revocation::Authentication%20Service::Session%20Hijacking%20%2F%20Replay",
+    "canonical_refs": {
+      "surface": "POST /api/v1/auth/logout",
+      "boundary": "Session Lifecycle and Token Revocation",
+      "subsystem": "Authentication Service",
+      "attack_class": "Session Hijacking / Replay"
+    },
+    "surface": "POST /api/v1/auth/logout",
+    "boundary": "Session Lifecycle and Token Revocation",
+    "subsystem": "Authentication Service",
+    "attack_class": "Session Hijacking / Replay",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "WEB-PROTOCOL-AND-AUTH.md#Session Security",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Post-Logout Session Hijacking via Missing JWT Revocation Blacklist: Tokens remain valid and accepted after user logout because the backend relies solely on stateless JWT expiration without querying a revocation store.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.auth.session.replay"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "POST%20%2Fapi%2Fv1%2Fdocuments%2Fapprove::Atomic%20State%20Transitions::Document%20Workflow%20Service::Race%20Condition%20%2F%20State%20Desynchronization",
+    "canonical_refs": {
+      "surface": "POST /api/v1/documents/approve",
+      "boundary": "Atomic State Transitions",
+      "subsystem": "Document Workflow Service",
+      "attack_class": "Race Condition / State Desynchronization"
+    },
+    "surface": "POST /api/v1/documents/approve",
+    "boundary": "Atomic State Transitions",
+    "subsystem": "Document Workflow Service",
+    "attack_class": "Race Condition / State Desynchronization",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "RESOURCE-EXHAUSTION-AND-AVAILABILITY.md#Race Conditions",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Race Condition in Concurrent Document Approval State Transitions: Parallel requests to approve a document both succeed without serialization, causing duplicate approvals and inconsistent workflow state.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.concurrency.race.condition"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "POST%20%2Fapi%2Fv1%2Fdocuments%2Farchive-extract::Decompression%20Ratio%20and%20Size%20Limits::Archive%20Ingestion%20Pipeline::Uncontrolled%20Resource%20Consumption%20%28Zip%20Bomb%29",
+    "canonical_refs": {
+      "surface": "POST /api/v1/documents/archive-extract",
+      "boundary": "Decompression Ratio and Size Limits",
+      "subsystem": "Archive Ingestion Pipeline",
+      "attack_class": "Uncontrolled Resource Consumption (Zip Bomb)"
+    },
+    "surface": "POST /api/v1/documents/archive-extract",
+    "boundary": "Decompression Ratio and Size Limits",
+    "subsystem": "Archive Ingestion Pipeline",
+    "attack_class": "Uncontrolled Resource Consumption (Zip Bomb)",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "RESOURCE-EXHAUSTION-AND-AVAILABILITY.md#Decompression Bombs",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Denial of Service via Unrestricted Archive Decompression Ratio: Document ingestion attempts decompression of zip archives without enforcing compression ratio or uncompressed byte bounds.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.parser.zip.bomb"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "POST%20%2Fapi%2Fv1%2Fdocuments%2Fupload::Content%20Ingestion%20Prompt%20Isolation::RAG%20Document%20Parser::Indirect%20Prompt%20Injection",
+    "canonical_refs": {
+      "surface": "POST /api/v1/documents/upload",
+      "boundary": "Content Ingestion Prompt Isolation",
+      "subsystem": "RAG Document Parser",
+      "attack_class": "Indirect Prompt Injection"
+    },
+    "surface": "POST /api/v1/documents/upload",
+    "boundary": "Content Ingestion Prompt Isolation",
+    "subsystem": "RAG Document Parser",
+    "attack_class": "Indirect Prompt Injection",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "AI-AND-LLM.md#Indirect Prompt Injection",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Indirect Prompt Injection via Ingested Document Content: Document parser processes untrusted instructions embedded in synthetic PDF text as system control directives rather than passive data.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.ai.prompt.injection"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "POST%20%2Fapi%2Fv1%2Frag%2Fretrieve::Cryptographic%20Chunk%20Provenance::Vector%20Retrieval%20Engine::RAG%20Data%20Poisoning%20%2F%20Citation%20Tampering",
+    "canonical_refs": {
+      "surface": "POST /api/v1/rag/retrieve",
+      "boundary": "Cryptographic Chunk Provenance",
+      "subsystem": "Vector Retrieval Engine",
+      "attack_class": "RAG Data Poisoning / Citation Tampering"
+    },
+    "surface": "POST /api/v1/rag/retrieve",
+    "boundary": "Cryptographic Chunk Provenance",
+    "subsystem": "Vector Retrieval Engine",
+    "attack_class": "RAG Data Poisoning / Citation Tampering",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "AI-AND-LLM.md#RAG Integrity",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "RAG Data Poisoning and Citation Authenticity Bypass: The RAG pipeline retrieves and cites unauthenticated, poisoned vector chunks without verifying tenant cryptographic provenance.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.rag.citation.poisoning"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "PUT%20%2Fapi%2Fv1%2Ftenants%2Fconfig::Role-Based%20Access%20Control::Tenant%20Management%20API::Privilege%20Escalation",
+    "canonical_refs": {
+      "surface": "PUT /api/v1/tenants/config",
+      "boundary": "Role-Based Access Control",
+      "subsystem": "Tenant Management API",
+      "attack_class": "Privilege Escalation"
+    },
+    "surface": "PUT /api/v1/tenants/config",
+    "boundary": "Role-Based Access Control",
+    "subsystem": "Tenant Management API",
+    "attack_class": "Privilege Escalation",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "ATTACK-CLASSES.md#Privilege Escalation",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Privilege Escalation via Missing Role-Based Authorization on Tenant Configuration: A standard employee user can modify tenant security policies and enable unrestricted data export due to missing server-side role validation.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.auth.privilege.escalation"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  },
+  {
+    "coverage_id": "deploy%2Fdocker%2Fdocker-compose.nexus.yml::Least%20Privilege%20Container%20Execution::Deployment%20Infrastructure::Privileged%20Container%20Execution",
+    "canonical_refs": {
+      "surface": "deploy/docker/docker-compose.nexus.yml",
+      "boundary": "Least Privilege Container Execution",
+      "subsystem": "Deployment Infrastructure",
+      "attack_class": "Privileged Container Execution"
+    },
+    "surface": "deploy/docker/docker-compose.nexus.yml",
+    "boundary": "Least Privilege Container Execution",
+    "subsystem": "Deployment Infrastructure",
+    "attack_class": "Privileged Container Execution",
+    "starting_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "ordinary_attack_class_block": "CLOUD-AND-DEPLOYMENT.md#Container Hardening",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [
+      {
+        "block": "SUPPLY-CHAIN-AND-RELEASE.md#Dependency Integrity",
+        "reason": "Static source analysis focuses on application logic and control flow rather than package manager lockfiles."
+      }
+    ],
+    "prior_status": "new",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "antigravity-auditor",
+    "reviewed_paths": [
+      "tests/mock-target/server.js"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "antigravity-auditor",
+        "reviewed_paths": [
+          "tests/mock-target/server.js"
+        ],
+        "invariant": "Target boundary must enforce strict authorization, tenant segregation, input validation, and secure defaults.",
+        "method": "source",
+        "result": "Container Execution Running Under Privileged Root User: Container image lacks a non-root USER instruction, causing application processes to run with full root UID 0 privileges inside the container namespace",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "nexus.container.root.posture"
+    ],
+    "unresolved": [
+      "Confirmed via deterministic source inspection of code path in tests/mock-target/server.js."
+    ]
+  }
+]
