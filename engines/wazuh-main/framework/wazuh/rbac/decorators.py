@@ -1,0 +1,1115 @@
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+import logging
+import re
+from collections import defaultdict
+from functools import wraps
+from typing import Awaitable, Any
+
+from wazuh.core.agent import get_agents_info, get_groups, expand_group
+from wazuh.core.common import rbac, broadcast, cluster_nodes, current_user
+from wazuh.core.exception import WazuhInternalError, WazuhPermissionError
+from wazuh.core.results import AbstractWazuhResult, AffectedItemsWazuhResult
+from wazuh.rbac.orm import RolesManager, PoliciesManager, AuthenticationManager, RulesManager
+from wazuh.rbac.utils import INTEGER_RESOURCES, canonical_id
+
+SENSITIVE_FIELD_PATHS = ("authd.pass", "cluster.key")
+# Credential fields masked at any depth, since each module nests them differently
+SENSITIVE_FIELD_NAMES = ("access_key", "secret_key", "application_key", "account_key", "client_secret", "api_key",
+                         "hook_url", "api_token", "secret_value", "shared_key", "password", "haproxy_password",
+                         "client_cert_password")
+
+MASK_DEFAULT = "*****"
+
+# The API's logger, as wazuh.rbac.orm already does: an audit line about something served over the API
+# belongs in the API log, next to the request line that carries the endpoint and the caller's address.
+logger = logging.getLogger("wazuh-api")
+
+# ... except that this module also runs inside wazuh-manager-clusterd, which configures 'wazuh' and
+# not 'wazuh-api': see _audit_logger().
+framework_logger = logging.getLogger("wazuh")
+
+# Node this process answers for, resolved once on first use. Deliberately lazy: wazuh.core.cluster
+# reads the configuration, and the RBAC decorators are imported long before that is wanted.
+_node_id = None
+
+integer_resources = list(INTEGER_RESOURCES)
+
+
+def _expand_resource(resource: str) -> set:
+    """Expand a specified resource depending on its type.
+
+    Parameters
+    ----------
+    resource : str
+        Resource to be expanded.
+
+    Returns
+    -------
+    set
+        Result of the resource expansion.
+    """
+    name, attribute, value = resource.split(':')
+    resource_type = ':'.join([name, attribute])
+
+    # We need to transform the wildcard * to the resource of the system
+    if value == '*':
+        if resource_type == 'agent:id' or resource_type == 'agent:group':
+            return get_agents_info()
+        elif resource_type == 'group:id':
+            return get_groups()
+        elif resource_type == 'role:id':
+            with RolesManager() as rm:
+                roles = rm.get_roles()
+            return {str(role_id.id) for role_id in roles}
+        elif resource_type == 'policy:id':
+            with PoliciesManager() as pm:
+                policies = pm.get_policies()
+            return {str(policy_id.id) for policy_id in policies}
+        elif resource_type == 'user:id':
+            users_system = set()
+            with AuthenticationManager() as auth:
+                users = auth.get_users()
+            for user in users:
+                users_system.add(str(user['user_id']))
+            return users_system
+        elif resource_type == 'rule:id':
+            with RulesManager() as rum:
+                rules = rum.get_rules()
+            return {str(rule_id.id) for rule_id in rules}
+        elif resource_type == 'node:id':
+            return set(cluster_nodes.get())
+        elif resource_type == '*:*':  # Resourceless
+            return {'*'}
+        return set()
+    else:
+        if resource_type == 'agent:group':
+            return expand_group(value)
+
+        # We return the value casted to set
+        return {value}
+
+
+def _combination_defined_rbac(needed_resources: list, user_resources: str) -> bool:
+    """This function avoids that the combinations of resources are processed as individuals resources.
+
+    Parameters
+    ----------
+    needed_resources : list
+        These are the needed resources for the framework's function.
+    user_resources : str
+        These are the user's resources for the actions.
+
+    Returns
+    -------
+    bool
+        True if the resource combination matches with the required resource combination, False otherwise.
+    """
+    for needed_resource in needed_resources:
+        split_needed_resource = needed_resource.split('&')
+        split_user_resource = user_resources.split('&')
+        if len(split_user_resource) != len(split_needed_resource):
+            return False
+        counter = 0
+        for index, element in enumerate(split_needed_resource):
+            user_resource_identifier = ':'.join(split_user_resource[index].split(':')[:-1])
+            needed_resource_identifier = ':'.join(split_needed_resource[index].split(':')[:-1])
+            if user_resource_identifier != needed_resource_identifier:  # Not the same resource
+                return False
+            # * wildcard founded in RBAC permissions for the required resource
+            if split_user_resource[index].split(':')[-1] == '*':
+                counter += 1
+            else:
+                if split_user_resource[index] == element or element.split(':')[-1] == '*':
+                    counter += 1
+                else:
+                    break
+
+        return counter == len(split_needed_resource)
+    return False
+
+
+def _optimize_resources(req_resources: list) -> defaultdict:
+    """This function creates an optimized data structure for an easier processing.
+    Example:
+        ["node:id:master-node",            {
+        "node:id:worker1",         -->         "node:id": {"master", "worker1", "worker2"}
+        "node:id:worker2"]                 }
+
+    Parameters
+    ----------
+    req_resources : list
+        Resource to be optimized.
+
+    Returns
+    -------
+    defaultdict
+        Returns the result of the resource expansion.
+    """
+    resources_value_odict = defaultdict(set)
+    for element in req_resources:
+        resources_value_odict[':'.join(element.split(':')[:-1])].add(element.split(':')[-1])
+
+    return resources_value_odict
+
+
+def _black_expansion(req_resources: list, final_user_permissions: dict):
+    """If RBAC policies is empty and the RBAC's mode is black, we have the permission over the required resource,
+    or if we can't expand the resource, the action is resourceless.
+
+    Parameters
+    ----------
+    req_resources : list
+        Required resource for the framework's function.
+    final_user_permissions : dict
+        Final user's permissions after processing the combinations of resources.
+    """
+    for req_resource in req_resources:
+        split_combination = req_resource.split('&')
+        for chunk in split_combination:
+            identifier = ':'.join(chunk.split(':')[:-1])
+            # Modify the identifier agent:group by agent:id in the resources required by the system
+            if identifier == 'agent:group':
+                identifier = 'agent:id'
+            if identifier == '*:*':
+                final_user_permissions['*:*'] = {'*'}
+            else:
+                expanded_resource = _expand_resource(chunk)
+                final_user_permissions[identifier].update(expanded_resource)
+
+
+def _process_effect(effect: str, identifier: str, value: str, final_user_permissions: dict, expanded_resource: set):
+    """This function will add or remove resources from the final permissions depending on the effect of the permission.
+
+    Parameters
+    ----------
+    effect : str
+        Allow or Deny.
+    identifier: str
+        Resource identifier. Ex: "node:id"
+    value : str
+        Value of the resource. Ex: "master-node"
+    final_user_permissions : dict
+        Dictionary that contains the user's final permissions.
+    expanded_resource : set
+        The expansion of the user_resource. Ex: Value= "*" -> ["mater-node", "worker1", "worker2"]
+    """
+    if effect == 'allow':
+        if value == '*':
+            final_user_permissions[identifier].update(expanded_resource)
+        else:
+            final_user_permissions[identifier].update(expanded_resource.intersection({value}))
+    else:
+        if value == '*':
+            final_user_permissions[identifier].difference_update(expanded_resource)
+        else:
+            final_user_permissions[identifier].difference_update(expanded_resource.intersection({value}))
+
+
+def _single_processor(req_resources: list, user_permissions_for_resource: dict, final_user_permissions: dict):
+    """This function processes the individual resources.
+
+    Parameters
+    ----------
+    req_resources : list
+        Required resource for the framework's function.
+    user_permissions_for_resource : dict
+        User's defined resources in his RBAC permissions.
+    final_user_permissions : dict
+        Final user's permissions after processing the combinations of resources
+    """
+    req_resources = _optimize_resources(req_resources)
+    for user_resource, user_resource_effect in user_permissions_for_resource.items():
+        # Skip combined resources
+        if '&' in user_resource:
+            continue
+        user_resource_identifier = ':'.join(user_resource.split(':')[:-1])
+        # Modify the identifier agent:group by agent:id in the user's resources
+        if user_resource_identifier == 'agent:group':
+            user_resource_identifier = 'agent:id'
+        wildcard_expansion = user_resource.split(':')[-1] == '*'
+        expanded_resource = _expand_resource(user_resource)
+        for value in req_resources.get(user_resource_identifier, list()):
+            if wildcard_expansion and value != '*':
+                expanded_resource |= _expand_resource(user_resource_identifier + ':' + value)
+            _process_effect(user_resource_effect, user_resource_identifier,
+                            value, final_user_permissions, expanded_resource)
+
+
+def _combination_processor(req_resources: list, user_permissions_for_resource: dict, final_user_permissions: dict):
+    """This function processes the combinations of resources.
+    Checks how the API is currently running and depending on the API and the resources defined for the user, will return
+    a dictionary with the final permissions.
+
+    Parameters
+    ---------
+    req_resources : list
+        Required resource for the framework's function.
+    user_permissions_for_resource : dict
+        User's defined resources in his RBAC permissions.
+    final_user_permissions : dict
+        Final user's permissions after processing the combinations of resources.
+    """
+    for user_resource, user_resource_effect in user_permissions_for_resource.items():
+        # _combination_defined_rbac: This function prevents pairs from being treated individually
+        if _combination_defined_rbac(req_resources, user_resource):
+            split_user_resource = user_resource.split('&')
+            for req_resource in req_resources:  # Normally this loop will iterate two times
+                for r, split_req_resource in zip(split_user_resource, req_resource.split('&')):
+                    split_chunk_resource = split_req_resource.split(':')
+                    identifier = ':'.join(split_chunk_resource[:-1])
+                    value = split_chunk_resource[-1]
+                    expanded_resource = _expand_resource(r)
+                    if r.split(':')[-1] == '*':
+                        expanded_resource |= _expand_resource(identifier + ':' + value)
+                    _process_effect(user_resource_effect, identifier,
+                                    value, final_user_permissions, expanded_resource)
+
+
+def _match_permissions(req_permissions: dict = None, rbac_mode: str = 'white') -> dict:
+    """Try to match function required permissions against user permissions to allow or deny execution.
+
+    Parameters
+    ----------
+    req_permissions : dict
+        Required permissions to allow function execution.
+    rbac_mode : str
+        RBAC mode (white or black).
+
+    Returns
+    -------
+    dict
+        Dictionary with final permissions.
+    """
+    allow_match = defaultdict(set)
+    for req_action, req_resources in req_permissions.items():
+        is_combination = any('&' in req_resource for req_resource in req_resources)
+        rbac_mode == 'black' and _black_expansion(req_resources, allow_match)
+        if not is_combination or len(req_resources) == 0:
+            _single_processor(req_resources, rbac.get().get(req_action, dict()), allow_match)
+        else:
+            _combination_processor(req_resources, rbac.get().get(req_action, dict()), allow_match)
+    return allow_match
+
+
+def _canonicalize_dynamic_ids(resources: list, kwargs: dict):
+    """Rewrite in place every dynamic resource id in kwargs to its canonical spelling.
+
+    RBAC compares ids as strings and the framework functions cast them to integers, so both must see
+    the same value: otherwise another spelling `int()` reads as the same id (`01`, `0005`, `5\\n`, a
+    non-ASCII digit) is allowed by a wildcard, missed by a deny
+    written for the canonical id, and then reaches the denied object anyway. Duplicates a list gains
+    this way are dropped, keeping the first occurrence.
+
+    Parameters
+    ----------
+    resources : list
+        List of exposed resources.
+    kwargs : dict
+        Function kwargs holding the dynamic resources.
+    """
+    for resource in resources:
+        for r in resource.split('&'):
+            m = re.search(r'^([a-z*]+:[a-z*]+):{(\w+)}$', r)
+            if m is None or m.group(2) not in kwargs:
+                continue
+            resource_type, param = m.group(1), m.group(2)
+            value = kwargs[param]
+            if isinstance(value, list):
+                kwargs[param] = list(dict.fromkeys(canonical_id(resource_type, v) for v in value))
+            else:
+                kwargs[param] = canonical_id(resource_type, value)
+
+
+def _get_required_permissions(actions: list = None, resources: list = None, **kwargs: dict) -> tuple:
+    """Resource pairs exposed by the framework function
+
+    Parameters
+    ----------
+    actions : list
+        List of exposed actions.
+    resources : list
+        List of exposed resources.
+    kwargs : dict
+        Function kwargs to look for dynamic resources.
+
+    Returns
+    -------
+    tuple
+        Dictionary with required actions as keys and a list of required resources as values
+    """
+    # We expose required resources for the request
+    res_list = list()
+    target_params = dict()
+    add_denied = True
+    combination = False
+    for resource in resources:
+        split_resource = resource.split('&')
+        if len(split_resource) > 1:
+            combination = True
+        for r in split_resource:
+            m = re.search(r'^([a-z*]+:[a-z*]+):([^{\}]+|\*|{(\w+)})$', r)
+            res_base = m.group(1)
+            # If we find a '{' in the regex we obtain the dynamic resource/s
+            if '{' in m.group(2):
+                target_params[m.group(1)] = m.group(3)
+                if m.group(3) in kwargs:
+                    # Dynamic resources ids are found within the {}
+                    params = kwargs[m.group(3)]
+                    # Ids the caller named are explicit whether or not the request is broadcast:
+                    # each one is answered -- denied (4000) or failed with exclude_codes such as
+                    # 1701 -- instead of vanishing. Broadcasting turned that off, so an explicit
+                    # agents_list on the broadcast agent endpoints (restart, reload, upgrade) lost
+                    # its non-existent and denied ids. A broadcast '*' never reaches here: DAPI
+                    # deletes a wildcard agent_list, which takes the KeyError branch below.
+                    if isinstance(params, list):
+                        for param in params:
+                            res_list.append("{0}:{1}".format(res_base, param))
+                        add_denied = True
+                    else:
+                        if params is None or params == '*':
+                            params = '*'
+                        add_denied = True
+                        res_list.append("{0}:{1}".format(res_base, params))
+                # KeyError occurs if required dynamic resources can't be found within request parameters
+                else:
+                    add_denied = False
+                    params = '*'
+                    res_list.append("{0}:{1}".format(res_base, params))
+            # If we don't find a regex match we obtain the static resource/s
+            else:
+                target_params[m.group(1)] = '*'
+                add_denied = not broadcast.get()
+                res_list.append(r)
+    # Create dict of required policies with action: list(resources) pairs
+    req_permissions = dict()
+    for action in actions:
+        if combination:
+            req_permissions[action] = ['&'.join(res_list)]
+        else:
+            req_permissions[action] = res_list
+    return target_params, req_permissions, add_denied
+
+
+def _get_denied(original: dict, allowed: list, target_param: str, res_id: int, resources: list = None) -> set:
+    """This function compares the original kwargs and the processed kwargs, the difference between both should be the
+    denied resources.
+
+    Parameters
+    ----------
+    original : dict
+        The original function's kwargs.
+    allowed : list
+        The processed list of resources after RBAC.
+    target_param : str
+        Element of kwargs that was processed.
+    res_id : int
+        Involved resource.
+    resources : list
+        List of the required resources for the function.
+
+    Returns
+    -------
+    set
+        Difference between the original kwargs and the processed ones.
+    """
+    try:
+        return {original[target_param]} - allowed[res_id]
+    except TypeError:
+        return set(original[target_param]) - allowed[res_id]
+    except KeyError:
+        return {res.split(':')[2] for res in resources} if resources is not None else {}
+
+
+async def async_list_handler(result: Awaitable[Any], **kwargs):
+    """This function makes list_handler async."""
+    result = await result
+    return list_handler(result, **kwargs)
+
+
+def list_handler(result: AffectedItemsWazuhResult, original: dict = None, allowed: dict = None, target: dict = None,
+                 add_denied: bool = False, **post_proc_kwargs: dict) -> AffectedItemsWazuhResult:
+    """Post processor for framework list responses with affected items and optional denied items.
+
+    Parameters
+    ----------
+    result : AffectedItemsWazuhResult
+        Dict with affected_items, failed_items and str_priority.
+    original : dict
+        Original input call parameter values.
+    allowed : dict
+        Allowed input call parameter values.
+    target : dict
+        Name of the input parameters used to calculate resource access.
+    add_denied : bool
+        Flag to add denied permissions to answer.
+    post_proc_kwargs : dict
+        Additional kwargs used in post-processing.
+
+    Returns
+    -------
+    AffectedItemsWazuhResult
+        Framework responses.
+    """
+    if add_denied:
+        for res_id, target_param in target.items():
+            denied = _get_denied(original, allowed, target_param, res_id)
+            if res_id in integer_resources:
+                denied = {int(i) if i.isdigit() else i for i in denied}
+            for denied_item in denied:
+                result.add_failed_item(id_=denied_item,
+                                       error=WazuhPermissionError(4000, extra_message=f'Resource type: {res_id}',
+                                                                  ids=denied))
+    if not add_denied or post_proc_kwargs.get('force'):
+        # Apply post processing exclusion/default values if the main resource was not explicit or
+        # `force` parameter exists in `post_proc_kwargs` and is True
+        if 'default_result_kwargs' in post_proc_kwargs and result is None:
+            return AffectedItemsWazuhResult(**post_proc_kwargs['default_result_kwargs'])
+        if 'exclude_codes' in post_proc_kwargs:
+            result.remove_failed_items(post_proc_kwargs['exclude_codes'])
+
+    return result
+
+
+def expose_resources(actions: list = None, resources: list = None, post_proc_func: callable = list_handler,
+                     post_proc_kwargs: dict = None):
+    """Decorator to apply user permissions on a Wazuh framework function based on exposed action:resource pairs.
+
+    Parameters
+    ----------
+    actions : list
+        List of actions exposed by the framework function.
+    resources : list
+        List of resources exposed by the framework function.
+    post_proc_func : callable
+        Name of the function to use in response post processing.
+    post_proc_kwargs : dict
+        Extra parameters used in post processing.
+
+    Returns
+    -------
+    Allow or deny framework function execution.
+    """
+    if post_proc_kwargs is None:
+        post_proc_kwargs = dict()
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            _canonicalize_dynamic_ids(resources, kwargs)
+            original_kwargs = dict(kwargs)
+            target_params, req_permissions, add_denied = \
+                _get_required_permissions(actions=actions, resources=resources, **kwargs)
+            allow = _match_permissions(req_permissions=req_permissions, rbac_mode=rbac.get()['rbac_mode'])
+            skip_execution = False
+
+            for res_id, target_param in target_params.items():
+                try:
+                    if target_param in original_kwargs and not isinstance(original_kwargs[target_param], list):
+                        if original_kwargs[target_param] is not None:
+                            original_kwargs[target_param] = [original_kwargs[target_param]]
+                    # We don't have any permissions over the required resources
+                    if len(allow[res_id]) == 0 and \
+                            original_kwargs.get(target_param, None) is not None and \
+                            len(original_kwargs[target_param]) != 0:
+                        raise Exception
+                    if target_param != '*':  # No resourceless and not static
+                        if target_param in original_kwargs and original_kwargs[target_param] is not None:
+                            kwargs[target_param] = list(filter(lambda x: x in allow[res_id],
+                                                               original_kwargs[target_param]))
+                        else:
+                            kwargs[target_param] = list(allow[res_id])
+                    elif len(allow[res_id]) == 0:
+                        raise Exception
+                except Exception:
+                    if add_denied:
+                        denied = _get_denied(original_kwargs, allow, target_param, res_id, resources=resources)
+                        if res_id in integer_resources:
+                            denied = {int(i) if i.isdigit() else i for i in denied}
+                        raise WazuhPermissionError(4000,
+                                                   extra_message=f'Resource type: {res_id}',
+                                                   ids=denied, title="Permission Denied")
+                    else:
+                        if target_param != '*':
+                            kwargs[target_param] = list()
+                        else:
+                            skip_execution = True
+
+            # If func is still decorated by expose_resources, do not remove 'call_func'
+            if hasattr(func, '__wrapped__') or kwargs.pop('call_func', True):
+                result = func(*args, **kwargs) if not skip_execution else None
+            else:
+                result = AffectedItemsWazuhResult()
+
+            if post_proc_func is None:
+                return result
+            else:
+                return post_proc_func(result, original=original_kwargs, allowed=allow, target=target_params,
+                                      add_denied=add_denied, **post_proc_kwargs)
+        wrapper.__wazuh_exposed__ = True
+        return wrapper
+
+    return decorator
+
+
+def _local_node_id():
+    """Name of the node this process answers for.
+
+    The same value `wazuh.manager` and `wazuh.cluster` put in their `@expose_resources`, read the
+    same way: the configuration of the node running the code, never the `node_id` of the request,
+    which the master strips before forwarding.
+
+    Returns
+    -------
+    str or None
+        Node name, or None when the cluster configuration cannot be read -- in which case there is
+        no node to check a permission against and the caller masks.
+    """
+    global _node_id
+
+    if _node_id is None:
+        try:
+            from wazuh.core.cluster.cluster import get_node
+            _node_id = get_node().get('node')
+        except Exception as exception:  # pragma: no cover - defensive
+            # Not cached: the next read may well succeed, and until it does the values stay masked
+            # rather than turning a configuration read into an error.
+            _audit_logger().warning(f"Could not resolve the node name to check the read-secrets "
+                                    f"permission against: {exception}")
+            return None
+
+    return _node_id
+
+
+def _audit_logger() -> logging.Logger:
+    """Logger that actually writes in the process the caller landed in.
+
+    `GET /cluster/local/config` is served by the API, but the two node-configuration endpoints are
+    `distributed_master`: they run inside the target node's `wazuh-manager-clusterd`, where
+    'wazuh-api' has no handlers and an INFO record is dropped before reaching a file. An audit line
+    nobody writes is not an audit line, so the disclosure is recorded in `api.log` when the read is
+    local and in `cluster.log` when it was forwarded.
+
+    Returns
+    -------
+    logging.Logger
+        'wazuh-api' in the API, 'wazuh' anywhere else.
+    """
+    return logger if logger.hasHandlers() else framework_logger
+
+
+def require_role_update(role_ids) -> None:
+    """Refuse the request unless the caller holds 'security:update' over every one of the given roles.
+
+    This is the permission `set_user_role` asks for to link a role to a user. An operation that gives
+    an account, or the person operating it, a role by any other road -- turning on its run_as flag,
+    resetting its password -- must ask for the same one, or it is a way around role scoping.
+
+    Resolved with the same matcher `expose_resources` uses, so the RBAC mode and denies are respected.
+    All or nothing: unlike a decorated list, the result is never narrowed to the allowed roles.
+
+    Parameters
+    ----------
+    role_ids : iterable of int
+        IDs of the roles the operation makes reachable.
+
+    Raises
+    ------
+    WazuhPermissionError(4000)
+        If the caller lacks 'security:update' over at least one of the roles, listing the missing ones.
+    """
+    required = {str(role_id) for role_id in role_ids}
+    if not required:
+        return
+
+    permissions = {'security:update': [f'role:id:{role_id}' for role_id in sorted(required)]}
+    allowed = _match_permissions(req_permissions=permissions, rbac_mode=rbac.get()['rbac_mode'])['role:id']
+    denied = required - allowed
+
+    if denied:
+        raise WazuhPermissionError(4000, extra_message='Resource type: role:id',
+                                   ids={int(role_id) for role_id in denied}, title="Permission Denied")
+
+
+def require_every_role_update() -> None:
+    """Refuse the request unless the caller holds 'security:update' over every role, future ones included.
+
+    A run_as login resolves to whatever role a custom rule is linked to when it logs in, not when its
+    flag was enabled, and any role can gain such a rule later (`set_role_rule`). An operation that opens
+    that road can therefore be bounded only by every role, including those not created yet: in white
+    mode that takes an explicit allow on `role:id:*`, and in both modes no deny on an existing role.
+
+    Raises
+    ------
+    WazuhPermissionError(4000)
+        If the caller lacks 'security:update' over an existing role, listing the missing ones, or, in
+        white mode, holds no allow over `role:id:*`.
+    """
+    with RolesManager() as rm:
+        roles = rm.get_roles()
+    require_role_update({role.id for role in roles} if isinstance(roles, list) else set())
+
+    if rbac.get()['rbac_mode'] == 'white' and \
+            rbac.get().get('security:update', dict()).get('role:id:*') != 'allow':
+        raise WazuhPermissionError(4000, extra_message='Resource type: role:id, resource: role:id:*',
+                                   title="Permission Denied")
+
+
+def can_read_secrets() -> bool:
+    """Check whether the current user may read the sensitive configuration values of THIS node in clear.
+
+    A separate action from the update ones on purpose: being allowed to WRITE the configuration used
+    to be enough to read the enrollment password and the cluster key out of it, which made the
+    disclosure a side effect of an unrelated permission.
+
+    Resolved with the same matcher the decorator itself uses, against the node being served, so the
+    answer respects what the rest of RBAC respects: the resource the action was granted on, a later
+    deny over it, and the RBAC mode. Anything else would let a grant on one node uncover the secrets
+    of every other node the caller can reach -- and these endpoints run on the node they answer for.
+
+    Returns
+    -------
+    bool
+        True when the caller holds 'cluster:read_secrets' over this node, False otherwise.
+    """
+    permissions = rbac.get()
+
+    # A context that is not a permission map, or an action that is not a resource->effect one, is a
+    # malformed token: fail closed here rather than raise from inside the matcher.
+    if not isinstance(permissions, dict) or not isinstance(permissions.get('cluster:read_secrets', {}), dict):
+        return False
+
+    node = _local_node_id()
+
+    if node is None:
+        return False
+
+    required = {'cluster:read_secrets': [f'node:id:{node}']}
+
+    return node in _match_permissions(required, permissions.get('rbac_mode', 'black'))['node:id']
+
+
+def _sensitive_paths_in(payload, dotted_path: str) -> bool:
+    """Whether ``dotted_path`` resolves to something inside ``payload``. Read-only twin of
+    `_mask_paths_in_object`, kept next to it so the two cannot drift apart.
+    """
+    if isinstance(payload, str):
+        block_pattern, leaf_pattern = _build_xml_mask_pattern(dotted_path)
+        # A leaf with no closing tag is one `_mask_xml_by_path` leaves as is, so it discloses nothing.
+        blocks = [payload] if block_pattern is None else (m.group(0) for m in block_pattern.finditer(payload))
+        return any(leaf.group(3) is not None for block in blocks for leaf in leaf_pattern.finditer(block))
+    if isinstance(payload, AffectedItemsWazuhResult):
+        return any(_sensitive_paths_in(item, dotted_path) for item in payload.affected_items)
+    if isinstance(payload, list):
+        return any(_sensitive_paths_in(element, dotted_path) for element in payload)
+    if not isinstance(payload, dict):
+        return False
+    if dotted_path in payload:
+        return True
+
+    head, *tail = dotted_path.split('.', 1)
+
+    return head in payload and bool(tail) and _sensitive_paths_in(payload[head], tail[0])
+
+
+def _bare_key_in(payload) -> bool:
+    """Whether the payload carries the literal ``key`` member `_mask_payload` masks on its own.
+
+    Not a dotted path and easy to miss: `GET /cluster/local/config` answers the cluster section as a
+    flat object whose `key` IS the cluster key, so this is the only rule that catches the disclosure
+    the audit line has to record.
+    """
+    if isinstance(payload, AffectedItemsWazuhResult):
+        return any(_bare_key_in(item) for item in payload.affected_items)
+    if isinstance(payload, list):
+        return any(_bare_key_in(element) for element in payload)
+
+    return isinstance(payload, dict) and "key" in payload
+
+
+def _audit_secret_read(payload):
+    """Record that sensitive values were served in clear, naming the fields and never their value.
+
+    Best effort by design: the caller is entitled to the answer, so a failure here must not turn a
+    permitted read into an error. It does have to be visible, hence the warning.
+    """
+    try:
+        disclosed = [path for path in SENSITIVE_FIELD_PATHS if _sensitive_paths_in(payload, path)]
+
+        if _bare_key_in(payload) and "cluster.key" not in disclosed:
+            disclosed.append("cluster.key")
+
+        if disclosed:
+            _audit_logger().info(
+                f"secret_read: user='{current_user.get()}' served in clear: {', '.join(disclosed)}")
+    except Exception as exception:  # pragma: no cover - defensive
+        _audit_logger().warning(f"Could not audit a read of sensitive configuration values: {exception}")
+
+
+def audit_agent_keys_read(agent_ids: list):
+    """Record that agents' pre-shared keys were served in clear, naming the agents and never a key.
+
+    The configuration endpoints get this from `mask_sensitive_config`, which never sees this
+    disclosure: the key endpoint answers with the secret itself instead of a payload to mask. Best
+    effort for the same reason as `_audit_secret_read`: the caller is entitled to the answer, so a
+    failure here must not turn a permitted read into an error.
+
+    Parameters
+    ----------
+    agent_ids : list
+        Agents whose key was served. Nothing is recorded when empty.
+    """
+    try:
+        if agent_ids:
+            _audit_logger().info(f"secret_read: user='{current_user.get()}' served in clear: "
+                                 f"agent.key ({', '.join(agent_ids)})")
+    except Exception as exception:  # pragma: no cover - defensive
+        _audit_logger().warning(f"Could not audit a read of agent keys: {exception}")
+
+
+def _build_xml_mask_pattern(path: str) -> tuple:
+    """Build compiled regex patterns to locate a value in a nested XML structure.
+
+    The dotted ``path`` is converted into a sequence of nested XML tags. The
+    leaf pattern captures three groups:
+
+    - Group 1: the opening tag of the innermost (leaf) element.
+    - Group 2: the text content to be replaced (between the leaf tags).
+    - Group 3: the closing tag of the leaf element.
+
+    The block pattern (``None`` when ``path`` has no ancestor tag) delimits the
+    span of the leaf's immediate container, so every leaf occurrence inside
+    that span can be masked -- not just the first one found in the document.
+
+    Parameters
+    ----------
+    path : str
+        Dotted path representing nested XML tags, e.g. ``"cluster.key"``
+        maps to ``<cluster>...<key>value</key>``.
+
+    Returns
+    -------
+    tuple
+        ``(block_pattern, leaf_pattern)``, both compiled with ``re.DOTALL``
+        (so ``.`` matches newlines) and ``re.IGNORECASE`` (tags are read back
+        case-insensitively, see ``configuration.py``'s ``tag.lower()``).
+        ``block_pattern`` is ``None`` if the path has a single tag.
+    """
+    tags = path.split('.')
+
+    def open_tag(tag: str) -> str:
+        # The XML parser (src/os_xml/os_xml.c) ends an element name on '>' or
+        # any whitespace, so the tag itself may carry attributes there. Like
+        # os_xml, '<' is accepted inside a quoted attribute value but '>' is
+        # not (it ends the tag, so an unclosed quote is an error there);
+        # outside quotes '<' ends the match, which is what keeps a run of
+        # unterminated '<tag ' input from going quadratic.
+        return rf'''<{tag}(?:\s(?:[^<>"']|"[^">]*"|'[^'>]*')*)?>'''
+
+    def close_tag(tag: str) -> str:
+        # load_wazuh_xml (ElementTree), used to read the cluster key, also
+        # tolerates whitespace before the closing '>'.
+        return rf'</{tag}\s*>'
+
+    # A tempered comment body -- "any char that isn't the start of the
+    # closing delimiter" -- so each comment can only end at its own nearest
+    # closing delimiter. A lazy '.*?' here would let a comment's end slide to
+    # any LATER delimiter when the rest of the match fails, and repeating
+    # that ambiguity over N consecutive comments is exponential-backtracking
+    # bait. os_xml (src/os_xml/os_xml.c:_oscomment) closes a comment opened
+    # with '<!' at the first '-->' *or* '!>' it sees, not only the W3C form.
+    comment = r'(?:<!--(?:(?!-->).)*-->|<!(?!--)(?:(?!-->|!>|<!--).)*(?:-->|!>))'
+
+    # A comment can sit between two occurrences of the leaf tag (e.g. an old,
+    # commented-out key left next to the real one) or inside a leaf's own
+    # value; tolerate it in the content so the real value is still found.
+    # os_xml keeps a backslash-escaped '<' as literal text, so it belongs to
+    # the value too, except before '</' (ElementTree, which reads the cluster
+    # key, closes the element there) and '<!' (os_xml still opens a comment).
+    leaf_content = rf'(?:[^<\\]|\\(?!<[/!]).|\\(?=<[/!])|{comment})*'
+    # The close is optional so that a leaf opening with no close consumes its
+    # content once; otherwise every later opening of the leaf inside a comment
+    # or after a backslash rescans that content up to the end of the block.
+    leaf_pattern = re.compile(
+        rf'({open_tag(tags[-1])})({leaf_content})({close_tag(tags[-1])})?', re.DOTALL | re.IGNORECASE
+    )
+
+    block_pattern = None
+    if len(tags) > 1:
+        # The block runs from the first opening tag of the container to the
+        # LAST matching closing tag (or to end of text if there is none).
+        # This scanner cannot tell a real close from a nested container
+        # (e.g. <cluster> inside <nodes>), a stray close, or one inside a
+        # comment/CDATA, so stopping at the first close could leave the real
+        # leaf unmasked. The accepted trade-off is over-masking: a same-named
+        # leaf in another section lying between the two (e.g. <ssl><key>) is
+        # masked too. Only the leaf's immediate container (tags[-2]) anchors
+        # the block.
+        block_pattern = re.compile(
+            open_tag(tags[-2]) + rf'(?:.*{close_tag(tags[-2])}|.*)', re.DOTALL | re.IGNORECASE
+        )
+
+    return block_pattern, leaf_pattern
+
+
+def _mask_xml_by_path(text: str, path: str, mask_text: str) -> str:
+    """Replace every value at a nested XML path with a mask string.
+
+    Builds patterns via `_build_xml_mask_pattern`. When the path has an
+    ancestor tag, every leaf occurrence within each ancestor block is masked
+    (not only the first one in the document); this also covers a leaf tag
+    left duplicated or commented-out next to the real one. If no pattern
+    matches, the original string is returned unchanged.
+
+    Parameters
+    ----------
+    text : str
+        Input XML string to process.
+    path : str
+        Dotted path representing nested XML tags, e.g. ``"cluster.key"``.
+    mask_text : str
+        Replacement string to place between the leaf tags.
+
+    Returns
+    -------
+    str
+        A new string with the matched content replaced by ``mask_text``.
+    """
+    block_pattern, leaf_pattern = _build_xml_mask_pattern(path)
+
+    def replacement(match: re.Match) -> str:
+        # An unclosed leaf is left as is.
+        if match.group(3) is None:
+            return match.group(0)
+        return match.group(1) + mask_text + match.group(3)
+
+    if block_pattern is None:
+        return leaf_pattern.sub(replacement, text)
+
+    return block_pattern.sub(lambda m: leaf_pattern.sub(replacement, m.group(0)), text)
+
+def _mask_all_sensitive_fields(text: str, mask_text: str = "***") -> str:
+    """Apply XML masking for every path in ``SENSITIVE_FIELD_PATHS`` and every tag in ``SENSITIVE_FIELD_NAMES``.
+
+    Iterates over all sensitive field paths and delegates each substitution to
+    `_mask_xml_by_path`, chaining the results so that every sensitive field in
+    the string is masked.
+
+    Parameters
+    ----------
+    text : str
+        Input XML string that may contain one or more sensitive fields.
+    mask_text : str, optional
+        Replacement string for all matched values. Defaults to ``"***"``.
+
+    Returns
+    -------
+    str
+        A new string with all sensitive XML field values replaced by
+        ``mask_text``.
+    """
+    for path in SENSITIVE_FIELD_PATHS + SENSITIVE_FIELD_NAMES:
+        text = _mask_xml_by_path(text, path, mask_text)
+    return text
+
+
+def unmask_xml_by_path(text: str, path: str, value: str, mask_text: str = MASK_DEFAULT) -> str:
+    """Put ``value`` back where `_mask_xml_by_path` left ``mask_text``. Write-side twin of it, kept next to it so the
+    two locate the field with the same pattern.
+
+    A configuration read without the read-secrets action comes back masked; sending it back unchanged must keep the
+    current secret rather than try to store the mask. Only a value that is exactly the mask (surrounding whitespace
+    aside) is replaced, so any other value reaches the caller's checks as written.
+
+    Parameters
+    ----------
+    text : str
+        Input XML string to process.
+    path : str
+        Dotted path representing nested XML tags, e.g. ``"cluster.key"``.
+    value : str
+        Value to restore in place of the mask.
+    mask_text : str, optional
+        Mask to look for. Defaults to `MASK_DEFAULT`.
+
+    Returns
+    -------
+    str
+        A new string with the masked value replaced by ``value``, or the original string when it holds no mask there.
+    """
+    block_pattern, leaf_pattern = _build_xml_mask_pattern(path)
+
+    def restore(match: re.Match) -> str:
+        # An unclosed leaf is left as is, as `_mask_xml_by_path` does.
+        if match.group(3) is None or match.group(2).strip() != mask_text:
+            return match.group(0)
+        return f'{match.group(1)}{value}{match.group(3)}'
+
+    if block_pattern is None:
+        return leaf_pattern.sub(restore, text)
+
+    return block_pattern.sub(lambda m: leaf_pattern.sub(restore, m.group(0)), text)
+
+
+def _mask_paths_in_object(obj, dotted_path: str, mask_text: str):
+    """Mask a value at a dotted path inside dict/list.
+
+    Parameters
+    ----------
+    obj : dict | list
+        Object to process.
+    dotted_path : str
+        Path in dotted notation (e.g. "authd.pass").
+    mask_text : str
+        Replacement text.
+    """
+    if isinstance(obj, dict) and dotted_path in obj:
+        obj[dotted_path] = mask_text
+        return
+    elif isinstance(obj, list):
+        for el in obj:
+            _mask_paths_in_object(el, dotted_path, mask_text)
+        return
+    elif not isinstance(obj, dict):
+        return
+
+    head, *tail = dotted_path.split('.', 1)
+    if head not in obj:
+        return
+    elif not tail:
+        obj[head] = mask_text
+    else:
+        _mask_paths_in_object(obj[head], tail[0], mask_text)
+
+
+def _mask_names_in_object(obj, mask_text: str):
+    """Mask every value whose key is in ``SENSITIVE_FIELD_NAMES``, at any depth of a dict/list, and the sensitive
+    XML fields inside string values.
+
+    Parameters
+    ----------
+    obj : dict | list
+        Object to process.
+    mask_text : str
+        Replacement text.
+    """
+    if isinstance(obj, dict):
+        for name, value in obj.items():
+            if name in SENSITIVE_FIELD_NAMES:
+                obj[name] = mask_text
+            elif isinstance(value, str) and '<' in value:
+                # Embedded XML, such as the files packed in merged.mg
+                obj[name] = _mask_all_sensitive_fields(value, mask_text)
+            else:
+                _mask_names_in_object(value, mask_text)
+    elif isinstance(obj, list):
+        for i, el in enumerate(obj):
+            if isinstance(el, str) and '<' in el:
+                obj[i] = _mask_all_sensitive_fields(el, mask_text)
+            else:
+                _mask_names_in_object(el, mask_text)
+
+
+def _mask_payload(payload, mask_text: str = MASK_DEFAULT):
+    """
+    Recursively mask sensitive data in a payload in-place.
+
+    The function traverses dictionaries, lists, AffectedItemsWazuhResult and
+    WazuhResult objects, applying masking to:
+    - Paths defined in the global `SENSITIVE_FIELD_PATHS` (via `_mask_paths_in_object`).
+    - Keys named in the global `SENSITIVE_FIELD_NAMES`, at any depth (via `_mask_names_in_object`).
+    - The literal key ``'key'`` (its value is replaced entirely by `mask`).
+    - Any string element that matches the XML pattern handled by `_mask_xml_string`
+      (the content between `<key>` tags is replaced by `mask`).
+
+    The operation modifies the input object directly; it does not return a value.
+    Unsupported types (e.g., int, str, None) are silently ignored.
+
+    Parameters
+    ----------
+    payload : dict, list, AbstractWazuhResult, or other
+        Data structure to be masked. Only dict, list and AbstractWazuhResult
+        subclasses are processed; other types are ignored.
+    mask : str
+        Replacement text used for all masked values.
+
+    Returns
+    -------
+    None
+    """
+    if isinstance(payload, dict):
+        for path in SENSITIVE_FIELD_PATHS:
+            _mask_paths_in_object(payload, path, mask_text)
+        _mask_names_in_object(payload, mask_text)
+        if "key" in payload:
+            payload["key"] = mask_text
+    elif isinstance(payload, list):
+        for i, item in enumerate(payload):
+            if isinstance(item, str):
+                payload[i] = _mask_all_sensitive_fields(item, mask_text)
+            else:
+                _mask_payload(item, mask_text)
+    elif isinstance(payload, AffectedItemsWazuhResult):
+        for item in payload.affected_items:
+            _mask_payload(item, mask_text)
+    elif isinstance(payload, AbstractWazuhResult):
+        # A WazuhResult is a MutableMapping, not a dict, and carries the configuration under 'data'.
+        # The masking rules apply to that object, never to the envelope holding it.
+        data = payload.get('data')
+        if isinstance(data, str):
+            payload['data'] = _mask_all_sensitive_fields(data, mask_text)
+        else:
+            _mask_payload(data, mask_text)
+
+
+def mask_sensitive_config(mask_text: str = MASK_DEFAULT):
+    """
+    Decorator to mask sensitive fields in config responses for users without the read-secrets action.
+
+    The decorator post‑processes the return value of the wrapped function.
+    - If the user lacks 'cluster:read_secrets' over the node being served, sensitive fields are masked
+      **in‑place** (or for XML strings, a masked copy is created).
+    - If the user holds it, the values are served in clear and the disclosure is audited.
+    - If masking fails, the request fails: a response nobody could mask cannot be claimed to be clean.
+
+    Parameters
+    ----------
+    mask_text : str, optional
+        Replacement text for sensitive values. Defaults to `MASK_DEFAULT`.
+
+    Returns
+    -------
+    callable
+        Decorated function that applies masking when necessary.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+
+            # Only the read-secrets action over THIS node lifts the mask; update-config no longer does.
+            if can_read_secrets():
+                _audit_secret_read(result)
+                return result
+
+            try:
+                if isinstance(result, str):
+                    string_wrapper = [result]
+                    _mask_payload(string_wrapper, mask_text=mask_text)
+                    result = string_wrapper[0]
+                else:
+                    _mask_payload(result, mask_text=mask_text)
+            except Exception as exception:
+                # Fail closed. Swallowing this used to hand the caller the unmasked payload, which is
+                # the one outcome the masking exists to prevent.
+                _audit_logger().error(f"Could not mask the sensitive configuration values: {exception}")
+                raise WazuhInternalError(
+                    1000, extra_message='the sensitive configuration values could not be masked') from exception
+
+            return result
+
+        return wrapper
+
+    return decorator

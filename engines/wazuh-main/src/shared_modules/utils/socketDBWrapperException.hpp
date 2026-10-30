@@ -1,0 +1,53 @@
+/*
+ * Wazuh Vulnerability scanner
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of either the GNU General Public License, version 2, or
+ * the GNU Affero General Public License, version 3 or (at your option) any
+ * later version, both as published by the Free Software Foundation.
+ *
+ * SPDX-License-Identifier: GPL-2.0-only OR AGPL-3.0-or-later
+ */
+
+#ifndef _WDB_SOCKET_DB_WRAPPER_EXCEPTION_HPP
+#define _WDB_SOCKET_DB_WRAPPER_EXCEPTION_HPP
+
+#include <stdexcept>
+
+/**
+ * @brief SocketDbWrapperException class.
+ *
+ */
+class SocketDbWrapperException : public std::exception
+{
+public:
+    /**
+     * @brief Overload what() method.
+     *
+     * @return const char*
+     */
+    // LCOV_EXCL_START
+    const char* what() const noexcept override
+    {
+        return m_msg.what();
+    }
+    // LCOV_EXCL_STOP
+
+    /**
+     * @brief Construct a new socket DB Wrapper Exception object
+     *
+     * @param message
+     * @param agentId
+     */
+    explicit SocketDbWrapperException(const std::string& message)
+        : m_msg {message} // NOLINT
+    {
+    }
+
+private:
+    std::runtime_error m_msg;
+    std::string m_agentId;
+};
+
+#endif // _WDB_SOCKET_DB_WRAPPER_EXCEPTION_HPP

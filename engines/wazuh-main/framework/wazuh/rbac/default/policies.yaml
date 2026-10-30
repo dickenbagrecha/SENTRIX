@@ -1,0 +1,205 @@
+# WAZUH SYSTEM FILE, PLEASE DO NOT MODIFY
+
+default_policies:
+  agents_all:
+    description: Grant full access to all agents related functionalities.
+    policies:
+      resourceless:
+        actions:
+          - agent:create
+          - group:create
+          - agent:uninstall
+          - enrollment_token:create
+          - enrollment_token:read
+          - enrollment_token:delete
+        resources:
+          - '*:*:*'
+        effect: allow
+      agents:
+        actions:
+          - agent:read
+          - agent:delete
+          - agent:modify_group
+          - agent:restart
+          - agent:reload
+          - agent:upgrade
+          - agent:scan_vulnerability
+        resources:
+          - agent:id:*
+          - agent:group:*
+        effect: allow
+      groups:
+        actions:
+          - group:read
+          - group:delete
+          - group:update_config
+          - group:modify_assignments
+        resources:
+          - group:id:*
+        effect: allow
+
+  agents_read:
+    description: Grant read access to all agents related functionalities.
+    policies:
+      resourceless:
+        actions:
+          - enrollment_token:read
+        resources:
+          - '*:*:*'
+        effect: allow
+      agents:
+        actions:
+          - agent:read
+        resources:
+          - agent:id:*
+          - agent:group:*
+        effect: allow
+      groups:
+        actions:
+          - group:read
+        resources:
+          - group:id:*
+        effect: allow
+
+  security_all:
+    description: Provide full access to all security related functionalities.
+    policies:
+      resourceless:
+        actions:
+          - security:create
+          - security:create_user
+          - security:read_config
+          - security:update_config
+          - security:revoke
+          - security:edit_run_as
+        resources:
+          - '*:*:*'
+        effect: allow
+      security:
+        actions:
+          - security:read
+          - security:update
+          - security:delete
+        resources:
+          - role:id:*
+          - policy:id:*
+          - user:id:*
+          - rule:id:*
+        effect: allow
+
+  users_all:
+    description: Provide full access to all users related functionalities.
+    policies:
+      resourceless:
+        actions:
+          - security:create_user
+          - security:revoke
+          - security:edit_run_as
+        resources:
+          - '*:*:*'
+        effect: allow
+      users:
+        actions:
+          - security:read
+          - security:update
+          - security:delete
+        resources:
+          - user:id:*
+        effect: allow
+
+  users_modify_run_as:
+    description: Allow changing the allow_run_as value of the users.
+    policies:
+      flag:
+        actions:
+          - security:edit_run_as
+        resources:
+          - '*:*:*'
+        effect: allow
+
+  mitre_read:
+    description: Allow read MITRE database information.
+    policies:
+      mitre:
+        actions:
+          - mitre:read
+        resources:
+          - '*:*:*'
+        effect: allow
+
+  cluster_all:
+    description: Provide full access to all cluster related functionalities.
+    policies:
+      resourceless:
+        actions:
+          - cluster:status
+          - cluster:update_config
+          - cluster:restart
+        resources:
+          - '*:*:*'
+        effect: allow
+      nodes:
+        actions:
+          - cluster:read_api_config
+          - cluster:read
+          - cluster:restart
+          - cluster:update_config
+        resources:
+          - node:id:*
+        effect: allow
+
+  secrets_read:
+    description: Allow reading the secrets the manager holds in clear instead of masked - the
+      sensitive configuration values (the enrollment password and the cluster key) and the agents'
+      pre-shared keys.
+    policies:
+      nodes:
+        actions:
+          - cluster:read_secrets
+        resources:
+          - node:id:*
+        effect: allow
+      agents:
+        actions:
+          - agent:read_secrets
+        resources:
+          - agent:id:*
+        effect: allow
+
+  cluster_read:
+    description: Provide read access to all cluster related functionalities.
+    policies:
+      resourceless:
+        actions:
+          - cluster:status
+          - cluster:read
+          - cluster:read_api_config
+        resources:
+          - '*:*:*'
+        effect: allow
+      nodes:
+        actions:
+          - cluster:read_api_config
+          - cluster:read
+        resources:
+          - node:id:*
+        effect: allow
+
+  security_read:
+    description: Provide read-only access to all security related functionalities.
+    policies:
+      resourceless:
+        actions:
+          - security:read_config
+        resources:
+          - '*:*:*'
+        effect: allow
+      security:
+        actions:
+          - security:read
+        resources:
+          - role:id:*
+          - policy:id:*
+          - user:id:*
+          - rule:id:*
+        effect: allow

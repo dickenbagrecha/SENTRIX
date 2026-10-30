@@ -1,0 +1,16 @@
+# ==============================================================================
+# CrowdSec Acquisition Configuration for SENTRIX
+# Ingests Coraza WAF audit events and platform logs
+# ==============================================================================
+
+# 1. Coraza WAF Audit Log Acquisition
+filenames:
+  - /var/log/sentrix/coraza-audit.log
+labels:
+  type: modsecurity-json
+---
+# 2. SENTRIX Core & System Logs Acquisition
+filenames:
+  - /var/log/sentrix/sentrix-core.log
+labels:
+  type: syslog

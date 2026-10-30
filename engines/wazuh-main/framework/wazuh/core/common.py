@@ -1,0 +1,259 @@
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+import json
+import os
+from contextvars import ContextVar
+from copy import deepcopy
+from functools import lru_cache, wraps
+from grp import getgrnam
+from multiprocessing import Value
+from pwd import getpwnam
+from typing import Any, Dict
+
+
+# ===================================================== Functions ======================================================
+@lru_cache(maxsize=None)
+def find_wazuh_path() -> str:
+    """Get the Wazuh installation path.
+
+    Returns
+    -------
+    str
+        Path where Wazuh is installed or empty string if there is no framework in the environment.
+    """
+    abs_path = os.path.abspath(os.path.dirname(__file__))
+    allparts = []
+    while 1:
+        parts = os.path.split(abs_path)
+        if parts[0] == abs_path:  # sentinel for absolute paths.
+            allparts.insert(0, parts[0])
+            break
+        elif parts[1] == abs_path:  # sentinel for relative paths.
+            allparts.insert(0, parts[1])
+            break
+        else:
+            abs_path = parts[0]
+            allparts.insert(0, parts[1])
+
+    wazuh_path = ''
+    try:
+        for i in range(0, allparts.index('framework')):
+            wazuh_path = os.path.join(wazuh_path, allparts[i])
+    except ValueError:
+        pass
+
+    return wazuh_path
+
+
+def wazuh_uid() -> int:
+    """Retrieve the numerical user ID for the wazuh user.
+
+    Returns
+    -------
+    int
+        Numerical user ID.
+    """
+    return getpwnam(USER_NAME).pw_uid if globals()['_WAZUH_UID'] is None else globals()['_WAZUH_UID']
+
+
+def wazuh_gid() -> int:
+    """Retrieve the numerical group ID for the wazuh group.
+
+    Returns
+    -------
+    int
+        Numerical group ID.
+    """
+    return getgrnam(GROUP_NAME).gr_gid if globals()['_WAZUH_GID'] is None else globals()['_WAZUH_GID']
+
+
+def context_cached(key: str = '') -> Any:
+    """Save the result of the decorated function in a cache.
+
+    Next calls to the decorated function returns the saved result saving time and resources. The cache gets
+    invalidated at the end of the request.
+
+    Parameters
+    ----------
+    key : str
+        Part of the cache entry identifier. The identifier will be the key + args + kwargs.
+
+    Returns
+    -------
+    Any
+        The result of the first call to the decorated function.
+
+    Notes
+    -----
+    The returned object will be a deep copy of the cached one.
+    """
+
+    def decorator(func) -> Any:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            cached_key = json.dumps({'key': key, 'args': args, 'kwargs': kwargs})
+            if cached_key not in _context_cache:
+                _context_cache[cached_key] = ContextVar(cached_key, default=None)
+            if _context_cache[cached_key].get() is None:
+                result = func(*args, **kwargs)
+                _context_cache[cached_key].set(result)
+            return deepcopy(_context_cache[cached_key].get())
+
+        return wrapper
+
+    return decorator
+
+
+def reset_context_cache() -> None:
+    """Reset context cache."""
+
+    for context_var in _context_cache.values():
+        context_var.set(None)
+
+
+# ================================================= Context variables ==================================================================================================
+rbac: ContextVar[Dict] = ContextVar('rbac', default={'rbac_mode': 'black'})
+current_user: ContextVar[str] = ContextVar('current_user', default='')
+broadcast: ContextVar[bool] = ContextVar('broadcast', default=False)
+cluster_nodes: ContextVar[list] = ContextVar('cluster_nodes', default=list())
+origin_module: ContextVar[str] = ContextVar('origin_module', default='framework')
+mp_pools: ContextVar[Dict] = ContextVar('mp_pools',default={})
+_context_cache = dict()
+
+
+# =========================================== Wazuh constants and variables ============================================
+# Monotonic generation counter bumped on every RBAC cache invalidation. Each process compares it
+# against the generation it last applied and flushes its own POLICIES_CACHE independently, so a
+# single revocation reaches every worker instead of only the first reader (the one-shot Event it
+# replaces was consumed by whichever process observed it first).
+#
+# The counter is inherited by the API process pools, which are forked from the process that created
+# it, and reaches no further: see `wazuh.rbac.utils.clear_tokens_cache`. It is a freshness
+# optimisation, not a security boundary: the authentication decision itself is no longer cached
+# (see `api.authentication.check_token`), so a process that failed to observe a bump can serve a
+# stale policy set for at most POLICIES_CACHE_TTL seconds, never a stale identity.
+token_cache_generation = Value('L', 0)
+_WAZUH_UID = None
+_WAZUH_GID = None
+GROUP_NAME = 'wazuh-manager'
+USER_NAME = 'wazuh-manager'
+WAZUH_PATH = find_wazuh_path()
+
+
+# =========================================== Wazuh constants - Date format ============================================
+DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+DECIMALS_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+# ========================================= Wazuh constants - Size and limits ==========================================
+MAX_SOCKET_BUFFER_SIZE = 64 * 1024  # 64KB.
+MAX_QUERY_FILTERS_RESERVED_SIZE = MAX_SOCKET_BUFFER_SIZE - 4 * 1024  # MAX_BUFFER_SIZE - 4KB.
+AGENT_NAME_LEN_LIMIT = 128
+DATABASE_LIMIT = 500
+MAXIMUM_DATABASE_LIMIT = 100000
+MAX_GROUPS_PER_MULTIGROUP = 128
+
+
+# ============================================= Wazuh constants - Version ==============================================
+# Agent upgrading variables.
+WPK_REPO_URL_4_X = "packages.wazuh.com/4.x/wpk/"
+
+
+# ================================================ Wazuh path - Config =================================================
+# The manager configuration directory is a fixed absolute path, outside the installation home. It is defined once per
+# language and the copies are kept identical: defs.h WAZUH_MANAGER_CONF_DIR, shared_modules/utils/managerConfDir.hpp,
+# the engine's base/managerConfig.hpp and src/init/shared.sh CONF_DIR.
+MANAGER_CONF_DIR = '/etc/wazuh-manager'
+
+
+def find_conf_path(wazuh_path: str) -> str:
+    """Get the manager configuration directory.
+
+    In a repository checkout (`wazuh_path` is then the repository root, see find_wazuh_path(); detected by the schema
+    source, as manager_conf.schema_path() does) the framework keeps using <repo>/etc, so tests never read the
+    configuration of a manager installed on the host. Everywhere else it is the fixed MANAGER_CONF_DIR.
+
+    Parameters
+    ----------
+    wazuh_path : str
+        The manager home (WAZUH_PATH).
+
+    Returns
+    -------
+    str
+        Absolute path of the configuration directory.
+    """
+    source_schema = os.path.join(wazuh_path, 'src', 'shared_modules', 'manager_config', 'schema',
+                                 'wazuh-manager.schema.json')
+    return os.path.join(wazuh_path, 'etc') if os.path.isfile(source_schema) else MANAGER_CONF_DIR
+
+
+CONF_PATH = find_conf_path(WAZUH_PATH)
+
+MANAGER_CONF = os.path.join(CONF_PATH, 'wazuh-manager.conf')
+MANAGER_CONF_SCHEMA = os.path.join(CONF_PATH, 'wazuh-manager.schema.json')
+INTERNAL_OPTIONS_CONF = os.path.join(CONF_PATH, 'wazuh-manager-internal-options.conf')
+CLIENT_KEYS = os.path.join(CONF_PATH, 'client.keys')
+SHARED_PATH = os.path.join(CONF_PATH, 'shared')
+AUTHD_PASS = os.path.join(CONF_PATH, 'authd.pass')
+CERTS_PATH = os.path.join(CONF_PATH, 'certs')
+
+
+# ================================================= Wazuh path - Misc ==================================================
+WAZUH_LOGS = os.path.join(WAZUH_PATH, 'logs')
+WAZUH_LOG = os.path.join(WAZUH_LOGS, 'wazuh-manager.log')
+WAZUH_LOG_JSON = os.path.join(WAZUH_LOGS, 'wazuh-manager.json')
+OSSEC_TMP_PATH = os.path.join(WAZUH_PATH, 'tmp')
+OSSEC_PIDFILE_PATH = os.path.join(WAZUH_PATH, 'var', 'run')
+OS_PIDFILE_PATH = os.path.join('var', 'run')
+WDB_PATH = os.path.join(WAZUH_PATH, 'queue', 'db')
+DEFAULT_RBAC_RESOURCES = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'rbac', 'default')
+CLUSTERD_WORKINGDIR = os.path.join(WAZUH_PATH, 'queue', 'cluster')
+INDEXER_PLUGINS_PATH = os.path.join(CONF_PATH, 'indexer-plugins')
+
+
+# ================================================ Wazuh path - Sockets ================================================
+ANALYSISD_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'engine-api-http.sock')
+VD_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'vd-http.sock')
+AUTHD_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'auth.sock')
+CONTROL_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'control.sock')
+REMOTED_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'remote.sock')
+REMOTED_ADMIN_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'remote-admin-http.sock')
+TASKS_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'task-http.sock')
+WDB_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'wdb.sock')
+WDB_HTTP_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'wdb-http.sock')
+KEY_STORE_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'keystore.sock')
+CLUSTERD_SOCKET = os.path.join(WAZUH_PATH, 'queue', 'sockets', 'cluster-internal.sock')
+
+# ================================================ Wazuh misc files ====================================================
+
+AR_BOOKMARK_FILEPATH = os.path.join(CLUSTERD_WORKINGDIR, "ar_bookmark.json")
+
+# ========================================== INSTALLATION UID PATH ====================================================
+SECURITY_PATH = os.path.join(WAZUH_PATH, 'api', 'configuration', 'security')
+
+# ============================================== CLUSTER PLACEHOLDERS =================================================
+
+# 1774 -> "this node's database holds no information about the agent". Not a verdict about the
+# agent but the absence of one: the node was asked about an agent that has never connected to it,
+# which is routine for 5.x agents, since they connect over stateless, load-balanced HTTPS and have
+# no fixed owning node.
+#
+# Lives here because two layers need it and neither owns it: wazuh/agent.py emits it, and the
+# cluster merge in core/cluster/dapi drops it for any agent another node did report on -- a
+# placeholder only stands while nothing better exists.
+AGENT_NOT_IN_LOCAL_DB_ERROR_CODE = 1774
+
+# 1816 -> the upgrade twin of 1774: the Task Manager's "Agent information not found in database"
+# (socket error 6), emitted by wazuh/agent.py upgrade_agents() and dropped by the same merge. Unlike
+# 1774 it is not always a placeholder -- the Task Manager also answers it for an agent whose OS
+# information is incomplete, on every node -- which is exactly why it must reach the merge rather
+# than be skipped by the node: when no node reports anything better, it is the outcome.
+UPGRADE_AGENT_NOT_IN_LOCAL_DB_ERROR_CODE = 1816
+
+# 1701 -> "Agent does not exist", by this node's replicated client.keys. A verdict when every node
+# gives it, but a copy that has not reached a worker yet makes that worker give it for an agent
+# another node knows, so the same merge drops it for any agent another node reported on.
+AGENT_DOES_NOT_EXIST_ERROR_CODE = 1701

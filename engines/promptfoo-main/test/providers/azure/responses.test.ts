@@ -1,0 +1,987 @@
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { fetchWithCache } from '../../../src/cache';
+import { AzureResponsesProvider } from '../../../src/providers/azure/responses';
+import * as azureUtil from '../../../src/providers/azure/util';
+import { maybeLoadResponseFormatFromExternalFile } from '../../../src/util/file';
+import { createInputOutputUsage, createTemperatureOptions } from '../../factories/literalFixtures';
+import { mockProcessEnv } from '../../util/utils';
+import { createMockFetchResponse } from '../mockProviderResponses';
+import type { MockedFunction } from 'vitest';
+
+import type { AzureChatCompletionProvider } from '../../../src/providers/azure/chat';
+import type { AzureResponsesOptions } from '../../../src/providers/azure/types';
+
+const createCachedTokenResponse = () => ({
+  output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '4' }] }],
+  usage: {
+    input_tokens: 2_000,
+    input_tokens_details: { cached_tokens: 500 },
+    output_tokens: 1_000,
+  },
+});
+
+const createOmitDefaultsConfig = () => ({
+  config: { omitDefaults: true },
+});
+
+// Mock external dependencies
+vi.mock('../../../src/cache');
+vi.mock('../../../src/util/file');
+
+const mockFetchWithCache = fetchWithCache as MockedFunction<typeof fetchWithCache>;
+const mockMaybeLoadResponseFormatFromExternalFile =
+  maybeLoadResponseFormatFromExternalFile as MockedFunction<
+    typeof maybeLoadResponseFormatFromExternalFile
+  >;
+let authHeadersValue: Record<string, string>;
+const originalOpenAiTemperature = process.env.OPENAI_TEMPERATURE;
+const originalOpenAiMaxTokens = process.env.OPENAI_MAX_TOKENS;
+const originalOpenAiMaxCompletionTokens = process.env.OPENAI_MAX_COMPLETION_TOKENS;
+
+describe('AzureResponsesProvider', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockProcessEnv({ OPENAI_TEMPERATURE: undefined });
+    mockProcessEnv({ OPENAI_MAX_TOKENS: undefined });
+    mockProcessEnv({ OPENAI_MAX_COMPLETION_TOKENS: undefined });
+
+    // Mock environment variables
+    mockProcessEnv({ AZURE_API_KEY: 'test-key' });
+    mockProcessEnv({ AZURE_API_HOST: 'test.openai.azure.com' });
+    authHeadersValue = { 'api-key': 'test-key' };
+  });
+
+  afterEach(() => {
+    mockProcessEnv({ AZURE_API_KEY: undefined });
+    mockProcessEnv({ AZURE_API_HOST: undefined });
+    if (originalOpenAiTemperature === undefined) {
+      mockProcessEnv({ OPENAI_TEMPERATURE: undefined });
+    } else {
+      mockProcessEnv({ OPENAI_TEMPERATURE: originalOpenAiTemperature });
+    }
+    if (originalOpenAiMaxTokens === undefined) {
+      mockProcessEnv({ OPENAI_MAX_TOKENS: undefined });
+    } else {
+      mockProcessEnv({ OPENAI_MAX_TOKENS: originalOpenAiMaxTokens });
+    }
+    if (originalOpenAiMaxCompletionTokens === undefined) {
+      mockProcessEnv({ OPENAI_MAX_COMPLETION_TOKENS: undefined });
+    } else {
+      mockProcessEnv({ OPENAI_MAX_COMPLETION_TOKENS: originalOpenAiMaxCompletionTokens });
+    }
+    delete (AzureResponsesProvider.prototype as any).authHeaders;
+  });
+
+  describe('constructor', () => {
+    it('should create an instance with deployment name', () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+      expect(provider).toBeInstanceOf(AzureResponsesProvider);
+      expect(provider.deploymentName).toBe('gpt-4.1-test');
+    });
+
+    it('should type only Azure-supported request service tiers', () => {
+      expectTypeOf<AzureResponsesOptions['service_tier']>().toEqualTypeOf<
+        'auto' | 'default' | 'flex' | 'priority' | null | undefined
+      >();
+    });
+
+    it('restricts flattened schemas to the Responses constructor', () => {
+      type ChatConfig = NonNullable<
+        NonNullable<ConstructorParameters<typeof AzureChatCompletionProvider>[1]>['config']
+      >;
+      type ResponsesConfig = NonNullable<
+        NonNullable<ConstructorParameters<typeof AzureResponsesProvider>[1]>['config']
+      >;
+      type FlattenedSchemaConfig = {
+        response_format: {
+          type: 'json_schema';
+          name: 'response_schema';
+          schema: {
+            type: 'object';
+            properties: Record<string, unknown>;
+            additionalProperties: false;
+          };
+        };
+      };
+      type FileConfig = { response_format: 'file://schema.json' };
+
+      expectTypeOf<FlattenedSchemaConfig>().toExtend<ResponsesConfig>();
+      expectTypeOf<FlattenedSchemaConfig>().not.toExtend<ChatConfig>();
+      expectTypeOf<FileConfig>().toExtend<ResponsesConfig>();
+      expectTypeOf<FileConfig>().toExtend<ChatConfig>();
+    });
+  });
+
+  describe('isReasoningModel', () => {
+    it('should identify o1 models as reasoning models', () => {
+      const provider = new AzureResponsesProvider('o1-preview');
+      expect(provider.isReasoningModel()).toBe(true);
+    });
+
+    it('should identify o3 models as reasoning models', () => {
+      const provider = new AzureResponsesProvider('o3-mini');
+      expect(provider.isReasoningModel()).toBe(true);
+    });
+
+    it('should identify gpt-5 models as reasoning models', () => {
+      const provider = new AzureResponsesProvider('gpt-5');
+      expect(provider.isReasoningModel()).toBe(true);
+    });
+
+    it('should not identify gpt-4.1 as reasoning model', () => {
+      const provider = new AzureResponsesProvider('gpt-4.1');
+      expect(provider.isReasoningModel()).toBe(false);
+    });
+
+    it('should respect isReasoningModel config override for custom deployment names', () => {
+      const provider = new AzureResponsesProvider('my-custom-deployment', {
+        config: { isReasoningModel: true },
+      });
+      expect(provider.isReasoningModel()).toBe(true);
+    });
+
+    it('should respect o1 config override for custom deployment names', () => {
+      const provider = new AzureResponsesProvider('my-custom-deployment', {
+        config: { o1: true },
+      });
+      expect(provider.isReasoningModel()).toBe(true);
+    });
+
+    it('should not identify custom deployment as reasoning model without config override', () => {
+      const provider = new AzureResponsesProvider('my-custom-deployment');
+      expect(provider.isReasoningModel()).toBe(false);
+    });
+  });
+
+  describe('supportsTemperature', () => {
+    it('should support temperature for non-reasoning models', () => {
+      const provider = new AzureResponsesProvider('gpt-4.1');
+      expect(provider.supportsTemperature()).toBe(true);
+    });
+
+    it('should not support temperature for reasoning models', () => {
+      const provider = new AzureResponsesProvider('o1-preview');
+      expect(provider.supportsTemperature()).toBe(false);
+    });
+  });
+
+  describe('getAzureResponsesBody', () => {
+    it('should create correct request body for basic prompt', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body).toMatchObject({
+        model: 'gpt-4.1-test',
+        input: 'Hello world',
+        text: {
+          format: {
+            type: 'text',
+          },
+        },
+      });
+    });
+
+    it('should handle external response_format file loading (fixed double-loading bug)', async () => {
+      const mockSchema = {
+        type: 'json_schema',
+        json_schema: {
+          name: 'test_schema',
+          schema: { type: 'object', properties: { test: { type: 'string' } } },
+        },
+      };
+
+      mockMaybeLoadResponseFormatFromExternalFile.mockReturnValue(mockSchema);
+
+      const provider = new AzureResponsesProvider('gpt-4.1-test', {
+        config: {
+          response_format: 'file://test-schema.json',
+        },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(mockMaybeLoadResponseFormatFromExternalFile).toHaveBeenCalledWith(
+        'file://test-schema.json',
+        undefined,
+      );
+      expect(mockMaybeLoadResponseFormatFromExternalFile).toHaveBeenCalledTimes(1); // Should only be called once (fix for double-loading)
+      expect(body.text.format).toMatchObject({
+        type: 'json_schema',
+        name: 'test_schema',
+        schema: mockSchema.json_schema.schema,
+        strict: true,
+      });
+    });
+
+    it('should handle inline response_format', async () => {
+      // For inline schemas, maybeLoadResponseFormatFromExternalFile should return the object unchanged
+      mockMaybeLoadResponseFormatFromExternalFile.mockImplementation(function (input: any) {
+        return input;
+      });
+
+      const provider = new AzureResponsesProvider('gpt-4.1-test', {
+        config: {
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'inline_schema',
+              strict: true,
+              schema: {
+                type: 'object',
+                properties: { result: { type: 'string' } },
+                additionalProperties: false,
+              },
+            },
+          },
+        },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.text.format).toMatchObject({
+        type: 'json_schema',
+        name: 'inline_schema',
+        schema: {
+          type: 'object',
+          properties: { result: { type: 'string' } },
+          additionalProperties: false,
+        },
+        strict: true,
+      });
+    });
+
+    it('should not include temperature for reasoning models', async () => {
+      const provider = new AzureResponsesProvider('o1-preview', createTemperatureOptions());
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body).not.toHaveProperty('temperature');
+    });
+
+    it('should include temperature for non-reasoning models', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test', createTemperatureOptions());
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.temperature).toBe(0.7);
+    });
+
+    it.each(['gpt-chat-latest', 'gpt-chat-latest-2026-06-24'])(
+      'uses reasoning request fields for Azure Responses alias %s',
+      async (deploymentName) => {
+        const provider = new AzureResponsesProvider(deploymentName, {
+          config: {
+            max_output_tokens: 2_000,
+            reasoning_effort: 'high',
+            temperature: 0.7,
+          } as any,
+        });
+
+        const body = await provider.getAzureResponsesBody('Hello world');
+
+        expect(body).toHaveProperty('max_output_tokens', 2_000);
+        expect(body).not.toHaveProperty('reasoning.effort');
+        expect(body).not.toHaveProperty('temperature');
+      },
+    );
+
+    it('preserves summaries while omitting fixed effort from prompt passthrough', async () => {
+      const direct = new AzureResponsesProvider('gpt-chat-latest');
+      const directBody = await direct.getAzureResponsesBody('hello');
+      expect(directBody).not.toHaveProperty('reasoning.effort');
+
+      const provider = new AzureResponsesProvider('opaque-deployment', {
+        config: { modelName: 'gpt-4.1' },
+      });
+      const passthrough = { reasoning: { effort: 'high', summary: 'auto' } };
+      const body = await provider.getAzureResponsesBody('hello', {
+        vars: {},
+        prompt: {
+          raw: 'hello',
+          label: 'override',
+          config: { modelName: 'gpt-chat-latest', passthrough },
+        },
+      });
+      expect(body.model).toBe('opaque-deployment');
+      expect(body.reasoning).toEqual({ summary: 'auto' });
+      expect(body).not.toHaveProperty('temperature');
+      expect(passthrough.reasoning).toEqual({ effort: 'high', summary: 'auto' });
+    });
+
+    it('should correctly send temperature: 0 in the request body', async () => {
+      // Test that temperature: 0 is correctly sent (not filtered out by falsy check)
+      const provider = new AzureResponsesProvider('gpt-4.1-test', {
+        config: { temperature: 0 },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      // temperature: 0 should be present in the request body
+      expect(body.temperature).toBe(0);
+      expect('temperature' in body).toBe(true);
+    });
+
+    it('should omit default temperature and max_output_tokens when omitDefaults is true', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test', createOmitDefaultsConfig());
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.temperature).toBeUndefined();
+      expect('temperature' in body).toBe(false);
+      expect(body.max_output_tokens).toBeUndefined();
+      expect('max_output_tokens' in body).toBe(false);
+    });
+
+    it('should use env defaults with omitDefaults when OPENAI env vars are set', async () => {
+      mockProcessEnv({ OPENAI_TEMPERATURE: '0.5' });
+      mockProcessEnv({ OPENAI_MAX_TOKENS: '2048' });
+
+      const provider = new AzureResponsesProvider('gpt-4.1-test', createOmitDefaultsConfig());
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.temperature).toBe(0.5);
+      expect('temperature' in body).toBe(true);
+      expect(body.max_output_tokens).toBe(2048);
+      expect('max_output_tokens' in body).toBe(true);
+    });
+
+    it('should prefer OPENAI_MAX_COMPLETION_TOKENS over OPENAI_MAX_TOKENS for reasoning models', async () => {
+      mockProcessEnv({ OPENAI_MAX_COMPLETION_TOKENS: '4096' });
+      mockProcessEnv({ OPENAI_MAX_TOKENS: '2048' });
+
+      const provider = new AzureResponsesProvider('o1-preview', createOmitDefaultsConfig());
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.max_output_tokens).toBe(4096);
+      expect('max_output_tokens' in body).toBe(true);
+    });
+
+    it('should fall back to OPENAI_MAX_TOKENS for reasoning models when OPENAI_MAX_COMPLETION_TOKENS is unset', async () => {
+      mockProcessEnv({ OPENAI_MAX_TOKENS: '2048' });
+
+      const provider = new AzureResponsesProvider('o1-preview', createOmitDefaultsConfig());
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.max_output_tokens).toBe(2048);
+      expect('max_output_tokens' in body).toBe(true);
+    });
+
+    it('should use OPENAI_MAX_TOKENS for reasoning models when omitDefaults is false and OPENAI_MAX_COMPLETION_TOKENS is unset', async () => {
+      mockProcessEnv({ OPENAI_MAX_TOKENS: '2048' });
+
+      const provider = new AzureResponsesProvider('o1-preview');
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.max_output_tokens).toBe(2048);
+      expect('max_output_tokens' in body).toBe(true);
+    });
+
+    it('should not apply a hardcoded max_output_tokens default for reasoning models when omitDefaults is false', async () => {
+      const provider = new AzureResponsesProvider('o1-preview');
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.max_output_tokens).toBeUndefined();
+      expect('max_output_tokens' in body).toBe(false);
+    });
+
+    it('should omit default max_output_tokens when omitDefaults is true for reasoning models', async () => {
+      const provider = new AzureResponsesProvider('o1-preview', createOmitDefaultsConfig());
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.max_output_tokens).toBeUndefined();
+      expect('max_output_tokens' in body).toBe(false);
+    });
+
+    it('should correctly send max_output_tokens: 0 in the request body when explicitly set', async () => {
+      // Test that max_output_tokens: 0 is correctly sent (not filtered out by falsy check)
+      // Note: While max_output_tokens: 0 is impractical, it should still be sent if explicitly configured
+      const provider = new AzureResponsesProvider('gpt-4.1-test', {
+        config: { max_output_tokens: 0 } as any,
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      // max_output_tokens: 0 should be present in the request body
+      expect(body.max_output_tokens).toBe(0);
+      expect('max_output_tokens' in body).toBe(true);
+    });
+
+    it('should include verbosity for reasoning models when configured', async () => {
+      const provider = new AzureResponsesProvider('gpt-5', {
+        config: { verbosity: 'high' },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.text).toMatchObject({
+        format: { type: 'text' },
+        verbosity: 'high',
+      });
+    });
+
+    it('should include verbosity for custom deployment with isReasoningModel override', async () => {
+      const provider = new AzureResponsesProvider('my-custom-deployment', {
+        config: { isReasoningModel: true, verbosity: 'medium' },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.text).toMatchObject({
+        format: { type: 'text' },
+        verbosity: 'medium',
+      });
+    });
+
+    it('should not include verbosity for non-reasoning models', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test', {
+        config: { verbosity: 'high' },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.text).toMatchObject({
+        format: { type: 'text' },
+      });
+      expect(body.text.verbosity).toBeUndefined();
+    });
+
+    it('should include top-level service_tier in the request body', async () => {
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: { service_tier: 'priority' },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.service_tier).toBe('priority');
+    });
+
+    it('should prefer passthrough service_tier over the top-level option', async () => {
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: {
+          service_tier: 'priority',
+          passthrough: { service_tier: 'default' },
+        },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+
+      expect(body.service_tier).toBe('default');
+    });
+
+    it('should omit a null top-level service_tier while preserving passthrough overrides', async () => {
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: {
+          service_tier: null,
+          passthrough: { service_tier: 'priority' },
+        },
+      });
+      const providerWithoutOverride = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: { service_tier: null },
+      });
+
+      const body = await provider.getAzureResponsesBody('Hello world');
+      const bodyWithoutOverride =
+        await providerWithoutOverride.getAzureResponsesBody('Hello world');
+
+      expect(body.service_tier).toBe('priority');
+      expect(bodyWithoutOverride).not.toHaveProperty('service_tier');
+    });
+  });
+
+  describe('callApi', () => {
+    beforeEach(() => {
+      // Mock the generic provider's method for getting auth headers and URL
+      AzureResponsesProvider.prototype.ensureInitialized = vi.fn().mockResolvedValue(void 0);
+      AzureResponsesProvider.prototype.getApiBaseUrl = vi
+        .fn()
+        .mockReturnValue('https://test.openai.azure.com');
+      Object.defineProperty(AzureResponsesProvider.prototype, 'authHeaders', {
+        get: vi.fn(() => authHeadersValue),
+        set: vi.fn((value: Record<string, string>) => {
+          authHeadersValue = value;
+        }),
+        configurable: true,
+      });
+    });
+
+    it('should preserve partial output and expose its incomplete finish reason', async () => {
+      const mockResponse = {
+        id: 'resp_azure_incomplete',
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            status: 'incomplete',
+            content: [{ type: 'output_text', text: 'Partial Azure answer' }],
+          },
+        ],
+        usage: { input_tokens: 10, output_tokens: 20, total_tokens: 30 },
+      };
+      mockFetchWithCache.mockResolvedValue({
+        data: mockResponse,
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+
+      const result = await provider.callApi('Hello');
+
+      expect(result.error).toBeUndefined();
+      expect(result.output).toBe('Partial Azure answer');
+      expect(result.raw).toEqual(mockResponse);
+      expect(result.finishReason).toBe('length');
+      expect(result.metadata).toMatchObject({
+        responseStatus: 'incomplete',
+        incompleteReason: 'max_output_tokens',
+      });
+      expect(result.tokenUsage).toEqual({
+        prompt: 10,
+        completion: 20,
+        total: 30,
+        numRequests: 1,
+      });
+    });
+
+    it('should provide clear error for missing API host', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+      vi.spyOn(provider, 'getApiBaseUrl').mockReturnValue('');
+
+      await expect(provider.callApi('test')).rejects.toThrow(
+        /Azure API configuration missing.*AZURE_API_HOST/,
+      );
+    });
+
+    it('should provide clear error for missing authentication', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+      // Finish eager authentication before replacing readiness with a mock.
+      await provider.initialize();
+
+      // Mock initialization to set empty auth headers
+      vi.spyOn(provider, 'ensureInitialized').mockImplementation(async function () {
+        (provider as any).authHeaders = {}; // Set empty auth headers
+      });
+
+      await expect(provider.callApi('test')).rejects.toThrow(
+        /Azure API authentication failed.*AZURE_API_KEY/,
+      );
+    });
+
+    it('should accept Entra ID authentication with Authorization header', async () => {
+      const mockResponse = {
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: 'Hello from Entra ID auth!',
+              },
+            ],
+          },
+        ],
+        usage: createInputOutputUsage(10, 8),
+      };
+
+      mockFetchWithCache.mockResolvedValue(createMockFetchResponse(mockResponse));
+
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+
+      // Mock ensureInitialized to set authHeaders with Authorization (Entra ID)
+      vi.spyOn(provider, 'ensureInitialized').mockImplementation(async function () {
+        (provider as any).authHeaders = { Authorization: 'Bearer test-entra-token' };
+      });
+
+      const result = await provider.callApi('Hello');
+
+      // Verify the call succeeded (no error about missing authentication)
+      expect(result).toMatchObject({
+        output: 'Hello from Entra ID auth!',
+        cached: false,
+      });
+
+      // Verify the API was called (auth check passed)
+      expect(mockFetchWithCache).toHaveBeenCalled();
+    });
+
+    it('reports non-zero cost from the Responses usage object (regression)', async () => {
+      // Regression for the costCalculator that passed `usage` into calculateAzureCost's ignored
+      // config slot (never forwarding token counts), so every Azure Responses eval reported cost 0.
+      const mockResponse = {
+        output: [
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '4' }] },
+        ],
+        usage: { input_tokens: 1000, output_tokens: 500 },
+      };
+      mockFetchWithCache.mockResolvedValue(createMockFetchResponse(mockResponse));
+
+      const provider = new AzureResponsesProvider('gpt-4.1');
+      vi.spyOn(provider, 'ensureInitialized').mockImplementation(async function () {
+        (provider as any).authHeaders = { 'api-key': 'test-key' };
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+
+      // gpt-4.1 is priced in AZURE_MODELS, and tokens now flow through, so cost must be > 0.
+      expect(result.cost).toBeGreaterThan(0);
+      expect(result.tokenUsage).toMatchObject({ prompt: 1000, completion: 500 });
+    });
+
+    it('applies the cached-input rate from Responses usage details', async () => {
+      mockFetchWithCache.mockResolvedValue(createMockFetchResponse(createCachedTokenResponse()));
+
+      const provider = new AzureResponsesProvider('gpt-5.6');
+      vi.spyOn(provider, 'ensureInitialized').mockImplementation(async function () {
+        (provider as any).authHeaders = { 'api-key': 'test-key' };
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+
+      expect(result.cost).toBeCloseTo((1_500 * 5 + 500 * 0.5 + 1_000 * 30) / 1e6, 12);
+      expect(result.tokenUsage).toMatchObject({ prompt: 2_000, completion: 1_000, cached: 500 });
+    });
+
+    it('preserves full cached usage when the Responses result comes from disk cache', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        data: {
+          output: [
+            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '4' }] },
+          ],
+          usage: {
+            input_tokens: 2_000,
+            input_tokens_details: { cached_tokens: 500 },
+            output_tokens: 1_000,
+            total_tokens: 3_000,
+          },
+        },
+        cached: true,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('gpt-5.6');
+      vi.spyOn(provider, 'ensureInitialized').mockImplementation(async function () {
+        (provider as any).authHeaders = { 'api-key': 'test-key' };
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+
+      expect(result.cached).toBe(true);
+      expect(result.tokenUsage).toMatchObject({ cached: 3_000, total: 3_000 });
+    });
+
+    it('applies priority pricing after Responses flattens passthrough fields', async () => {
+      mockFetchWithCache.mockResolvedValue(createMockFetchResponse(createCachedTokenResponse()));
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: { passthrough: { service_tier: 'priority' } },
+      });
+      vi.spyOn(provider, 'ensureInitialized').mockImplementation(async function () {
+        (provider as any).authHeaders = { 'api-key': 'test-key' };
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+
+      expect(result.cost).toBeCloseTo((2 * (1_500 * 5 + 500 * 0.5 + 1_000 * 30)) / 1e6, 12);
+    });
+
+    it('falls back to the requested top-level service_tier when the response omits it', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        data: {
+          ...createCachedTokenResponse(),
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: { service_tier: 'priority' },
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+      const requestBody = JSON.parse(
+        mockFetchWithCache.mock.calls[0]![1]!.body as string,
+      ) as Record<string, unknown>;
+
+      expect(requestBody.service_tier).toBe('priority');
+      expect(result.cost).toBeCloseTo((2 * (1_500 * 5 + 500 * 0.5 + 1_000 * 30)) / 1e6, 12);
+    });
+
+    it('prices the passthrough service_tier that overrides the top-level option', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        data: {
+          ...createCachedTokenResponse(),
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: {
+          service_tier: 'priority',
+          passthrough: { service_tier: 'default' },
+        },
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+      const requestBody = JSON.parse(
+        mockFetchWithCache.mock.calls[0]![1]!.body as string,
+      ) as Record<string, unknown>;
+
+      expect(requestBody.service_tier).toBe('default');
+      expect(result.cost).toBeCloseTo((1_500 * 5 + 500 * 0.5 + 1_000 * 30) / 1e6, 12);
+    });
+
+    it('prices the default tier Azure served instead of requested priority', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        data: {
+          service_tier: 'default',
+          ...createCachedTokenResponse(),
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: { service_tier: 'priority' },
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+      const requestBody = JSON.parse(
+        mockFetchWithCache.mock.calls[0]![1]!.body as string,
+      ) as Record<string, unknown>;
+
+      expect(requestBody.service_tier).toBe('priority');
+      expect(result.cost).toBeCloseTo((1_500 * 5 + 500 * 0.5 + 1_000 * 30) / 1e6, 12);
+    });
+
+    it('prices the served tier using the passthrough model sent for an aliased deployment', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        data: {
+          service_tier: 'priority',
+          ...createCachedTokenResponse(),
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('my-custom-deployment', {
+        config: {
+          service_tier: 'default',
+          passthrough: { model: 'gpt-5.6-sol' },
+        },
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+      const requestBody = JSON.parse(
+        mockFetchWithCache.mock.calls[0]![1]!.body as string,
+      ) as Record<string, unknown>;
+
+      expect(requestBody).toMatchObject({ model: 'gpt-5.6-sol', service_tier: 'default' });
+      expect(result.cost).toBeCloseTo((2 * (1_500 * 5 + 500 * 0.5 + 1_000 * 30)) / 1e6, 12);
+    });
+
+    it('prices the priority tier Azure served instead of requested auto', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        data: {
+          service_tier: 'priority',
+          ...createCachedTokenResponse(),
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: { service_tier: 'auto' },
+      });
+
+      const result = await provider.callApi('What is 2+2?');
+      const requestBody = JSON.parse(
+        mockFetchWithCache.mock.calls[0]![1]!.body as string,
+      ) as Record<string, unknown>;
+
+      expect(requestBody.service_tier).toBe('auto');
+      expect(result.cost).toBeCloseTo((2 * (1_500 * 5 + 500 * 0.5 + 1_000 * 30)) / 1e6, 12);
+    });
+
+    it('omits a null service_tier from the request and cost config', async () => {
+      const costSpy = vi.spyOn(azureUtil, 'calculateAzureCost');
+      mockFetchWithCache.mockResolvedValue({
+        data: {
+          ...createCachedTokenResponse(),
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new AzureResponsesProvider('gpt-5.6-sol', {
+        config: { service_tier: null },
+      });
+
+      await provider.callApi('What is 2+2?');
+      const requestBody = JSON.parse(
+        mockFetchWithCache.mock.calls[0]![1]!.body as string,
+      ) as Record<string, unknown>;
+      const costConfig = costSpy.mock.calls[0]![1];
+      costSpy.mockRestore();
+
+      expect(requestBody).not.toHaveProperty('service_tier');
+      expect(costConfig).not.toHaveProperty('service_tier');
+      expect(costConfig.passthrough).not.toHaveProperty('service_tier');
+    });
+
+    it('prices image-token usage from Azure Responses details', async () => {
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          output: [
+            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] },
+          ],
+          usage: {
+            input_tokens: 1_000,
+            input_tokens_details: { image_tokens: 400 },
+            output_tokens: 0,
+          },
+        }),
+      );
+      const provider = new AzureResponsesProvider('gpt-image-1');
+      vi.spyOn(provider, 'ensureInitialized').mockImplementation(async function () {
+        (provider as any).authHeaders = { 'api-key': 'test-key' };
+      });
+
+      const result = await provider.callApi('Describe the image');
+
+      expect(result.cost).toBeCloseTo((600 * 5 + 400 * 10) / 1e6, 12);
+    });
+
+    it('should validate external response_format files', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test', {
+        config: { response_format: 'file://missing.json' },
+      });
+
+      mockMaybeLoadResponseFormatFromExternalFile.mockImplementation(function () {
+        throw new Error('File does not exist');
+      });
+
+      await expect(provider.callApi('test')).rejects.toThrow(
+        /Failed to load response_format file.*missing\.json/,
+      );
+    });
+
+    it('should make successful API call', async () => {
+      const mockResponse = {
+        output: [
+          {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: 'Hello! How can I help you?',
+              },
+            ],
+          },
+        ],
+        usage: createInputOutputUsage(10, 8),
+      };
+
+      mockFetchWithCache.mockResolvedValue(createMockFetchResponse(mockResponse));
+
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+      const result = await provider.callApi('Hello');
+
+      expect(result).toMatchObject({
+        output: 'Hello! How can I help you?',
+        cached: false,
+      });
+
+      expect(mockFetchWithCache).toHaveBeenCalledWith(
+        'https://test.openai.azure.com/openai/v1/responses?api-version=preview',
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.objectContaining({
+            'Content-Type': 'application/json',
+            'api-key': 'test-key',
+          }),
+          body: expect.stringContaining('gpt-4.1-test'),
+        }),
+        expect.any(Number),
+        'json',
+        undefined,
+      );
+    });
+
+    it('should handle API errors', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        data: { error: { message: 'Invalid API key' } },
+        cached: false,
+        status: 401,
+        statusText: 'Unauthorized',
+      });
+
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+      const result = await provider.callApi('Hello');
+
+      expect(result.error).toContain('API error: 401');
+    });
+
+    it('should handle deep research model timeout', async () => {
+      const provider = new AzureResponsesProvider('o3-deep-research-test');
+
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'Research complete' }],
+            },
+          ],
+        }),
+      );
+
+      await provider.callApi('Research question');
+
+      expect(mockFetchWithCache).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Object),
+        600000, // 10 minutes timeout for deep research
+        'json',
+        undefined,
+      );
+    });
+
+    it('should construct correct Azure URL format', async () => {
+      const provider = new AzureResponsesProvider('gpt-4.1-test');
+
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          output: [
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'response' }],
+            },
+          ],
+        }),
+      );
+
+      await provider.callApi('Hello');
+
+      // Verify the URL does NOT include deployment name (Azure Responses API pattern)
+      expect(mockFetchWithCache).toHaveBeenCalledWith(
+        'https://test.openai.azure.com/openai/v1/responses?api-version=preview',
+        expect.any(Object),
+        expect.any(Number),
+        'json',
+        undefined,
+      );
+    });
+  });
+});

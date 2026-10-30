@@ -1,0 +1,10 @@
+name: 4.X - Scan Build
+on:
+  workflow_dispatch:
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

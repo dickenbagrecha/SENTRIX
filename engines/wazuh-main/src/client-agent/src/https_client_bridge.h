@@ -1,0 +1,102 @@
+/*
+ * Wazuh agent HTTPS client bridge (development scaffold)
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef _HTTPS_CLIENT_BRIDGE_H
+#define _HTTPS_CLIENT_BRIDGE_H
+
+#include <stdbool.h>
+#include <stddef.h> // size_t
+
+#include "https_client.h" // hc_enroll_result_t
+
+/**
+ * @brief Start the HTTPS client module. client-agent/src/main.c already
+ *        refused to start the agent (a hard exit) unless a validated server
+ *        address is configured, but transport options (e.g. the backoff
+ *        base/cap pair) are only validated here, once the module builds its
+ *        config -- so this can still fail after main.c's checks passed.
+ * @return true once the client is created and running; false if the config
+ *         was rejected or the client failed to start (already logged via
+ *         merror by this call). The caller must not treat false as a
+ *         functioning transport.
+ */
+bool w_https_client_start(void);
+
+/**
+ * @brief Make SHAREDCFG_DIR trustworthy before anything reads it.
+ *
+ * Called once at startup, before the HTTPS client starts. If an apply of a
+ * downloaded configuration was interrupted, or the shared agent.conf on disk
+ * does not pass validation, the shared directory and merged.mg are discarded:
+ * the startup gate stays closed and the manager's configuration is downloaded
+ * and validated again, as on a freshly enrolled agent.
+ */
+void w_https_client_reconcile_shared_config(void);
+
+/** @brief Stop and destroy the HTTPS client module if it was started. */
+void w_https_client_stop(void);
+
+/**
+ * @brief Pull the /config reporter's next send in now, instead of waiting out its periodic
+ *        cadence. Call once a shared-configuration reload has actually completed (e.g. from
+ *        agentd.c's needs_config_reload handling), not right after dispatching the reload.
+ */
+void w_https_client_notify_config_reload_completed(void);
+
+/**
+ * @brief Submit one stateless event frame ("queue:location:message" bytes) into
+ *        the HTTPS /stateless accumulator. Non-blocking: appends and returns.
+ *        Returns 0 if accepted, -1 if dropped (accumulator full) or the client
+ *        is stopping / not started.
+ */
+int w_https_client_submit_event(const char *frame, size_t length);
+
+/**
+ * @brief Perform exactly one /enroll HTTP request (#38465), against the same
+ *        manager/TLS material already configured for every other HTTPS
+ *        endpoint (<agent><manager>, <agent><ssl>). Handle-less: usable before
+ *        the module is started (first-boot enrollment has no handle yet) or
+ *        standalone (re-enrollment after a 401). No retry loop -- the caller
+ *        (client-agent/src/start_agent.c's try_enroll_to_server()) already
+ *        owns backoff/retry one layer up.
+ * @param body_json The already-built, already-validated JSON body
+ *        (enrollment.c's job; never inspected here).
+ * @param password Empty/NULL means no `wazuh-enroll+jwt` bearer (mTLS/open
+ *        enrollment); a client cert (if <agent><ssl> has one) and a password
+ *        may both apply at once, with no precedence between them.
+ * @param result Filled with the HTTP outcome; http_code stays 0 when nothing
+ *        was ever sent (invalid transport config, e.g. no CA under a
+ *        verifying mode).
+ * @return true once a request was sent and answered, whatever the HTTP
+ *         status (the caller interprets 200 vs. 4xx/5xx); false when nothing
+ *         was ever sent.
+ */
+bool w_https_client_enroll(const char *body_json, const char *password, const char *enroll_kid,
+                           const char *enroll_key_hex, hc_enroll_result_t *result);
+
+/**
+ * @brief Take/release the writer side of the global keystore lock.
+ *
+ * Wraps whatever REPLACES `keys` -- OS_UpdateKeys() and the crypto-method reset that follows it.
+ * OS_UpdateKeys() frees every keyentry, on the re-enrollment thread or on the initial-enrollment
+ * path, while other threads may be copying the agent's identity out of the keystore; the lock
+ * serializes those readers, which copy the identity out instead of borrowing pointers, against
+ * that writer.
+ *
+ * Declared here rather than in keys.h because the readers that need it live here: a lock in the
+ * shared keystore API would imply a guarantee the manager-side users of that API do not get.
+ *
+ * Not recursive: never call these while already holding them. Where the handle lock is also held,
+ * it is taken FIRST.
+ */
+void w_agent_keys_write_lock(void);
+void w_agent_keys_write_unlock(void);
+
+#endif // _HTTPS_CLIENT_BRIDGE_H

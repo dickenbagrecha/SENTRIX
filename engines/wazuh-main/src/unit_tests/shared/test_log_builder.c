@@ -1,0 +1,110 @@
+/*
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <setjmp.h>
+#include <cmocka.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "shared.h"
+#include "../wrappers/common.h"
+#include "../wrappers/wazuh/client-agent/notify_wrappers.h"
+#include "../wrappers/wazuh/shared/agent_op_wrappers.h"
+
+/* log_builder_init() reads logcollector.ip_update_interval only in the agent build: the function is
+ * reached exclusively through mq_log_builder_init() <- logcollector, which is agent-only, so the
+ * manager build has no internal option to read and the interval keeps its 0 initializer. Hence the
+ * getDefine_Int* mocks below are agent-only too. */
+extern int g_ip_update_interval;
+int log_builder_update_host_ip(log_builder_t * builder);
+
+// Tests
+
+void test_log_builder(void **state)
+{
+    const char * PATTERN = "location: $(location), log: $(log), escaped: $(json_escaped_log)";
+    const char * LOG = "Hello \"World\"";
+    const char * LOCATION = "test";
+    const char * EXPECTED_OUTPUT = "location: test, log: Hello \"World\", escaped: Hello \\\"World\\\"";
+
+#if defined(TEST_AGENT) || defined(TEST_WINAGENT)
+    will_return_always(__wrap_getDefine_Int, 60);
+#endif
+
+    log_builder_t * builder = log_builder_init(false);
+
+    char * output = log_builder_build(builder, PATTERN, LOG, LOCATION);
+
+    assert_string_equal(output, EXPECTED_OUTPUT);
+
+    free(output);
+    log_builder_destroy(builder);
+}
+
+void test_log_builder_update(void **state)
+{
+#if defined(TEST_AGENT) || defined(TEST_WINAGENT)
+    will_return_always(__wrap_getDefine_Int, 1);
+#endif
+    log_builder_t * builder = log_builder_init(false);
+#if !defined(TEST_AGENT) && !defined(TEST_WINAGENT)
+    /* Nothing set it during init in this build, and log_builder_update_host_ip() only refreshes the
+     * IP while the interval is positive: set it here so the refresh path is the one under test. */
+    g_ip_update_interval = 1;
+#endif
+    assert_int_equal(g_ip_update_interval, 1);
+    assert_non_null(builder);
+
+#ifdef WIN32
+    char * return_ip = "1.2.3.4";
+    time_mock_value = 1000;
+    will_return(wrap_get_agent_ip_legacy_win32, strdup(return_ip));
+#elif defined __linux__ || defined __MACH__ || defined sun || defined FreeBSD || defined OpenBSD
+    will_return(__wrap_getPrimaryIP, NULL);
+#endif
+
+    int r = log_builder_update_host_ip(builder);
+    assert_int_equal(r, 0);
+#ifdef WIN32
+    assert_string_equal(builder->host_ip, "1.2.3.4");
+#endif
+    log_builder_destroy(builder);
+}
+
+void test_log_builder_not_update(void **state) {
+#if defined(TEST_AGENT) || defined(TEST_WINAGENT)
+    will_return_always(__wrap_getDefine_Int, 0);
+#endif
+
+    log_builder_t * builder = log_builder_init(false);
+#if !defined(TEST_AGENT) && !defined(TEST_WINAGENT)
+    /* g_ip_update_interval is a global shared by every test in this binary and the previous one left
+     * it at 1: reset it, this test is the "interval disabled, no refresh" case. */
+    g_ip_update_interval = 0;
+#endif
+    assert_int_equal(g_ip_update_interval, 0);
+    assert_non_null(builder);
+
+    int r = log_builder_update_host_ip(builder);
+    assert_int_equal(r, 0);
+
+    log_builder_destroy(builder);
+}
+
+int main(void) {
+    const struct CMUnitTest tests[] = {
+            cmocka_unit_test(test_log_builder),
+            cmocka_unit_test(test_log_builder_update),
+            cmocka_unit_test(test_log_builder_not_update),
+    };
+    return cmocka_run_group_tests(tests, NULL, NULL);
+}

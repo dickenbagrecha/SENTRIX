@@ -1,0 +1,106 @@
+# provider-cerebras (Cerebras)
+
+Evaluate Cerebras models on text responses, structured output, and function calls.
+
+You can run this example with:
+
+```bash
+npx promptfoo@latest init --example provider-cerebras
+cd provider-cerebras
+```
+
+## Prerequisites
+
+### API Key Setup
+
+1. Sign up for an account at [Cerebras AI](https://console.cerebras.ai/)
+2. Navigate to your account settings to generate an API key
+3. Set your Cerebras API key as an environment variable:
+
+```bash
+export CEREBRAS_API_KEY="your-api-key-here"
+```
+
+Alternatively, you can add it to your `.env` file:
+
+```text
+CEREBRAS_API_KEY=your-api-key-here
+```
+
+## Example Configurations
+
+This repository contains three example configurations demonstrating different Cerebras features:
+
+### 1. Basic Model Evaluation (`promptfooconfig.yaml`)
+
+This configuration evaluates two Cerebras models on their ability to explain complex concepts in simple terms.
+
+```bash
+promptfoo eval
+```
+
+**Expected output:** Compare model responses and latency. The assertions check for topic-specific terms; they do not grade clarity or factual accuracy.
+
+### 2. Structured Outputs (`promptfooconfig-structured.yaml`)
+
+The structured output example demonstrates Cerebras's JSON schema enforcement capabilities, ensuring the model returns consistent, structured recipe data with proper types and required fields.
+
+```bash
+promptfoo eval -c promptfooconfig-structured.yaml
+```
+
+**Expected output:** You'll receive structured JSON outputs for different recipes, with consistent fields like cuisine type, difficulty level, ingredients, and cooking instructions - all following the defined schema.
+
+Example output:
+
+```json
+{
+  "name": "Traditional Pasta Carbonara",
+  "cuisine": "Italian",
+  "difficulty": "medium",
+  "prepTime": 15,
+  "cookTime": 20,
+  "ingredients": [
+    { "name": "spaghetti", "amount": "400g" },
+    { "name": "pancetta", "amount": "150g" },
+    { "name": "eggs", "amount": "3 large" },
+    { "name": "parmesan cheese", "amount": "50g" }
+  ],
+  "instructions": [
+    "Bring a large pot of salted water to boil",
+    "Cook spaghetti according to package instructions",
+    "In a separate pan, cook pancetta until crispy",
+    "In a bowl, whisk eggs and grated parmesan cheese",
+    "Drain pasta, reserving some pasta water",
+    "Toss hot pasta with pancetta, then quickly mix in egg mixture",
+    "Add pasta water as needed to create a silky sauce"
+  ]
+}
+```
+
+### 3. Tool Use (`promptfooconfig-tools.yaml`)
+
+The tool example checks that the model requests the `calculate` function with the expected expression. It validates the returned function call; it does not execute a calculator.
+
+```bash
+promptfoo eval -c promptfooconfig-tools.yaml
+```
+
+**Expected output:** A `calculate` tool call with a JSON `expression` argument matching the test input.
+
+## Model Capabilities
+
+The public model catalog lists `gpt-oss-120b` and `qwen-3.8-27b`. Context limits depend on the account tier: GPT-OSS 120B allows about 65K tokens on free accounts and 131K on paid accounts; Qwen 3.8 27B allows 64K and 128K respectively.
+
+Check the [official model catalog](https://inference-docs.cerebras.ai/models/overview) for current availability. Dedicated deployments have a separate catalog, so a model's absence from this public list does not establish its dedicated availability.
+
+## Pricing & Usage
+
+Check [Cerebras pricing](https://www.cerebras.ai/pricing) for the rates that apply to your model and account. The example compares both public models without assuming that they share prices or account limits.
+
+## Learn More
+
+- [Cerebras Provider Documentation](https://promptfoo.dev/docs/providers/cerebras)
+- [Cerebras API Reference](https://inference-docs.cerebras.ai/)
+- [Cerebras Structured Outputs Guide](https://inference-docs.cerebras.ai/capabilities/structured-outputs/)
+- [Cerebras Tool Use Guide](https://inference-docs.cerebras.ai/capabilities/tool-use/)

@@ -1,0 +1,42 @@
+run-name: Package - Build Filebeat module ${{ inputs.revision }} ${{ inputs.checksum && '- checksum' || '' }} ${{ inputs.id }}
+name: 4.X - Package - Build Filebeat module
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: |
+          Revision used to naming Filebeat package wazuh-filebeat-X.X.tar.gz.
+          Default 0.0.
+        required: false
+        default: "0.0"
+        type: string
+      checksum:
+        description: Generate package checksum.
+        required: false
+        type: boolean
+      id:
+        type: string
+        description: |
+          ID used to identify the workflow uniquely.
+        required: false
+
+  workflow_call:
+    inputs:
+      revision:
+        required: false
+        default: "0.0"
+        type: string
+      checksum:
+        required: false
+        type: boolean
+      id:
+        type: string
+        required: false
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

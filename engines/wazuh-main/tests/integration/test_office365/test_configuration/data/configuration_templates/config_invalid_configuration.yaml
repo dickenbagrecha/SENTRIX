@@ -1,0 +1,64 @@
+- sections:
+    # set_section_wazuh_conf() clears <agent> entirely before repopulating it, so the
+    # <manager><endpoint> the installed package's own config already carried has to be
+    # restated here too -- omitting it left the agent with no server configured at all
+    # ("No valid server IP found").
+    #
+    # The agent's default verification_mode is now 'system', which
+    # RemotedSimulator's self-signed cert fails -- opt out explicitly since this
+    # suite is not testing TLS trust.
+    - section: agent
+      elements:
+        - manager:
+            elements:
+              - endpoint:
+                  value: '127.0.0.1:1517'
+        - ssl:
+            elements:
+              - verification_mode:
+                  value: none
+
+    - section: office365
+      elements:
+        - enabled:
+            value: 'ENABLED'
+        - only_future_events:
+            value: 'ONLY_FUTURE_EVENTS'
+        - interval:
+            value: 'INTERVAL'
+        - curl_max_size:
+            value: 'CURL_MAX_SIZE'
+        - api_auth:
+            elements:
+              - tenant_id:
+                  value: 'TENANT_ID'
+              - client_id:
+                  value: 'CLIENT_ID'
+              - client_secret:
+                  value: 'CLIENT_SECRET'
+        - subscriptions:
+            elements:
+              - subscription:
+                  value: 'SUSCRIPTION'
+
+    - section: sca
+      elements:
+        - enabled:
+            value: 'no'
+
+    - section: rootcheck
+      elements:
+        - disabled:
+            value: 'yes'
+
+    - section: syscheck
+      elements:
+        - disabled:
+            value: 'yes'
+
+    - section: wodle
+      attributes:
+        - name: syscollector
+      elements:
+        - disabled:
+            value: 'yes'

@@ -1,0 +1,207 @@
+/*
+ * Wazuh SYSINFO
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef _HARDWARE_WRAPPER_IMPL_MAC_H
+#define _HARDWARE_WRAPPER_IMPL_MAC_H
+
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/mach_error.h>
+#include "hardwareWrapperInterface.h"
+#include "sysInfo.hpp"
+#include "cmdHelper.h"
+#include "stringHelper.h"
+#include "defer.hpp"
+#include "osPrimitivesInterfaceMac.h"
+#include "utilsWrapperMac.hpp"
+#include "sharedDefs.h"
+
+
+double getMhz(IOsPrimitivesMac* osPrimitives = nullptr);
+
+template <class TOsPrimitivesMac>
+class OSHardwareWrapperMac final : public IOSHardwareWrapper, public TOsPrimitivesMac
+{
+    public:
+        // LCOV_EXCL_START
+        virtual ~OSHardwareWrapperMac() = default;
+        // LCOV_EXCL_STOP
+
+        std::string boardSerial() const
+        {
+            std::string ret{UNKNOWN_VALUE};
+            const auto rawData{UtilsWrapperMac::exec("system_profiler SPHardwareDataType | grep Serial")};
+
+            if (!rawData.empty())
+                ret = Utils::trim(rawData.substr(rawData.find(":")), " :\t\r\n");
+
+            return ret;
+        }
+
+        std::string cpuName() const
+        {
+            size_t len{0};
+            auto ret{this->sysctlbyname("machdep.cpu.brand_string", nullptr, &len, nullptr, 0)};
+
+            if (ret)
+            {
+                throw std::system_error
+                {
+                    ret,
+                    std::system_category(),
+                    "Error getting cpu name size."
+                };
+            }
+
+            const auto spBuff{std::make_unique<char[]>(len + 1)};
+
+            if (!spBuff)
+            {
+                throw std::runtime_error
+                {
+                    "Error allocating memory to read the cpu name."
+                };
+            }
+
+            ret = this->sysctlbyname("machdep.cpu.brand_string", spBuff.get(), &len, nullptr, 0);
+
+            if (ret)
+            {
+                throw std::system_error
+                {
+                    ret,
+                    std::system_category(),
+                    "Error getting cpu name"
+                };
+            }
+
+            spBuff.get()[len] = 0;
+            return std::string{reinterpret_cast<const char*>(spBuff.get())};
+        }
+
+        int cpuCores() const
+        {
+            int cores{0};
+            size_t len{sizeof(cores)};
+            const std::vector<int> mib{CTL_HW, HW_NCPU};
+            const auto ret{this->sysctl(const_cast<int*>(mib.data()), mib.size(), &cores, &len, nullptr, 0)};
+
+            if (ret)
+            {
+                throw std::system_error
+                {
+                    ret,
+                    std::system_category(),
+                    "Error reading cpu cores number."
+                };
+            }
+
+            return cores;
+        }
+
+        double cpuMhz()
+        {
+            return getMhz(static_cast<IOsPrimitivesMac*>(this));
+        }
+
+        uint64_t ramTotal() const
+        {
+            uint64_t ramTotal{0};
+            size_t len{sizeof(ramTotal)};
+            auto ret{this->sysctlbyname("hw.memsize", &ramTotal, &len, nullptr, 0)};
+
+            if (ret)
+            {
+                throw std::system_error
+                {
+                    ret,
+                    std::system_category(),
+                    "Error reading total RAM."
+                };
+            }
+
+            return ramTotal;
+        }
+
+        uint64_t ramFree() const
+        {
+            return availableRam(sampleMemory());
+        }
+
+        uint64_t ramUsage() const
+        {
+            const auto ramTotal{this->ramTotal()};
+
+            if (ramTotal == 0)
+            {
+                return 0;
+            }
+
+            const auto ramFreeValue{this->ramFree()};
+            return ramTotal > ramFreeValue ? ramTotal - ramFreeValue : 0;
+        }
+
+    private:
+        struct MemorySample final
+        {
+            u_int pageSize{0};
+            vm_statistics64_data_t vmStat{};
+        };
+
+        MemorySample sampleMemory() const
+        {
+            MemorySample sample;
+            size_t len{sizeof(sample.pageSize)};
+            auto ret{this->sysctlbyname("vm.pagesize", &sample.pageSize, &len, nullptr, 0)};
+
+            if (ret)
+            {
+                throw std::system_error
+                {
+                    ret,
+                    std::system_category(),
+                    "Error reading page size."
+                };
+            }
+
+            mach_msg_type_number_t count{HOST_VM_INFO64_COUNT};
+            const auto hostPort{this->mach_host_self()};
+            DEFER([this, hostPort]()
+            {
+                this->mach_port_deallocate(mach_task_self(), hostPort);
+            });
+
+            const auto kr{this->host_statistics64(hostPort,
+                                                  HOST_VM_INFO64,
+                                                  reinterpret_cast<host_info64_t>(&sample.vmStat),
+                                                  &count)};
+
+            if (kr != KERN_SUCCESS)
+            {
+                throw std::runtime_error
+                {
+                    std::string{"Error reading virtual memory statistics: "} + mach_error_string(kr)
+                };
+            }
+
+            return sample;
+        }
+
+        static uint64_t availableRam(const MemorySample& sample)
+        {
+            const auto& vmStat{sample.vmStat};
+            const uint64_t availablePages{vmStat.free_count + vmStat.active_count + vmStat.inactive_count};
+            return availablePages * sample.pageSize;
+        }
+};
+
+
+#endif // _HARDWARE_WRAPPER_IMPL_MAC_H

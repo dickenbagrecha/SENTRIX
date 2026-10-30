@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: Evaluating Cerebras models for educational concept explanations
+prompts:
+  - file://prompts.txt
+providers:
+  - id: cerebras:gpt-oss-120b
+    config:
+      temperature: 0.7
+      max_completion_tokens: 1024
+  - id: cerebras:qwen-3.8-27b
+    config:
+      temperature: 0.5
+      max_completion_tokens: 1024
+tests:
+  - vars:
+      topic: quantum computing
+      concept: quantum entanglement
+    assert:
+      - type: contains-any
+        value: ['particles', 'correlation', 'distance', 'spooky action', 'Einstein']
+  - vars:
+      topic: artificial intelligence
+      concept: transformer architecture
+    assert:
+      - type: contains-any
+        value:
+          ['attention mechanism', 'self-attention', 'parallel processing', 'encoder', 'decoder']
+  - vars:
+      topic: astrophysics
+      concept: black hole information paradox
+    assert:
+      - type: contains-any
+        value:
+          [
+            'Hawking radiation',
+            'event horizon',
+            'quantum mechanics',
+            'information loss',
+            'firewall',
+          ]

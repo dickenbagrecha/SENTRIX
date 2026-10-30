@@ -1,0 +1,135 @@
+/* Copyright (C) Wazuh Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#pragma once
+
+#include <functional>
+#include <string>
+
+#include "agent_sync_protocol_c_interface_types.h"
+
+using LoggerFunc = std::function<void(modules_log_level_t, const std::string&)>;
+
+/// @brief Result status for sync operations, especially for integrity checks
+enum class SyncResult
+{
+    SUCCESS,             ///< Operation completed successfully
+    COMMUNICATION_ERROR, ///< Failed to communicate with the manager
+    CHECKSUM_ERROR,      ///< Checksum validation failed
+    START_TIMEOUT_ERROR,       ///< Exceeded maximum retries waiting for a response for the Start message
+    END_TIMEOUT_ERROR,       ///< Exceeded maximum retries waiting for a response for the End message
+    PROTOCOL_ERROR,       ///< Manager sent an unexpected or invalid response
+    NO_GROUPS_ERROR,     ///< No groups available in metadata.
+    PAYLOAD_TOO_LARGE,   ///< Manager rejected the session as larger than its total in-flight
+    ///< budget (HTTP 413); the session must be split and resent smaller.
+};
+
+struct SyncModuleResult
+{
+    bool success{false};
+    std::string failureReason;
+    /// @brief True when the operation was aborted because a stop/shutdown was requested.
+    /// Lets the calling module demote an expected shutdown-time failure from WARNING to
+    /// INFO/DEBUG.
+    bool stopped{false};
+    /// @brief True when the manager did not answer the handshake, or answered that it cannot serve
+    /// this agent yet (Offline). This describes what happened, not whether it is harmless: the same
+    /// condition covers a brief window after an agent restart and a lasting outage (for example the
+    /// manager having no indexer available). Use it together with @ref consecutiveFailures to decide
+    /// the log level.
+    bool managerNotReady{false};
+    /// @brief Number of consecutive failed synchronizations for this module, including this one.
+    /// Reset to zero on the first success. A single failure that recovers on the next cycle is an
+    /// expected hiccup; a growing count means the condition is not clearing and deserves a WARNING.
+    unsigned int consecutiveFailures{0};
+    /// @brief True when the sync was aborted because a prerequisite the manager has to supply
+    /// first (the assigned groups) has not arrived yet. Same
+    /// intent as @ref stopped: lets the calling module demote this from WARNING to INFO/DEBUG,
+    /// since it is expected and normally clears within the next cycle or two (e.g. right after
+    /// an agent restart, before the first /control round trip completes).
+    bool awaitingPrerequisite{false};
+    /// @brief True when the local sync intake itself could not be reached (wazuh-agentd's
+    /// https_client not done starting yet). Deliberately distinct from @ref managerNotReady: this
+    /// never got far enough to hear anything from the manager, so it must not be described as a
+    /// manager-side condition. Same idea as managerNotReady otherwise -- use it together with
+    /// @ref consecutiveFailures to tell a restart hiccup from a lasting local problem.
+    bool localTransportUnavailable{false};
+    /// @brief True when this call ran no session at all because another synchronization was
+    /// already in flight on the same instance (the periodic cycle and a flush colliding, for
+    /// example). Reported as a success -- the in-flight sync is draining the same queue -- but
+    /// a caller that records something about the session that was sent must not do so for a
+    /// call that sent nothing.
+    bool sessionSkipped{false};
+
+    /// @brief True when at least one block of queued items was actually sent to the manager.
+    ///
+    /// @ref success alone cannot distinguish "the manager accepted everything" from "there was
+    /// nothing queued, so no session was opened at all": an empty queue takes an early break and
+    /// returns the initial `true`. That is the intended contract -- a routine "nothing changed"
+    /// cycle is not a failure -- so this field carries the distinction instead, letting a module
+    /// log "nothing to send" rather than "finished successfully".
+    ///
+    /// Not a general license to gate durable state on this field alone: a marker that records
+    /// "the manager has this agent's data" should normally be gated on something that proves a
+    /// round trip, such as @ref IAgentSyncProtocol::notifyDataClean -- gating it on a bare sync
+    /// result instead is what lets an untransmitted cycle be recorded as a completed one (#38899).
+    ///
+    /// FIM's and syscollector's own first-sync-completed markers are a deliberately accepted,
+    /// narrower exception: they gate on `success && sentAnything` together, not on this field
+    /// alone. `success` covers the whole DELTA session for the cycle (it turns false the moment
+    /// any block fails), so the pair proves "every block this cycle sent actually round-tripped",
+    /// closing the exact #38899 symptom (an empty-queue cycle no longer masquerades as a
+    /// completed sync). It is still not the same claim as "the manager has the agent's complete
+    /// current state": a first sync bigger than AgentSyncProtocol's own
+    /// per-cycle block limit (agent.sync_max_blocks_per_cycle) leaves items queued for a later cycle, and
+    /// this cycle's `success && sentAnything` is already true by the time that happens. Accepted
+    /// for these two markers specifically (see run_check.c and
+    /// syscollectorImp.cpp) because the alternative -- notifyDataClean(), an ad hoc
+    /// index-clearing call, not something wired into the periodic DELTA path -- would need a
+    /// separate mechanism entirely; any other consumer wanting a true round-trip proof should
+    /// still reach for that, not this field.
+    ///
+    /// Distinct from @ref sessionSkipped: that one means no session ran at all because another
+    /// was already in flight, while this one is about whether the session that did run carried
+    /// anything.
+    ///
+    /// Always false for metadata and group synchronizations, which send no queued items by
+    /// construction.
+    bool sentAnything{false};
+};
+
+/// @brief Outcome of a module integrity check (IAgentSyncProtocol::requiresFullSync()).
+enum class IntegrityCheckStatus
+{
+    VALID,       ///< The manager confirmed the checksum matches.
+    MISMATCH,    ///< The manager confirmed a checksum mismatch on every attempt; a resync is needed.
+    NOT_CHECKED, ///< The check did not complete, so nothing is known about the checksum.
+};
+
+/// @brief Result of a module integrity check.
+///
+/// NOT_CHECKED is kept apart from VALID so a caller never reports a check that did not happen as
+/// a passed one. Whether it still counts the table as checked for this interval is the caller's
+/// decision; the detail below lets it say why the check did not complete.
+struct IntegrityCheckResult
+{
+    IntegrityCheckStatus status{IntegrityCheckStatus::NOT_CHECKED};
+    /// @brief Why the check did not complete. Empty unless status is NOT_CHECKED.
+    std::string failureReason;
+    /// @brief True when the check was abandoned because a stop/shutdown was requested. Expected
+    /// during shutdown, so callers should not report it as a failure.
+    bool stopped{false};
+    /// @brief Same meaning as SyncModuleResult::managerNotReady.
+    bool managerNotReady{false};
+    /// @brief Same meaning as SyncModuleResult::localTransportUnavailable.
+    bool localTransportUnavailable{false};
+    /// @brief True when the manager had already reported a mismatch (409) that was still being
+    /// confirmed when the check stopped. That mismatch is not acted on, so a caller should say so.
+    bool mismatchUnconfirmed{false};
+};

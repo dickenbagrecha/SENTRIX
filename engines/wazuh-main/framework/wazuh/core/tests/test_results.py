@@ -1,0 +1,570 @@
+#!/usr/bin/env python
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+from copy import deepcopy
+from unittest.mock import patch
+
+import pytest
+
+with patch('wazuh.core.common.wazuh_uid'):
+    with patch('wazuh.core.common.wazuh_gid'):
+        from wazuh.core.results import WazuhResult, AffectedItemsWazuhResult, _goes_before_than, nested_itemgetter, merge
+        from wazuh import WazuhException, WazuhError
+
+param_name = ['affected_items', 'total_affected_items', 'sort_fields', 'sort_casting', 'sort_ascending',
+              'all_msg', 'some_msg', 'none_msg']
+WAZUH_EXCEPTION_CODE = 1725
+FAILED_AGENT_ID = '999'
+
+
+@pytest.fixture(scope='function')
+def get_wazuh_result():
+    return WazuhResult(dct={"data": {"items": [{"item1": "data1"}, {"item2": "OK"}], "message": "Everything ok"}},
+                       str_priority=['KO', 'OK'])
+
+
+@pytest.fixture(scope='function')
+def get_wazuh_affected_item():
+    def _get_affected(params=None):
+        kwargs = {p_name: param for p_name, param in zip(param_name, params)}
+        return AffectedItemsWazuhResult(**kwargs)
+
+    return _get_affected
+
+
+@pytest.fixture(scope='function')
+def get_wazuh_failed_item():
+    item = AffectedItemsWazuhResult()
+    item.add_failed_item(id_=FAILED_AGENT_ID, error=WazuhException(WAZUH_EXCEPTION_CODE))
+    return item
+
+
+@pytest.mark.parametrize('dikt, priority', [
+    ({"data": {"items": [{"item1": "data1"}, {"item2": "OK"}], "message": "Everything ok"}}, ['KO', 'OK']),
+    ({"data": {"items": [{"item1": "data1"}, {"item2": "data2"}], "message": "Everything ok"}}, None),
+])
+def test_results_WazuhResult__merge_str(dikt, priority, get_wazuh_affected_item):
+    """Test method `_merge_str` from `WazuhResult`.
+
+        Parameters
+        ----------
+        dikt : dict
+            Dict with basic information for the class declaration.
+        priority : list
+            Used to set the WazuhResult priority.
+        """
+    wazuh_result = WazuhResult(deepcopy(dikt), str_priority=priority)
+    assert isinstance(wazuh_result, WazuhResult)
+    item2 = wazuh_result.dikt['data']['items'][1]['item2']
+    merge_result = wazuh_result._merge_str(item2, 'KO')
+    assert merge_result == priority[0] if priority else '{}|{}'.format(item2, 'KO')
+
+
+def test_results_WazuhResult_to_dict(get_wazuh_result):
+    """Test method `to_dict` from `WazuhResult`."""
+    dict_result = get_wazuh_result.to_dict()
+    assert isinstance(dict_result, dict)
+    assert (key == result_key for key, result_key in zip(['str_priority', 'result'], dict_result.keys()))
+
+
+def test_results_WazuhResult_render(get_wazuh_result):
+    """Test method `render` from `WazuhResult`."""
+    render_result = get_wazuh_result.render()
+    assert isinstance(render_result, dict)
+    assert render_result == get_wazuh_result.dikt
+
+
+def test_results_WazuhResult_decode_json(get_wazuh_result):
+    """Test class method `decode_json` from `WazuhResult`."""
+    wazuh_result = get_wazuh_result
+    decoded_result = WazuhResult.decode_json(wazuh_result.to_dict())
+    assert decoded_result == wazuh_result
+
+
+@pytest.mark.parametrize('param_value', [
+    # affected_items,total_affected_items, sort_fields, sort_casting, sort_ascending,
+    # all_msg, some_msg, none_msg
+    [['001', '002'], 2, None, ['int'], [True, True], 'Sample message', 'Sample message', 'Sample message'],
+    [['001', '003'], None, None, ['int'], [True, False], 'Sample message', 'Sample message', 'Sample message'],
+    [[], 0, None, None, ['int'], None, 'Sample message', 'Sample message', 'Sample message'],
+    [['001'], None, None, ['str'], None, 'Sample message', 'Sample message', 'Sample message']
+])
+def test_results_AffectedItemsWazuhResult(get_wazuh_affected_item, param_value):
+    """Test class `AffectedItemsWazuhResult`.
+
+    Parameters
+    ----------
+    param_value : list
+        List with param values for _init_.
+    """
+    affected_result = get_wazuh_affected_item(param_value)
+    assert isinstance(affected_result, AffectedItemsWazuhResult)
+    for value, dikt_value in zip(param_value, affected_result.dikt.values()):
+        assert value == dikt_value
+
+
+def test_results_AffectedItemsWazuhResult_add_failed_item():
+    """Test method `add_failed_item` from class `AffectedItemsWazuhResult`."""
+    affected_result = AffectedItemsWazuhResult()
+    id_list = ['001', '002']
+    # Add two failed items with different id but same exception
+    for agent_id in id_list:
+        affected_result.add_failed_item(id_=agent_id, error=WazuhException(WAZUH_EXCEPTION_CODE))
+
+    assert affected_result.failed_items
+    assert set(id_list) == next(iter(affected_result.failed_items.values()))
+
+
+def test_results_AffectedItemsWazuhResult_add_failed_items_from(get_wazuh_failed_item):
+    """Test method `add_failed_items_from` from class `AffectedItemsWazuhResult`."""
+    affected_result = AffectedItemsWazuhResult()
+    failed_result = get_wazuh_failed_item
+    affected_result.add_failed_items_from(failed_result)
+    assert affected_result.failed_items == failed_result.failed_items
+
+
+def test_results_AffectedItemsWazuhResult_add_failed_items_from_exception():
+    """Test raised exception from method `add_failed_items_from` from class `AffectedItemsWazuhResult`."""
+    affected_result = AffectedItemsWazuhResult()
+    with pytest.raises(WazuhException, match='.* 1000 .*'):
+        affected_result.add_failed_items_from('Invalid type')
+
+
+def test_results_AffectedItemsWazuhResult_remove_failed_items(get_wazuh_failed_item):
+    """Test method `remove_failed_items` from class `AffectedItemsWazuhResult`."""
+    failed_result = get_wazuh_failed_item
+    failed_result.remove_failed_items(code={WAZUH_EXCEPTION_CODE})
+    assert not failed_result.failed_items
+
+
+def test_results_AffectedItemsWazuhResult___or__(get_wazuh_failed_item):
+    """Test method `__or__` from class `AffectedItemsWazuhResult`."""
+    agent_list_1 = ['001', '002']
+    agent_list_2 = ['004', '003']
+    affected_item_1 = AffectedItemsWazuhResult(affected_items=deepcopy(agent_list_1))
+    affected_item_2 = AffectedItemsWazuhResult(affected_items=deepcopy(agent_list_2))
+    failed_item = get_wazuh_failed_item
+
+    # Expect 'affected_items': ['001', '002', '003']
+    or_result_1 = affected_item_1 | affected_item_2
+    assert set(agent_list_1 + agent_list_2) == set(or_result_1.affected_items)
+    assert not or_result_1.failed_items
+
+    # Expect new failed_item
+    or_result_2 = or_result_1 | failed_item
+    assert or_result_2.failed_items == failed_item.failed_items
+
+
+def test_results_AffectedItemsWazuhResult___or___reconciles_conflicting_verdicts():
+    """Test that `__or__` reconciles conflicting per-item verdicts from different sources.
+
+    Regression test: when merging responses from multiple cluster nodes, one node may report an
+    item as successfully affected while another (e.g. working from a stale local view) reports
+    that same item as failed. A success must be authoritative: the item should end up only in
+    affected_items, never duplicated, and it must not also linger in failed_items.
+    """
+    success = AffectedItemsWazuhResult(affected_items=['001', '002'])
+
+    stale_failure = AffectedItemsWazuhResult(affected_items=['003'])
+    stale_failure.add_failed_item(id_='001', error=WazuhException(WAZUH_EXCEPTION_CODE))
+    stale_failure.add_failed_item(id_='004', error=WazuhException(WAZUH_EXCEPTION_CODE))
+
+    # Another node redundantly reports '002' as affected too (e.g. duplicate task creation).
+    redundant_success = AffectedItemsWazuhResult(affected_items=['002'])
+
+    result = success | stale_failure | redundant_success
+
+    assert sorted(result.affected_items) == ['001', '002', '003']
+    assert result.total_affected_items == 3
+    assert next(iter(result.failed_items.values())) == {'004'}
+    assert result.total_failed_items == 1
+
+
+@pytest.mark.parametrize('or_item, expected_result', [
+    (WazuhError(WAZUH_EXCEPTION_CODE, ids=['001']), AffectedItemsWazuhResult),
+    (WazuhError(WAZUH_EXCEPTION_CODE), WazuhException),
+    (WazuhException(WAZUH_EXCEPTION_CODE), WazuhException),
+    ({'Invalid type': None}, None)
+])
+def test_results_AffectedItemsWazuhResult___or___exceptions(or_item, expected_result):
+    """Test raised exceptions from method `__or__` from class `AffectedItemsWazuhResult`."""
+    affected_result = AffectedItemsWazuhResult()
+    # Force an exception trying to use __or__ with an invalid type
+    try:
+        or_result = affected_result | or_item
+        assert isinstance(or_result, expected_result)
+    except WazuhException as e:
+        if e.code != 1000:
+            raise e
+
+
+def test_results_AffectedItemsWazuhResult_to_dict():
+    """Test method `to_dict` from class `AffectedItemsWazuhResult`."""
+    affected_result = AffectedItemsWazuhResult()
+    dict_item = affected_result.to_dict()
+    assert isinstance(dict_item, dict)
+    assert dict_item
+    assert (field == dict_field for field, dict_field in zip(affected_result, dict_item))
+
+
+def test_results_AffectedItemsWazuhResult_properties():
+    """Test getters and setters from class `AffectedItemsWazuhResult`."""
+    affected_result = AffectedItemsWazuhResult()
+    # Lacks 'failed_items', 'total_failed_items' and 'message'
+    property_list = ['affected_items', 'sort_fields', 'sort_casting', 'sort_ascending', 'total_affected_items',
+                     'all_msg', 'some_msg', 'none_msg']
+    values_list = [['001', '002'], 2, param_name, ['int'], [True, True], 'Sample message', 'Sample message',
+                   'Sample message']
+
+    assert len(property_list) == len(values_list)
+    # Check getters and setters dynamically
+    for key, value in zip(property_list, values_list):
+        setattr(affected_result, key, value)
+        assert value == getattr(affected_result, key)
+
+
+def test_results_AffectedItemsWazuhResult_failed_items_properties(get_wazuh_failed_item):
+    """Test `failed_items` properties from class `AffectedItemsWazuhResult`."""
+    fail_items = get_wazuh_failed_item.failed_items
+    total_fail_items = get_wazuh_failed_item.total_failed_items
+    assert isinstance(fail_items, dict)
+    assert total_fail_items == 1
+
+
+def test_results_AffectedItemsWazuhResult_message_property():
+    """Test `message` property from class `AffectedItemsWazuhResult`."""
+    messages = {'none_msg': 'none_msg', 'all_msg': 'all_msg', 'some_msg': 'some_msg'}
+    # Force every possible case since this property returns a different value depending on affected_items
+    none_msg_result = AffectedItemsWazuhResult(**messages).message
+    all_msg_result = AffectedItemsWazuhResult(**messages, affected_items=['001']).message
+    aux_result = AffectedItemsWazuhResult(**messages, affected_items=['001'])
+    aux_result.add_failed_item(WazuhException(WAZUH_EXCEPTION_CODE))
+    some_msg_result = aux_result.message
+    assert messages
+    assert len(messages) == 3
+    assert (msg == item_msg for msg, item_msg in zip(messages, [none_msg_result, all_msg_result, some_msg_result]))
+
+
+@pytest.mark.parametrize('self_field, other_field, key, expected_result', [
+    ('Sample1', 'Sample2', 'older_than', 'Sample1'),
+    ('Sample1', 'Sample2', None, 'Sample1|Sample2')
+])
+def test_results_AffectedItemsWazuhResult__merge_str(self_field, other_field, key, expected_result):
+    """Test method `_merge_str` from class `AffectedItemsWazuhResult`."""
+    affected_result = AffectedItemsWazuhResult()
+    merge_result = affected_result._merge_str(self_field, other_field, key=key)
+    assert merge_result == expected_result
+
+
+def test_results_AffectedItemsWazuhResult_encode_decode_json(get_wazuh_affected_item):
+    """Test methods `encode_json` and `decode_json` from class `AffectedItemsWazuhResult`."""
+    param_list = [['001', '002'], 2, None, ['int'], [True, True], 'Sample message', 'Sample message', 'Sample message']
+    affected_result = get_wazuh_affected_item(param_list)
+    affected_result.add_failed_item(id_=FAILED_AGENT_ID, error=WazuhException(WAZUH_EXCEPTION_CODE))
+    # Use a complete AffectedIemsWazuhResult to encode a json and then decode it
+    json_item = affected_result.encode_json()
+    decoded_json = AffectedItemsWazuhResult.decode_json(json_item)
+    assert affected_result == decoded_json
+
+
+def test_results_AffectedItemsWazuhResult_render(get_wazuh_affected_item):
+    """Test method `render` from class `AffectedItemsWazuhResult`."""
+    param_list = [['001', '002'], 2, None, ['int'], [True, True], 'Sample message', 'Sample message', 'Sample message']
+    affected_result = get_wazuh_affected_item(param_list)
+    for agent_id in [FAILED_AGENT_ID, 'Invalid ID']:
+        affected_result.add_failed_item(id_=agent_id, error=WazuhException(WAZUH_EXCEPTION_CODE))
+    # Render a valid AffectedItemsWazuhResult and check it has all the expected fields
+    render_result = affected_result.render()
+    assert isinstance(render_result, dict)
+    assert render_result
+    assert (field in ['data', 'message'] for field in render_result)
+    assert render_result['data']
+    assert (field in ['affected_items', 'total_affected_items', 'total_failed_items', 'failed_items']
+            for field in render_result['data'])
+
+
+@pytest.mark.parametrize('item, expressions, expected_result', [
+    ({'a': {'b': 3}, 'c.1': 5}, ['a.b', 'c\\.1'], (3, 5)),
+    ({'a': {'b': 3}, 'c.1': 5}, ['a.b', 'f'], (3, None)),
+    ([{'a': {'b': 3}, 'c.1': 5}], ['c\\.1'], [{'a': {'b': 3}, 'c.1': 5}])
+])
+def test_results_nested_itemgetter(item, expressions, expected_result):
+    """Test function `nested_itemgetter` from module results
+
+    Parameters
+    ----------
+    item : dict or list
+        Dict to get data from. We use a list to force a TypeError.
+    expressions : list(str)
+        Expressions used to find certain data from `item`.
+    expected_result : tuple
+        Tuple with the expected result to assert if the function is working properly.
+    """
+    assert expected_result == nested_itemgetter(*expressions)(item)
+
+
+@pytest.mark.parametrize('a, b, ascending, casters, expected_result', [
+    (['sample'], ['elpmas'], None, None, False),
+    (['sample'], ['elpmas'], [False], [list], True),
+    (['sample'], ['elpmas'], [True], [str], False),
+    (['elpmas'], ['sample'], [True], [None], True),
+    ([None], [None], [True], [None], False),
+    ([None], ['sample'], [True], [None], True),
+    (['sample'], [None], [True], [None], False),
+    (['equal'], ['equal'], None, [str], False)
+])
+def test_results__goes_before_than(a, b, ascending, casters, expected_result):
+    """Test function `_goes_before_than` from module results.
+
+    Parameters
+    ----------
+    a : tuple or list
+        Tuple or list to be compared.
+    b : tuple or list
+        Tuple or list to be compared.
+    ascending : list(bool)
+        Tuple or list of booleans with a length equal to the minimum length between `a` and `b`. True if ascending,
+        False otherwise.
+    casters : iterable
+        Iterable of callables with a length equal to the minimum length between `a` and `b`. The callable msut fit any
+        class in builtins module.
+    expected_result : bool
+        Expected result after the method call.
+    """
+    assert _goes_before_than(a, b, ascending=ascending, casters=casters) == expected_result
+
+
+@pytest.mark.parametrize('iterables, criteria, ascending, types, expected_result', [
+    ((['001', '002'], ['003', '004']), None, [True], ['int'], ['001', '002', '003', '004']),
+    ((['001', '002'], ['003', '004']), None, [False], ['int'], ['003', '004', '001', '002']),
+    ((['001', '002'], ['003', '004']), ['1'], [True], ['int'], ['001', '002', '003', '004']),
+])
+def test_results_merge(iterables, criteria, ascending, types, expected_result):
+    """Test function `merge` from module results.
+
+    Parameters
+    ----------
+    iterables : list(list) or tuple(list)
+        List of lists to be merged.
+    criteria : list(str) or tuple(str)
+        Expressions accepted by the `nested_itemgetter` function.
+    ascending : list(bool) or tuple(bool)
+        True for ascending, False otherwise.
+    types : list(str) or tuple(str)
+        Must fit a class in builtins.
+    expected_result : list(str)
+        Expected results after merge.
+    """
+    assert merge(*iterables, criteria=criteria, ascending=ascending, types=types) == expected_result
+
+
+def _node_result(affected=(), failed=()):
+    """One node's answer, shaped as a distributed operation builds it."""
+    result = AffectedItemsWazuhResult(all_msg='all ok', some_msg='some failed', none_msg='none ok')
+    for item_id in affected:
+        result.affected_items.append(item_id)
+        result.total_affected_items += 1
+    for item_id, code in failed:
+        result.add_failed_item(id_=item_id, error=WazuhError(code))
+    return result
+
+
+def test_node_attribution_survives_the_success_wins_reconciliation():
+    """The node that could not serve must stay visible after the merge resolves the item.
+
+    `__or__` lets a success override a failure for the same item, which is right for the stale-view
+    case it exists for and wrong for a node-local fact: an agent whose upgrade task was created on
+    two nodes and not on a third merges to a clean success, leaving the operator with no way to
+    learn which node could not serve it (#39428).
+
+    Attribution is recorded per node BEFORE the merge and unioned, so it survives that.
+    """
+    master = _node_result(affected=['001'])
+    worker1 = _node_result(affected=['001'])
+    worker2 = _node_result(failed=[('001', 1824)])
+    for name, result in (('master', master), ('worker1', worker1), ('worker2', worker2)):
+        result.attribute_to_node(name)
+
+    merged = (master | worker1) | worker2
+    rendered = merged.render()
+
+    # The item's own outcome is still reconciled: it WAS scheduled, and that is what matters to it.
+    assert rendered['data']['affected_items'] == ['001']
+    assert rendered['data']['failed_items'] == []
+
+    # And the node breakdown is what the merge can no longer erase.
+    assert rendered['data']['nodes'] == {
+        'master': {'affected_items': ['001']},
+        'worker1': {'affected_items': ['001']},
+        'worker2': {'failed_items': {1824: ['001']}},
+    }
+
+
+def test_node_attribution_is_absent_when_nothing_attributed():
+    """A result nobody attributed must render exactly as before: no new key.
+
+    Every endpoint shares this class, so the field has to stay invisible unless DAPI populated it.
+    """
+    result = _node_result(affected=['001'])
+
+    assert 'nodes' not in result.render()['data']
+
+
+def test_node_attribution_ignores_document_shaped_affected_items():
+    """Endpoints whose affected items are documents must contribute no attribution.
+
+    `GET /cluster/{node_id}/daemons/stats` puts a whole metrics dump per daemon in
+    `affected_items`, and `/logs` puts log entries. Recording those per node would duplicate the
+    entire payload once per node, and the API's own response validator rejects them outright --
+    it answered `500 Response body does not conform to specification ... is not of type 'string'
+    - 'data.nodes.worker2.affected_items.0'` when this recorded them.
+
+    "Which items did this node apply" is only a question for identifier-shaped results.
+    """
+    result = AffectedItemsWazuhResult()
+    result.affected_items.append({'name': 'wazuh-manager-analysisd', 'uptime': '2026-09-22T20:48:15.257Z'})
+    result.total_affected_items = 1
+
+    result.attribute_to_node('worker2')
+
+    assert result.node_attribution == {}, 'a document is not an identifier'
+    assert 'nodes' not in result.render()['data']
+
+
+def test_node_attribution_records_a_failure_even_for_document_shaped_results():
+    """A failure is keyed by identifier, so it is recorded whatever the affected items look like."""
+    result = AffectedItemsWazuhResult()
+    result.affected_items.append({'name': 'wazuh-manager-analysisd'})
+    result.total_affected_items = 1
+    result.add_failed_item(id_='001', error=WazuhError(1824))
+
+    result.attribute_to_node('worker2')
+
+    assert result.node_attribution == {'worker2': {'failed_items': {1824: ['001']}}}
+
+
+def test_node_attribution_keeps_every_item_of_a_code_raised_with_per_item_messages():
+    """Same code, different extra_message, must not drop the earlier exception's items.
+
+    `_failed_items` is keyed by exception and a WazuhException's identity includes its message,
+    so 1824 raised once per agent with the task manager's own text is one key per agent. The
+    per-node entry is keyed by code alone and must union them, matching the top-level count.
+    """
+    result = AffectedItemsWazuhResult(all_msg='all ok', some_msg='some failed', none_msg='none ok')
+    result.affected_items.append('004')
+    result.total_affected_items = 1
+    result.add_failed_item(id_='003', error=WazuhError(1824, cmd_error=True,
+                                                       extra_message='WPK file does not exist: windows 5.0.1'))
+    result.add_failed_item(id_='005', error=WazuhError(1824, cmd_error=True,
+                                                       extra_message='WPK file does not exist: macos 5.0.1'))
+
+    result.attribute_to_node('worker01')
+
+    rendered = result.render()['data']
+    assert rendered['total_failed_items'] == 2
+    assert rendered['nodes'] == {'worker01': {'affected_items': ['004'], 'failed_items': {1824: ['003', '005']}}}
+
+
+def test_uninformative_failure_yields_to_a_real_verdict():
+    """1774 must not double-list an agent some other node did report on.
+
+    Every node an agent has never connected to answers 1774 for it, which says the node has nothing
+    to say rather than anything about the agent. Once the merge has collected the nodes that do
+    know it, keeping that placeholder lists the agent twice -- and counts it twice, so a request
+    for three agents comes back with more failures than agents.
+    """
+    master = _node_result(affected=['001'], failed=[('002', 1761)])
+    worker = _node_result(failed=[('001', 1774), ('002', 1774), ('003', 1774)])
+
+    merged = master | worker
+    merged.drop_uninformative_failures(1774)
+
+    rendered = merged.render()['data']
+    assert rendered['affected_items'] == ['001']
+    # 002 keeps the only answer that explains anything, and 003 keeps the placeholder: no node has
+    # ever seen it, so "no node has information about this agent" IS the outcome.
+    assert [(item['error']['code'], item['id']) for item in rendered['failed_items']] == \
+           [(1761, ['002']), (1774, ['003'])]
+    assert rendered['total_failed_items'] == 2, 'the placeholder must not be counted twice'
+
+
+def test_uninformative_failure_survives_in_the_per_node_breakdown():
+    """Dropping the placeholder from the merge must not erase it from `nodes`.
+
+    That breakdown is each node's own answer, and there "this node has no information about the
+    agent" is the point: it names the node that could not serve the agent (#39428).
+    """
+    master = _node_result(affected=['001'])
+    master.attribute_to_node('master')
+    worker = _node_result(failed=[('001', 1774)])
+    worker.attribute_to_node('worker1')
+
+    merged = master | worker
+    merged.drop_uninformative_failures(1774)
+
+    assert merged.render()['data']['failed_items'] == []
+    assert merged.node_attribution['worker1'] == {'failed_items': {1774: ['001']}}
+
+
+def test_upgrade_placeholder_yields_and_stands_alone():
+    """1816 is dropped where another node answered, and kept where no node did.
+
+    The Task Manager answers 1816 on every node for an agent whose OS information is incomplete, so
+    for such an agent it is the only outcome there is and must reach the top level -- skipping it on
+    the node is what made the refusal invisible. Every entry carrying the code is reconciled, not
+    the first: errors are keyed by their text, so two wordings make two entries.
+    """
+    def upgrade_error(code, message):
+        return WazuhError(code, cmd_error=True, extra_message=message)
+
+    master = _node_result(affected=['001'])
+    master.add_failed_item(id_='002', error=upgrade_error(1824, 'The WPK file does not exist'))
+    master.add_failed_item(id_='003', error=upgrade_error(1816, 'Agent information not found in database'))
+    worker = _node_result()
+    worker.add_failed_item(id_='001', error=upgrade_error(1816, 'Agent information not found in database'))
+    worker.add_failed_item(id_='002', error=upgrade_error(1816, 'Agent information not found'))
+    worker.add_failed_item(id_='003', error=upgrade_error(1816, 'Agent information not found in database'))
+
+    merged = master | worker
+    merged.drop_uninformative_failures(1816)
+
+    rendered = merged.render()['data']
+    assert rendered['affected_items'] == ['001']
+    failed = {}
+    for item in rendered['failed_items']:
+        failed.setdefault(item['error']['code'], set()).update(item['id'])
+    # 002's second-wording 1816 is the entry a first-match drop would have left behind.
+    assert failed == {1824: {'002'}, 1816: {'003'}}
+    assert rendered['total_failed_items'] == 2
+
+
+def test_lagging_1701_yields_before_the_placeholders_are_judged():
+    """The order DistributedAPI drops in: 1701 first, then 1774.
+
+    A worker its client.keys copy has not reached answers 1701 for an agent the master knows but
+    that has never connected (1774). Dropped in the other order, 1701 would be the real answer
+    that removes the 1774 and the agent would come back as non-existent. An agent no node knows
+    keeps its 1701.
+    """
+    master = _node_result(failed=[('001', 1774), ('999', 1701)])
+    worker = _node_result(failed=[('001', 1701), ('999', 1701)])
+
+    merged = master | worker
+    merged.drop_uninformative_failures(1701)
+    merged.drop_uninformative_failures(1774)
+
+    rendered = merged.render()['data']
+    assert [(item['error']['code'], item['id']) for item in rendered['failed_items']] == \
+           [(1701, ['999']), (1774, ['001'])]
+    assert rendered['total_failed_items'] == 2
+
+
+def test_drop_uninformative_failures_is_a_no_op_without_the_code():
+    """A result that never carried the placeholder must come out untouched."""
+    result = _node_result(affected=['001'], failed=[('002', 1761)])
+
+    result.drop_uninformative_failures(1774)
+
+    assert result.render()['data']['total_failed_items'] == 1

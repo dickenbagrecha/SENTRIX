@@ -1,0 +1,59 @@
+/*
+ * Wazuh Module for Security Configuration Assessment
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef WM_SCA_H
+#define WM_SCA_H
+
+#include "os_xml.h"
+#include "wmodules_def.h"
+
+#define WM_SCA_LOGTAG ARGV0 ":sca"
+
+typedef struct wm_sca_policy_t {
+    unsigned int enabled:1;
+    unsigned int remote:1;
+    char *policy_path;
+    char *policy_id;
+    char *policy_regex_type;
+} wm_sca_policy_t;
+
+typedef struct wm_sca_db_sync_flags_t {
+    unsigned int enable_synchronization:1;  // Enable database synchronization
+    uint32_t sync_interval;                 // Synchronization interval
+    uint32_t integrity_interval;            // Integrity check interval (0 = every sync)
+} wm_sca_db_sync_flags_t;
+
+typedef struct wm_sca_t {
+    int enabled;
+    int scan_on_start;
+    int max_eps;
+    wm_sca_policy_t** policies;
+    int remote_commands:1;
+    int commands_timeout;
+    unsigned int interval;                  // Scan interval in seconds
+    wm_sca_db_sync_flags_t sync;
+} wm_sca_t;
+
+extern const wm_context WM_SCA_CONTEXT;
+
+/**
+ * @brief Read configuration and return a module (if enabled) or NULL (if disabled)
+ * @param xml XML object
+ * @param nodes XML nodes to analyze
+ * @param module SCA configuration structure
+ * @param skip_ruleset_load When set, skips scanning the default SCA ruleset
+ *        folder on disk. Used when only validating the XML content (e.g. on
+ *        the manager, which never runs the SCA module itself) so validation
+ *        does not depend on, or report on, filesystem state that is
+ *        irrelevant to it.
+ */
+int wm_sca_read(const OS_XML* xml, xml_node** nodes, wmodule* module, int agent_cfg);
+
+#endif // WM_SCA_H

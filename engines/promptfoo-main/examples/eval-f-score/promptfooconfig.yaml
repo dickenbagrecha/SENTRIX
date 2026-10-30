@@ -1,0 +1,81 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: IMDB Review Sentiment Analysis
+
+providers:
+  - openai:gpt-4.1-mini
+
+prompts:
+  - label: Sentiment Analysis
+    raw: |
+      Analyze the sentiment of the following movie review. Classify it as either positive or negative.
+
+      Review: "{{text}}"
+
+      Respond with a JSON object in the following format:
+      {
+        "sentiment": "positive" or "negative",
+        "confidence": number between 1-10,
+        "reasoning": "brief explanation"
+      }
+    config:
+      response_format:
+        type: json_schema
+        json_schema:
+          name: MovieReviewSentiment
+          schema:
+            type: object
+            properties:
+              sentiment:
+                type: string
+                enum: ['positive', 'negative']
+              confidence:
+                type: integer
+                minimum: 1
+                maximum: 10
+              reasoning:
+                type: string
+            required: ['sentiment', 'confidence', 'reasoning']
+
+defaultTest:
+  assert:
+    # Basic JSON validation
+    - type: is-json
+
+    # Return the confusion matrix with the accuracy grade so zero-valued
+    # counters do not count as failed assertions or change the overall score.
+    - type: javascript
+      value: |
+        const predicted = output.sentiment;
+        const expected = context.vars.sentiment;
+        const correct = predicted === expected;
+        return {
+          pass: correct,
+          score: Number(correct),
+          reason: correct ? 'Correct sentiment' : `Expected ${expected}, got ${predicted}`,
+          namedScores: {
+            accuracy: Number(correct),
+            true_positives: Number(predicted === 'positive' && expected === 'positive'),
+            false_positives: Number(predicted === 'positive' && expected === 'negative'),
+            false_negatives: Number(predicted === 'negative' && expected === 'positive'),
+            true_negatives: Number(predicted === 'negative' && expected === 'negative'),
+          },
+        };
+
+derivedMetrics:
+  # Precision = TP / (TP + FP)
+  - name: precision
+    value: 'true_positives + false_positives > 0 ? true_positives / (true_positives + false_positives) : 0'
+
+  # Recall = TP / (TP + FN)
+  - name: recall
+    value: 'true_positives + false_negatives > 0 ? true_positives / (true_positives + false_negatives) : 0'
+
+  # F1 Score = 2 * (precision * recall) / (precision + recall)
+  - name: f1_score
+    value: '2 * true_positives + false_positives + false_negatives > 0 ? 2 * true_positives / (2 * true_positives + false_positives + false_negatives) : 0'
+
+  # Accuracy = (TP + TN) / (TP + TN + FP + FN)
+  - name: accuracy_score
+    value: 'true_positives + true_negatives + false_positives + false_negatives > 0 ? (true_positives + true_negatives) / (true_positives + true_negatives + false_positives + false_negatives) : 0'
+
+tests: file://imdb_eval_sample.csv

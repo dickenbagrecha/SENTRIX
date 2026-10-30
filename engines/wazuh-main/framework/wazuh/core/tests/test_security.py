@@ -1,0 +1,155 @@
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+from contextvars import ContextVar
+from unittest.mock import patch
+
+import pytest
+
+from wazuh.tests.test_security import db_setup  # noqa
+
+
+@patch('yaml.safe_load')
+def test_load_spec(mock_safe_load, db_setup):
+    """Test if the function load_spec works properly.
+
+    Parameters
+    ----------
+    mock_safe_load: MagicMock
+        Mock of safe_load method.
+    db_setup: callable
+        This function creates the rbac.db file.
+    """
+    security, _, _ = db_setup
+    # To execute the function first it's necessary to clear the cache.
+    security.load_spec.cache_clear()
+    security.load_spec()
+    mock_safe_load.assert_called()
+    # Clearing the cache again since this call used mocked resources.
+    security.load_spec.cache_clear()
+
+
+def test_revoke_tokens(db_setup):
+    """Checks that the return value of revoke_tokens is a WazuhResult.
+
+    Parameters
+    ----------
+    db_setup: callable
+        This function creates the rbac.db file.
+    """
+    with patch('wazuh.core.security.change_keypair', side_effect=None):
+        security, WazuhResult, _ = db_setup
+        mock_current_user = ContextVar('current_user', default='wazuh')
+        with patch("wazuh.core.common.current_user", new=mock_current_user):
+            result = security.revoke_current_user_tokens()
+            assert isinstance(result, WazuhResult)
+
+
+@pytest.mark.parametrize('role_list, expected_roles', [
+    ([104], {104}),
+    ([102, 103], {102, 103}),
+    ([], set())
+])
+def test_invalid_roles_tokens(db_setup, role_list, expected_roles):
+    """Check that the argument passed to `TokenManager.add_user_roles_rules` formed by `roles` is correct.
+
+    Parameters
+    ----------
+    db_setup: callable
+        This function creates the rbac.db file.
+    role_list : list
+        List of roles.
+    expected_roles : set
+        Expected roles.
+    """
+    with patch('wazuh.core.security.TokenManager.add_user_roles_rules') as TM_mock:
+        _, _, core_security = db_setup
+        core_security.invalid_roles_tokens(roles=[role_id for role_id in role_list])
+        assert set(TM_mock.call_args.kwargs['roles']) == expected_roles
+
+
+@patch('wazuh.core.security.TokenManager.add_user_roles_rules')
+def test_invalid_run_as_tokens(mock_add_user_roles_rules, db_setup):
+    """Check that TokenManager's add_user_roles_rules method is called with the expected parameters.
+
+    Parameters
+    ----------
+    db_setup: callable
+        This function creates the rbac.db file.
+    """
+    _, _, core_security = db_setup
+    core_security.invalid_run_as_tokens()
+    mock_add_user_roles_rules.assert_called_with(run_as=True)
+
+
+@patch('wazuh.core.security.TokenManager.add_user_roles_rules')
+def test_invalid_run_as_context_tokens(mock_add_user_roles_rules, db_setup):
+    """Check that only the given run_as authorization contexts are handed to add_user_roles_rules."""
+    _, _, core_security = db_setup
+    core_security.invalid_run_as_context_tokens(contexts=['abc', 'abc', 'def'])
+    mock_add_user_roles_rules.assert_called_with(contexts={'abc', 'def'})
+
+
+def test_revoke_run_as_tokens_by_authorization_context(db_setup):
+    """Logging out with a run_as token revokes its authorization context, never the account it names."""
+    security, WazuhResult, _ = db_setup
+    mock_current_user = ContextVar('current_user', default='wazuh-internal-client')
+    with patch("wazuh.core.common.current_user", new=mock_current_user), \
+            patch('wazuh.security.invalid_users_tokens') as mock_users, \
+            patch('wazuh.security.invalid_run_as_context_tokens') as mock_contexts:
+        result = security.revoke_current_user_tokens(run_as=True, hash_auth_context='abc')
+
+    assert isinstance(result, WazuhResult)
+    mock_contexts.assert_called_once_with(contexts=['abc'])
+    mock_users.assert_not_called()
+
+
+def test_revoke_non_run_as_tokens_by_user(db_setup):
+    """Logging out with a regular token still revokes every token of its user."""
+    security, _, _ = db_setup
+    mock_current_user = ContextVar('current_user', default='wazuh')
+    with patch("wazuh.core.common.current_user", new=mock_current_user), \
+            patch('wazuh.security.invalid_users_tokens') as mock_users, \
+            patch('wazuh.security.invalid_run_as_context_tokens') as mock_contexts:
+        security.revoke_current_user_tokens()
+
+    mock_users.assert_called_once()
+    assert len(mock_users.call_args.kwargs['users']) == 1
+    mock_contexts.assert_not_called()
+
+
+@pytest.mark.parametrize('user_list, expected_users', [
+    ([104], {104}),
+    ([102, 103], {102, 103}),
+    ([], set())
+])
+def test_invalid_users_tokens(db_setup, user_list, expected_users):
+    """Check that the argument passed to `TokenManager.add_user_roles_rules` formed by `users` is correct.
+
+    Parameters
+    ----------
+    db_setup: callable
+        This function creates the rbac.db file.
+    user_list : list
+        List of users.
+    expected_users : set
+        Expected users.
+    """
+    with patch('wazuh.core.security.TokenManager.add_user_roles_rules') as TM_mock:
+        _, _, core_security = db_setup
+        core_security.invalid_users_tokens(users=[user_id for user_id in user_list])
+        related_users = TM_mock.call_args.kwargs['users']
+        assert set(related_users) == expected_users
+
+
+@patch("wazuh.core.security.revoke_tokens")
+@patch("wazuh.core.security.check_database_integrity")
+@patch("wazuh.core.security.os.remove")
+def test_rbac_db_factory_reset(remove_mock, db_integrity_mock, revoke_mock, db_setup):
+    """Check that the RBAC database factory reset is correct."""
+    _, _, core_security = db_setup
+    assert core_security.rbac_db_factory_reset() == {'reset': True}
+    assert remove_mock.call_args[0][0].endswith("rbac.db")
+    db_integrity_mock.assert_called_once()
+    revoke_mock.assert_called_once()

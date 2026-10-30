@@ -1,0 +1,162 @@
+import React from 'react';
+
+import Head from '@docusaurus/Head';
+import Link from '@docusaurus/Link';
+import AutoFixHighIcon from '@mui/icons-material/AutoFixHigh';
+import BiotechIcon from '@mui/icons-material/Biotech';
+import GitHubIcon from '@mui/icons-material/GitHub';
+import VolumeOffIcon from '@mui/icons-material/VolumeOff';
+import { BenefitItem } from '@site/src/components/BenefitItem';
+import Layout from '@theme/Layout';
+import clsx from 'clsx';
+import ProofBannerSection from '../../components/CodeScanProofBanner';
+import VulnerabilityTypesSection from '../../components/CodeScanVulnerabilities';
+import LogoContainer from '../../components/LogoContainer';
+import styles from '../landing-page.module.css';
+
+function HeroSection() {
+  return (
+    <section className={styles.heroSection}>
+      <div className="container">
+        <img
+          src="/img/docs/code-scanning/github.png"
+          alt="GitHub PR with security findings"
+          className={clsx(styles.heroImage, styles.heroImageGitHubScanner)}
+        />
+        <div className={styles.logoSection}>
+          Promptfoo is trusted by teams at...
+          <LogoContainer className={styles.heroLogos} noBackground noBorder />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function GitHubActionHeader() {
+  return (
+    <header className={clsx('hero', styles.heroBanner)}>
+      <div className="container">
+        <div className={styles.heroContent}>
+          <h1 className={styles.heroTitle}>Security scanning for LLM apps</h1>
+          <p className={styles.heroSubtitle}>
+            Find AI-based vulnerabilities in pull requests before you merge.
+          </p>
+          <div className={styles.heroButtons}>
+            <Link
+              className={clsx('button button--primary button--lg', styles.buttonPrimary)}
+              to="https://github.com/apps/promptfoo-scanner"
+            >
+              <GitHubIcon />
+              Install on GitHub
+            </Link>
+            <Link
+              className={clsx('button button--secondary button--lg', styles.buttonSecondary)}
+              to="/docs/code-scanning/github-action/"
+            >
+              View Docs
+            </Link>
+          </div>
+        </div>
+      </div>
+      <HeroSection />
+    </header>
+  );
+}
+
+function BenefitsSection() {
+  return (
+    <section className={styles.benefitsSection}>
+      <div className="container">
+        <div className={styles.sectionEyebrow}>Built for developers</div>
+        <h2 className={styles.sectionTitle}>Real security that fits your workflow</h2>
+        <p className={styles.sectionSubtitle}>Flag dangerous code without adding friction.</p>
+        <div className={styles.benefitsList}>
+          <BenefitItem
+            styles={styles}
+            icon={<BiotechIcon className={styles.benefitIcon} />}
+            title="Deep tracing"
+          >
+            Beyond the PR itself, the scanner agentically traces LLM inputs, outputs, and capability
+            changes deep into the larger repository to identify subtle yet critical issues that
+            human reviewers can struggle to catch.
+          </BenefitItem>
+          <BenefitItem
+            styles={styles}
+            icon={<VolumeOffIcon className={styles.benefitIcon} />}
+            title="No noise"
+          >
+            Despite the comprehensive approach, it has a high bar for reporting, avoiding false
+            positives and alert fatigue. Maintainers can configure severity levels and provide
+            custom instructions to tailor sensitivity to their needs.
+          </BenefitItem>
+          <BenefitItem
+            styles={styles}
+            icon={<AutoFixHighIcon className={styles.benefitIcon} />}
+            title="Fix suggestions"
+          >
+            Every finding includes a suggested remediation, as well as a prompt that can be passed
+            straight to an AI coding agent to further investigate and address the issue.
+          </BenefitItem>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function CallToActionSection() {
+  return (
+    <section className={styles.finalCTA}>
+      <div className="container">
+        <h2 className={styles.finalCTATitle}>Start scanning PRs right now</h2>
+        <p className={styles.finalCTASubtitle}>No account, credit card, or API keys required.</p>
+        <div className={styles.finalCTAButtons}>
+          <Link
+            className={clsx('button button--primary button--lg', styles.buttonPrimary)}
+            to="https://github.com/apps/promptfoo-scanner"
+          >
+            <GitHubIcon />
+            Install on GitHub
+          </Link>
+          <Link
+            className={clsx('button button--secondary button--lg', styles.buttonSecondary)}
+            to="/docs/code-scanning/github-action/"
+          >
+            Read the Docs
+          </Link>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export default function GitHubAction(): React.ReactElement {
+  return (
+    <Layout
+      title="GitHub Action for LLM Security Scanning"
+      description="Automatically scan pull requests for LLM vulnerabilities. Find prompt injection, PII exposure, and AI security risks before you merge."
+    >
+      <Head>
+        <meta
+          property="og:image"
+          content="https://www.promptfoo.dev/img/docs/code-scanning/github.png"
+        />
+        <meta name="twitter:card" content="summary_large_image" />
+      </Head>
+      <div className={styles.pageContainer}>
+        <GitHubActionHeader />
+        <main className={styles.mainContent}>
+          <VulnerabilityTypesSection
+            eyebrow="LLM-specific vulnerabilities"
+            title="Catch issues that other review tools miss"
+          >
+            Our scanner is laser-focused on the kinds of vulnerabilities that apps built on LLMs and
+            agents are uniquely susceptible to.
+          </VulnerabilityTypesSection>
+          <ProofBannerSection />
+          <BenefitsSection />
+          <CallToActionSection />
+        </main>
+      </div>
+    </Layout>
+  );
+}

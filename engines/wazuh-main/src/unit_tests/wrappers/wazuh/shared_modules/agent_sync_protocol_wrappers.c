@@ -1,0 +1,109 @@
+/* Copyright (C) Wazuh Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+#include "agent_sync_protocol_wrappers.h"
+
+__attribute__((weak)) void __wrap_asp_sync_module_hook(void) {
+}
+
+AgentSyncProtocolHandle* __wrap_asp_create(const char* module, const char* db_path, asp_logger_t logger,
+                                           uint64_t flush_batch_size, uint64_t flush_interval_ms,
+                                           uint64_t wal_autocheckpoint_pages) {
+    check_expected_ptr(module);
+    (void)db_path;
+    (void)logger;
+    (void)flush_batch_size;
+    (void)flush_interval_ms;
+    (void)wal_autocheckpoint_pages;
+    return mock_ptr_type(AgentSyncProtocolHandle*);
+}
+
+void __wrap_asp_persist_diff(AgentSyncProtocolHandle* handle,
+                             const char* id,
+                             int operation,
+                             const char* index,
+                             const char* data,
+                             uint64_t version) {
+    check_expected_ptr(handle);
+    check_expected_ptr(id);
+    check_expected(operation);
+    check_expected_ptr(index);
+    check_expected_ptr(data);
+    check_expected(version);
+}
+
+static bool s_asp_sync_module_use_full_result = false;
+
+void __wrap_asp_sync_module_use_full_result(bool enable) {
+    s_asp_sync_module_use_full_result = enable;
+}
+
+SyncModuleResult_t __wrap_asp_sync_module(AgentSyncProtocolHandle* handle,
+                            int mode) {
+    check_expected_ptr(handle);
+    check_expected(mode);
+    __wrap_asp_sync_module_hook();
+
+    if (s_asp_sync_module_use_full_result) {
+        return *(SyncModuleResult_t *)mock_type(SyncModuleResult_t *);
+    }
+
+    SyncModuleResult_t result = {0};
+    result.success = mock_type(bool);
+    return result;
+}
+
+SyncModuleResult_t __wrap_asp_sync_module_bounded(AgentSyncProtocolHandle* handle,
+                                                  int mode,
+                                                  uint32_t max_blocks) {
+    check_expected_ptr(handle);
+    check_expected(mode);
+    check_expected(max_blocks);
+
+    if (s_asp_sync_module_use_full_result) {
+        return *(SyncModuleResult_t *)mock_type(SyncModuleResult_t *);
+    }
+
+    SyncModuleResult_t result = {0};
+    result.success = mock_type(bool);
+    return result;
+}
+
+IntegrityCheckResult_t __wrap_asp_requires_full_sync(AgentSyncProtocolHandle* handle,
+                                                     const char* index,
+                                                     const char* checksum) {
+    check_expected_ptr(handle);
+    check_expected_ptr(index);
+    check_expected_ptr(checksum);
+    return *mock_ptr_type(IntegrityCheckResult_t*);
+}
+
+long __wrap_asp_get_agent_id(void) {
+    return mock_type(long);
+}
+
+bool __wrap_asp_parse_response_buffer(AgentSyncProtocolHandle* handle, const uint8_t* data, size_t length) {
+    check_expected_ptr(handle);
+    check_expected_ptr(data);
+    check_expected(length);
+    return mock_type(bool);
+}
+
+bool __wrap_asp_notify_data_clean(AgentSyncProtocolHandle* handle,
+                                  const char** indices,
+                                  size_t indices_count) {
+    check_expected_ptr(handle);
+    check_expected_ptr(indices);
+    check_expected(indices_count);
+    return mock_type(bool);
+}
+
+void __wrap_asp_delete_database(AgentSyncProtocolHandle* handle) {
+    check_expected_ptr(handle);
+}

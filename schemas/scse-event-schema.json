@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://sentrix.io/schemas/v1/scse-event.json",
+  "title": "SentrixCommonSecurityEvent",
+  "description": "Normalized Security Event schema for SENTRIX unified cybersecurity platform (SCSE v1.0.0, aligned with OCSF v1.1.0)",
+  "type": "object",
+  "required": [
+    "event_id",
+    "timestamp",
+    "engine",
+    "severity",
+    "category",
+    "action_taken",
+    "source",
+    "target"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "Unique UUIDv4 identifier for this event"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of detection"
+    },
+    "engine": {
+      "type": "string",
+      "enum": ["coraza", "crowdsec", "modsecurity", "promptfoo", "wazuh", "sentrix-core"],
+      "description": "Originating security engine"
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"],
+      "description": "Normalized threat severity"
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "WEB_APPLICATION_ATTACK",
+        "NETWORK_INTRUSION",
+        "HOST_ENDPOINT_ANOMALY",
+        "FILE_INTEGRITY_VIOLATION",
+        "VULNERABILITY_CVE",
+        "AI_PROMPT_INJECTION",
+        "AI_JAILBREAK",
+        "AI_DATA_LEAK",
+        "POLICY_VIOLATION"
+      ],
+      "description": "Standardized attack or detection category"
+    },
+    "action_taken": {
+      "type": "string",
+      "enum": ["BLOCKED", "DROPPED", "ALERTED", "REMEDIATED", "LOGGED", "PASSED"],
+      "description": "Enforcement or mitigation decision applied"
+    },
+    "source": {
+      "type": "object",
+      "description": "Originating client, network, or process endpoint",
+      "properties": {
+        "ip": { "type": "string" },
+        "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "hostname": { "type": "string" },
+        "user": { "type": "string" },
+        "country": { "type": "string", "maxLength": 2 }
+      }
+    },
+    "target": {
+      "type": "object",
+      "description": "Targeted resource, application, endpoint, or system",
+      "properties": {
+        "ip": { "type": "string" },
+        "port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "url": { "type": "string" },
+        "endpoint": { "type": "string" },
+        "file_path": { "type": "string" },
+        "llm_model": { "type": "string" }
+      }
+    },
+    "threat_details": {
+      "type": "object",
+      "description": "Optional fine-grained threat classification metadata",
+      "properties": {
+        "rule_id": { "type": "string" },
+        "rule_name": { "type": "string" },
+        "cve": { "type": "string" },
+        "cwe": { "type": "string" },
+        "mitre_attack": {
+          "type": "object",
+          "properties": {
+            "tactic": { "type": "string" },
+            "technique_id": { "type": "string" },
+            "technique_name": { "type": "string" }
+          }
+        },
+        "owasp_category": { "type": "string" },
+        "confidence_score": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+      }
+    },
+    "raw_event": {
+      "description": "Verbatim raw log or telemetry object from the source engine"
+    }
+  },
+  "additionalProperties": false
+}

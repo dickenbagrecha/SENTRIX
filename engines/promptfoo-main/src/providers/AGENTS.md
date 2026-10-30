@@ -1,0 +1,162 @@
+# Provider Implementations
+
+LLM provider integrations implementing `ApiProvider` interface to call different AI services.
+
+## Architecture
+
+Each provider:
+
+- Implements `ApiProvider` interface (`src/types/providers.ts`)
+- Transforms prompts → provider-specific API format
+- Returns normalized `ProviderResponse`
+- Handles auth, rate limits, retries, streaming
+
+## Provider Lifecycle & Cleanup
+
+Evaluations use `providerRegistry.withEvaluation()` (`src/providers/providerRegistry.ts`). Providers and registered resources stay open until their last evaluation and any active calls finish. A new caller waits for cleanup of the same provider; unrelated evaluations continue. Nested entry points share one scope.
+
+**If your provider allocates resources** (Python workers, connections, child processes):
+
+- Implement `cleanup()` without required arguments. For a provider that registers itself, the registry calls `shutdown()` instead; it can delegate to `cleanup()`. Use `cleanupAfterEvaluation({ reason: 'evaluation-complete' })` when automatic cleanup must differ from explicit shutdown.
+- Register resources before asynchronous initialization creates processes or connections. Registration of a provider instance is restored when an evaluation reuses it. An idle cleanup hook may leave the provider registered for process shutdown.
+- For shared singleton transports, await `useResource()` on every access and call `throwIfResourceUseAborted()` after asynchronous acquisition. Both use the current provider call's signal; direct callers can supply one.
+- Pass the request signal to `withProvider()`. When using a temporary adapter, retain ownership on the provider that performs cleanup. Cancelled calls waiting for cleanup never start; active calls retain resources until they settle.
+- Process shutdown closes registered resources immediately. The CLI also cleans up its own targets, including targets without registered resources. Caller-supplied graders remain borrowed.
+
+**Reference implementations:**
+
+- `openai.ts` - Most comprehensive
+- `anthropic/index.ts` - Complex provider with subdirectory
+- `http.ts` - Generic HTTP pattern
+
+## Logging
+
+See `docs/agents/logging.md` - use logger with object context (auto-sanitized).
+
+## Common Patterns
+
+**OpenAI-compatible providers** extend `OpenAiChatCompletionProvider`. See `src/providers/quiverai.ts` for a minimal example or `src/providers/openrouter.ts` for a more complex one.
+
+**Config priority:** Explicit options > Environment variables > Provider defaults
+
+## Provider Routing
+
+Prefix dispatch in `src/providers/registry.ts` is case-sensitive and meaningful. Similar
+prefixes can route to different classes. When you add a new sub-type (e.g.
+`:moderation`, `:embedding`, `:realtime`) to one prefix, do one of:
+
+- Add the sub-type to every prefix it should work under, **or**
+- Explicitly fail-fast (throw with a clear message) for the prefixes that should not
+  support it.
+
+Silently mapping `foo:newtype` to a class that only handles `foo:chat` is a routing
+regression. Add a test in `test/providers/registry.test.ts` that asserts each
+prefix/sub-type pair resolves to the expected class or throws.
+
+## Cache Key Hygiene
+
+Promptfoo's disk cache lives at `${getConfigDirectoryPath()}/cache` (typically
+`~/.promptfoo/cache`), unless overridden with `PROMPTFOO_CACHE_PATH` or
+`PROMPTFOO_CONFIG_DIR`. If an implementation stores literal cache-key strings, those
+strings persist to disk; if it stores hashed keys, the hash persists.
+
+- **Never include secrets in cache keys.** Strip `Authorization`, bearer tokens, API
+  keys, tenant tokens, signed metadata, and custom auth headers before building or
+  hashing a key. If those values materially change the response, use a non-secret
+  tenant/account identifier, a cache namespace, or disable caching for that path; do not
+  hash raw secrets into long-lived cache keys.
+- **Canonicalize before hashing.** `JSON.stringify({a, b})` and `JSON.stringify({b, a})`
+  produce different strings but represent the same config, so naïve stringification
+  causes cache misses for semantically identical requests. Sort keys (or use a
+  canonical-JSON helper) before hashing.
+- Reference pattern for stable key structure and canonicalized hashing:
+  `getModerationCacheKey` in `src/providers/azure/moderation.ts`.
+
+## Caching Best Practices
+
+Use `shouldBustProviderCache(context)` for the shared `bustCache`/legacy `debug`
+precedence, including both reads and writes for manually cached SDK responses.
+Use `withResponseCacheMetadata(response, cached)` after response normalization to
+retain replay provenance and mark cached requests without mutating stored usage.
+The helper preserves reported costs and unknown token counts; the evaluator
+derives incurred usage and cost from the cache marker.
+
+When implementing caching in your provider, **ALWAYS set the `cached: true` flag** when returning a cached response:
+
+```typescript
+// ✅ CORRECT - Always set cached flag
+if (cachedResponse) {
+  const parsed = JSON.parse(cachedResponse as string);
+  return { ...parsed, cached: true };
+}
+
+// ❌ WRONG - Missing cached flag
+if (cachedResponse) {
+  return JSON.parse(cachedResponse as string);
+}
+```
+
+**Why this matters:**
+
+- The `cached` flag allows downstream code to skip rate limiting delays
+- Performance metrics can distinguish between fresh API calls and cache hits
+- Evaluations can accurately track which responses were served from cache
+
+**Response type compatibility:**
+
+- `ProviderResponse` has `cached?: boolean`
+- `ProviderEmbeddingResponse` has `cached?: boolean`
+- `ProviderModerationResponse` has `cached?: boolean`
+
+**Reference implementations:**
+
+- `bedrock/converse.ts:1276` - Sets cached flag correctly
+- `pythonCompletion.ts:62` - Sets the flag on the parsed result
+- `google/vertex.ts:371` - Multiple cache points handled correctly
+
+## Testing Requirements
+
+**CRITICAL: Tests must NEVER make real API calls.** Mock all HTTP requests.
+
+Every provider needs tests in `test/providers/`:
+
+- Mock API responses using `vi.mock`
+- Test success AND error cases
+- Test rate limits, timeouts, invalid configs
+- Run with: `npx vitest run test/providers/my-provider`
+
+## Adding a Provider
+
+The eligibility bar in `site/docs/contributing.md` ("Provider eligibility") applies only to dedicated provider prefixes. Before adding one, confirm authorized model access, accountable ownership, durability, clear data handling, and provider-specific value beyond what `openai` + `apiBaseUrl` can express. A service that needs only a base URL and API-key environment variable should use the generic `openai` path and contribute docs or an example instead.
+
+**All seven items are required** before a provider is complete:
+
+1. Implement `ApiProvider` interface
+2. Add env vars to `ProviderEnvOverridesSchema` in `src/contracts/env.ts` (re-exported via `src/types/env.ts`)
+3. Add env vars to `src/envars.ts` (if documenting in CLI help)
+4. Add tests in `test/providers/`
+5. Add docs in `site/docs/providers/<provider>.md`
+6. Add entry to `site/docs/providers/index.md` table (alphabetical order)
+7. Add example in `examples/<provider>/`
+
+After updating env schema, regenerate JSON schema: `npm run jsonSchema:generate`
+
+**Verify completeness:**
+
+```bash
+# Check all pieces exist
+ls src/providers/myprovider.ts
+grep -q "MYPROVIDER_API_KEY" src/contracts/env.ts && echo "env schema updated"
+ls test/providers/myprovider.test.ts
+ls site/docs/providers/myprovider.md
+grep -q "myprovider" site/docs/providers/index.md && echo "index.md updated"
+ls examples/myprovider/promptfooconfig.yaml
+```
+
+**Reference existing providers** - 50+ implementations to learn from.
+
+## Creator inputs
+
+The loader normalizes configuration and environment once. Factories receive those `ProviderOptions`; existing public creators accept them as `providerOptions`. `creator.ts` adapts the older nested `config` input at those public boundaries.
+
+`families/compatible.ts` loads the Cerebras, Envoy, LiteLLM, Novita, Nscale, and TogetherAI creators on demand, before the generic file fallback. Preserve each creator's aliases, default subtype, and colon-containing model names.

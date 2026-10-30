@@ -1,0 +1,46 @@
+# ==============================================================================
+# CrowdSec Configuration for SENTRIX
+# ==============================================================================
+common:
+  daemonize: false
+  log_media: stdout
+  log_level: info
+
+config_paths:
+  config_dir: /etc/crowdsec/
+  data_dir: /var/lib/crowdsec/data/
+  simulation_path: /etc/crowdsec/simulation.yaml
+  hub_dir: /etc/crowdsec/hub/
+  index_path: /etc/crowdsec/hub/.index.json
+  notification_dir: /etc/crowdsec/notifications/
+  plugin_dir: /usr/local/lib/crowdsec/plugins/
+
+crowdsec_service:
+  acquisition_path: /etc/crowdsec/acquis.yaml
+  parser_routines: 2
+
+db_config:
+  log_level: info
+  type: sqlite
+  db_path: /var/lib/crowdsec/data/crowdsec.db
+  flush:
+    max_items: 5000
+    max_age: 7d
+
+api:
+  client:
+    insecure_skip_verify: false
+  server:
+    log_level: info
+    listen_uri: 0.0.0.0:8085
+    profiles_path: /etc/crowdsec/profiles.yaml
+    trusted_ips:
+      - 127.0.0.1
+      - ::1
+      - 172.28.0.0/16 # Allow SENTRIX Docker bridge network
+
+prometheus:
+  enabled: true
+  level: full
+  listen_addr: 0.0.0.0
+  listen_port: 6060

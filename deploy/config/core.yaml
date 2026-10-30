@@ -1,0 +1,41 @@
+# ==============================================================================
+# SENTRIX Core Configuration
+# ==============================================================================
+environment: "development"
+http_port: 9000
+bind_address: "0.0.0.0"
+
+logging:
+  level: "info"
+  format: "json"
+
+engines:
+  coraza:
+    enabled: true
+    url: "http://sentrix-waf-coraza:8080/healthz"
+    timeout_ms: 2000000000        # 2s
+    check_interval_ms: 5000000000 # 5s
+
+  crowdsec:
+    enabled: true
+    url: "http://sentrix-crowdsec:8085/v1/health"
+    timeout_ms: 3000000000         # 3s
+    check_interval_ms: 10000000000 # 10s
+
+  promptfoo:
+    enabled: true
+    url: "http://sentrix-promptfoo:15500/healthz"
+    timeout_ms: 5000000000         # 5s
+    check_interval_ms: 15000000000 # 15s
+
+  wazuh:
+    enabled: false                 # Disabled by default in lightweight dev profile
+    url: "https://sentrix-wazuh-manager:55000/"
+    timeout_ms: 5000000000         # 5s
+    check_interval_ms: 15000000000 # 15s
+
+  modsecurity:
+    enabled: false                 # Optional benchmark / secondary engine
+    url: "http://sentrix-modsec:8082/healthz"
+    timeout_ms: 2000000000         # 2s
+    check_interval_ms: 10000000000 # 10s

@@ -1,0 +1,50 @@
+  <!-- File integrity monitoring -->
+  <syscheck>
+    <disabled>no</disabled>
+
+    <!-- Frequency that syscheck is executed default every 12 hours -->
+    <frequency>43200</frequency>
+
+    <!-- Directories to check  (perform all possible verifications) -->
+    <!-- /etc is a symlink to /private/etc on macOS; monitor the resolved path directly -->
+    <directories>/private/etc,/usr/bin,/usr/sbin</directories>
+    <directories>/bin,/sbin</directories>
+
+    <!-- Files/directories to ignore -->
+    <ignore>/private/etc/mtab</ignore>
+    <ignore>/private/etc/hosts.deny</ignore>
+    <ignore>/private/etc/mail/statistics</ignore>
+    <ignore>/private/etc/random-seed</ignore>
+    <ignore>/private/etc/random.seed</ignore>
+    <ignore>/private/etc/adjtime</ignore>
+    <ignore>/private/etc/httpd/logs</ignore>
+    <ignore>/private/etc/utmpx</ignore>
+    <ignore>/private/etc/wtmpx</ignore>
+    <ignore>/private/etc/cups/certs</ignore>
+    <ignore>/private/etc/dumpdates</ignore>
+    <ignore>/private/etc/svc/volatile</ignore>
+
+    <!-- File types to ignore -->
+    <ignore type="sregex">.log$|.swp$</ignore>
+
+    <!-- Check the file, but never compute the diff -->
+    <nodiff type="sregex">^/private/etc/ssl/private/</nodiff>
+
+    <skip_nfs>yes</skip_nfs>
+    <skip_dev>yes</skip_dev>
+    <skip_proc>yes</skip_proc>
+    <skip_sys>yes</skip_sys>
+
+    <!-- Nice value for Syscheck process -->
+    <process_priority>10</process_priority>
+
+    <!-- Maximum output throughput -->
+    <max_eps>50</max_eps>
+
+    <!-- Database synchronization settings -->
+    <synchronization>
+      <enabled>yes</enabled>
+      <interval>5m</interval>
+      <integrity_interval>24h</integrity_interval>
+    </synchronization>
+  </syscheck>

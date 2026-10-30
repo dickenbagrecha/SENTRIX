@@ -1,0 +1,35 @@
+# Modules
+
+- [Active Response](active-response/README.md) - Automated security response actions triggered by detected events
+- [Agent Info](agent_info/README.md) - Agent metadata collection and reporting
+- [Agent Management](agent-management/README.md) - Centralized configuration and group management for agents
+- [Agent Upgrade](agent_upgrade/README.md) - Agent-side WPK verification and install (the manager side is in [Task Manager](task_manager/README.md))
+- [Authd](authd/README.md) - Agent enrollment service (TLS, key generation)
+- [Client](client/README.md) - Agent daemon (wazuh-agentd) managing agent-manager communication
+- [Cluster](cluster/README.md) - Manages the Wazuh server cluster
+- [Command](command/README.md) - Scheduled command execution through the command wodle
+- [Content Manager](content_manager/README.md) - Shared content fetcher: CVE feeds for Vulnerability Detection, rulesets and IoCs for the Engine
+- [Control](control/README.md) - Manager control operations (restart, reload) via wm_control module
+- [Database Sync](database-sync/README.md) - modulesd `database` module that keeps `global.db` in step with `client.keys` and `/etc/wazuh-manager/shared/`
+- [Engine](engine/README.md) - Event decoding, enrichment, and detection pipeline
+- [FIM](fim/README.md) - File Integrity Monitoring with persistent state synchronization
+- [Indexer Connector](indexer_connector/README.md) - OpenSearch indexing library (Filebeat replacement)
+- [Integrations](integrations/README.md) - Cloud services and third-party platform integrations
+- [Inventory Sync Server](inventory-sync-server/README.md) - Manager-side synchronization service for agent state data (HTTP over UDS)
+- [Keystore](keystore/README.md) - Encrypted credential storage (AES-256, RocksDB), served over UDS by the `keystore_server` module
+- [Logcollector](logcollector/README.md) - Log ingestion
+- [Logging](logging/README.md) - Log format configuration (plain text, JSON, or dual output)
+- [RBAC](rbac/README.md) - Role-based access control for the API
+- [Remoted](remoted/README.md) - Agent communication daemon
+- [Rootcheck](rootcheck/README.md) - Rootkit and anomaly detection
+- [SCA](sca/README.md) - Security Configuration Assessment for compliance evaluation
+- [Server API](server-api/README.md) - RESTful management API
+- [Syscollector](syscollector/README.md) - System inventory collection and monitoring
+- [Task Manager](task_manager/README.md) - Generic manager-side task broker for asynchronous agent operations
+- [Vulnerability Scanner](vulnerability-scanner/README.md) - CVE detection and vulnerability assessment
+- [Wazuh DB](wazuh_db/README.md) - SQLite database daemon for the agent registry and groups (`global.db`)
+- [Agent Sync Protocol](utils/sync-protocol/README.md) - Agent-side library for synchronizing data with the manager
+- [FlatBuffers](utils/flatbuffers/README.md) - High-performance serialization for synchronization protocol
+- [Schema Validator](utils/schema-validator/README.md) - JSON schema validation for synchronized data
+- [UDS HTTP Server](utils/uds-http-server/README.md) - Shared HTTP/1.1-over-UDS server transport for manager daemons (deferred responses, load shedding, two-phase shutdown)
+- [Metrics Library](utils/metrics/README.md) - Shared lock-free metrics library (wazuh_metrics) and how to query a module's /metrics

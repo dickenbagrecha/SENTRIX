@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: OpenAI vision model image analysis and evaluation
+
+prompts:
+  - file://prompt.json
+providers:
+  - openai:gpt-6-sol
+
+tests:
+  - vars:
+      question: 'What do you see?'
+      url: file://assets/earth.txt
+    assert:
+      - type: icontains
+        value: 'Earth'

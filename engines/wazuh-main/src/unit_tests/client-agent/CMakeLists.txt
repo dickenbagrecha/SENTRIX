@@ -1,0 +1,413 @@
+# Generate client-agent library
+if(${TARGET} STREQUAL "winagent")
+  # On winagent, agentd objects are already in DEPENDENCIES_O (winagent.cmake).
+  # Creating a separate CLIENT-AGENT library from the same objects would cause
+  # duplicate globals (e.g. agent_state), leading to test failures where the
+  # test modifies one copy but production code reads the other.
+else()
+  file(GLOB client-agent_files
+       ${SRC_FOLDER}/build/client-agent/CMakeFiles/agentd_lib.dir/src/*.o)
+  list(REMOVE_ITEM client-agent_files ${SRC_FOLDER}/build/client-agent/CMakeFiles/agentd_lib.dir/src/main.c.o)
+endif()
+
+if(NOT ${TARGET} STREQUAL "winagent")
+list(REMOVE_ITEM client-agent_files ${SRC_FOLDER}/client-agent/main.o)
+
+add_library(CLIENT-AGENT STATIC ${client-agent_files} ${CMAKE_CURRENT_SOURCE_DIR}/https_client_stubs.c)
+
+set_source_files_properties(
+    ${client-agent_files}
+    PROPERTIES
+    EXTERNAL_OBJECT true
+    GENERATED true
+)
+
+set_target_properties(
+    CLIENT-AGENT
+    PROPERTIES
+    LINKER_LANGUAGE C
+)
+
+target_link_libraries(CLIENT-AGENT ${WAZUHLIB} ${WAZUHEXT} -lpthread)
+endif()
+
+if(${TARGET} STREQUAL "winagent")
+    link_directories(${SRC_FOLDER}/build/bin)
+endif(${TARGET} STREQUAL "winagent")
+
+#include wrappers
+include(${SRC_FOLDER}/unit_tests/wrappers/wazuh/shared/shared.cmake)
+
+# Generate agentd tests
+list(APPEND client-agent_names "test_start_agent")
+set(START_AGENT_BASE_FLAGS "-Wl,--wrap,w_rotate_log -Wl,--wrap,getDefine_Int -Wl,--wrap,getDefine_Int_default \
+                            -Wl,--wrap,w_https_client_submit_event -Wl,--wrap,getpid ${DEBUG_OP_WRAPPERS} \
+                            -Wl,--wrap=is_fim_shutdown -Wl,--wrap=fim_db_teardown \
+                            -Wl,--wrap=_imp__dbsync_initialize \
+                            -Wl,--wrap,metadata_provider_update \
+                            -Wl,--wrap,get_unix_version -Wl,--wrap,get_win_version -Wl,--wrap,free_osinfo")
+if(${TARGET} STREQUAL "winagent")
+    list(APPEND client-agent_flags "${START_AGENT_BASE_FLAGS} -Wl,--wrap,os_random -Wl,--wrap=syscom_dispatch -Wl,--wrap=Start_win32_Syscheck -Wl,--wrap,w_query_agentd")
+else()
+    list(APPEND client-agent_flags "${START_AGENT_BASE_FLAGS}")
+endif()
+
+list(APPEND client-agent_names "test_agentd_state")
+if(${TARGET} STREQUAL "winagent")
+    # cJSON_func@x instead of cJSON_func since linker will be looking for cdecl forma
+    # More info at: (https://devblogs.microsoft.com/oldnewthing/20040108-00/?p=41163)
+    list(APPEND client-agent_flags "-Wl,--wrap,pthread_mutex_lock -Wl,--wrap,pthread_mutex_unlock \
+                                    -Wl,--wrap,cJSON_CreateObject@0 -Wl,--wrap,cJSON_AddNumberToObject@16 \
+                                    -Wl,--wrap,cJSON_AddItemToObject@12 -Wl,--wrap,cJSON_AddStringToObject@12 \
+                                    -Wl,--wrap,cJSON_Delete@4 -Wl,--wrap,strftime -Wl,--wrap=syscom_dispatch \
+                                    -Wl,--wrap=Start_win32_Syscheck -Wl,--wrap=is_fim_shutdown -Wl,--wrap=fim_db_teardown \
+                                    -Wl,--wrap=_imp__dbsync_initialize \
+                                    -Wl,--wrap,cJSON_PrintUnformatted@4 \
+                                    -Wl,--wrap,cJSON_AddBoolToObject@12 -Wl,--wrap,w_query_agentd -Wl,--enable-stdcall-fixup ${DEBUG_OP_WRAPPERS}")
+else()
+    list(APPEND client-agent_flags "-Wl,--wrap,pthread_mutex_lock -Wl,--wrap,pthread_mutex_unlock \
+                                    -Wl,--wrap,cJSON_CreateObject -Wl,--wrap,cJSON_AddNumberToObject -Wl,--wrap,strftime \
+                                    -Wl,--wrap,cJSON_AddItemToObject -Wl,--wrap,cJSON_AddStringToObject -Wl,--wrap,cJSON_Delete \
+                                    -Wl,--wrap,cJSON_PrintUnformatted \
+                                    -Wl,--wrap,cJSON_AddBoolToObject ${DEBUG_OP_WRAPPERS}")
+endif()
+
+list(APPEND client-agent_names "test_agcom")
+if(${TARGET} STREQUAL "winagent")
+list(APPEND client-agent_flags "-Wl,--wrap,getAgentConfig \
+                                -Wl,--wrap,getLabelsConfig -Wl,--wrap,getAgentInternalOptions \
+                                -Wl,--wrap,getAntiTamperingConfig -Wl,--wrap,w_agentd_state_get \
+                                -Wl,--wrap=syscom_dispatch -Wl,--wrap=Start_win32_Syscheck \
+                                -Wl,--wrap=is_fim_shutdown -Wl,--wrap=fim_db_teardown \
+                                -Wl,--wrap=_imp__dbsync_initialize -Wl,--wrap=_imp__rsync_initialize")
+else()
+list(APPEND client-agent_flags "-Wl,--wrap,getAgentConfig \
+                                -Wl,--wrap,getLabelsConfig -Wl,--wrap,getAgentInternalOptions \
+                                -Wl,--wrap,getAntiTamperingConfig -Wl,--wrap,w_agentd_state_get")
+endif()
+
+if(${TARGET} STREQUAL "agent")
+list(APPEND client-agent_names "test_agentd")
+list(APPEND client-agent_flags "-Wl,--wrap,wurl_free_response -Wl,--wrap,wurl_http_request \
+                                -Wl,--wrap,w_https_client_start -Wl,--wrap,w_https_client_stop \
+                                -Wl,--wrap,getDefine_Int -Wl,--wrap,getDefine_Int_default \
+                                -Wl,--wrap,OS_IsValidIP -Wl,--wrap,exit ${DEBUG_OP_WRAPPERS}")
+
+list(APPEND client-agent_names "test_startup_gate")
+list(APPEND client-agent_flags "-Wl,--wrap,OS_SHA256_File ${DEBUG_OP_WRAPPERS}")
+
+# POSIX-only: the Windows branch dispatches in-process via control_dispatch(), no
+# socket/retry involved. Wraps the OS_ConnectUnixDomain/sleep boundary controlAgent()
+# retries against, same convention as test_agent_report.c.
+list(APPEND client-agent_names "test_reload_agent")
+list(APPEND client-agent_flags "-Wl,--wrap,OS_ConnectUnixDomain -Wl,--wrap,OS_SendSecureTCP \
+                                -Wl,--wrap,sleep -Wl,--wrap,close ${DEBUG_OP_WRAPPERS}")
+
+list(APPEND client-agent_names "test_ca_publication")
+# Real temporary files, so no filesystem wrappers -- but the install path logs, and the
+# unwrapped logger reads ossec.conf and dies without one.
+# rename() is the exception: it is the instant the trust store is committed, and wrapping it is
+# what makes crash atomicity assertable rather than merely argued. The wrapper delegates to
+# __real_rename() unless a test asks it to fail, so the install still runs for real.
+list(APPEND client-agent_flags "-Wl,--wrap,rename ${DEBUG_OP_WRAPPERS}")
+
+list(APPEND client-agent_names "test_agent_ssl_ca")
+# wfopen is wrapped only so the link succeeds: wrapping IsFile pulls in file_op_wrappers.o, which
+# references __real_wfopen. Its wrapper forwards to the real call unless a test sets test_mode.
+list(APPEND client-agent_flags "-Wl,--wrap,w_is_file -Wl,--wrap,IsFile -Wl,--wrap,IsLink -Wl,--wrap,wfopen -Wl,--wrap,os_find_ca_bundle \
+                                -Wl,--wrap,w_x509_load_all_pem -Wl,--wrap,w_x509_free_all ${DEBUG_OP_WRAPPERS}")
+
+# getAgentConfig() reads the agt globals and builds cJSON, nothing else: no wrappers.
+list(APPEND client-agent_names "test_agent_config")
+list(APPEND client-agent_flags " ")
+
+# ClientConf() itself, run end to end against real temp files: no wrappers, needs a
+# real etc/internal_options.conf at the working directory instead (see below).
+list(APPEND client-agent_names "test_client_conf_ssl_resolution")
+list(APPEND client-agent_flags " ")
+
+# w_enrollment_build_request()/w_enrollment_process_response() (#38465): pure
+# functions, no https_client involvement, so no hc_*/wurl_* wraps needed --
+# just the log wrappers every merror()/minfo() call goes through, plus
+# OS_IsValidIP (real PCRE2 matching isn't safe/deterministic to call
+# unmocked in a unit test -- same convention every other test in this
+# tree already follows).
+list(APPEND client-agent_names "test_enrollment")
+list(APPEND client-agent_flags "-Wl,--wrap,OS_IsValidIP -Wl,--wrap,TempFile -Wl,--wrap,rename \
+                                -Wl,--wrap,chmod -Wl,--wrap,fchmod ${DEBUG_OP_WRAPPERS}")
+
+# w_reenroll_secret_store()/load()/clear() (#39064): the real store against real files relative to
+# the working directory -- the atomic rename and the 0640 mode are the point, so nothing about the
+# filesystem is mocked. TempFile, rename and chmod are wrapped only to record the staged name and
+# to make a step fail on request; they reach the real calls.
+list(APPEND client-agent_names "test_reenroll_secret")
+list(APPEND client-agent_flags "-Wl,--wrap,TempFile -Wl,--wrap,rename -Wl,--wrap,chmod -Wl,--wrap,fchmod ${DEBUG_OP_WRAPPERS}")
+
+# w_shred_file_in_place()/w_agent_shred_enrollment_password() (#39064): the real shredder against
+# real files relative to the working directory. Whether the open truncates is the whole point, so
+# nothing about the filesystem is mocked -- only the log wrappers, same as test_reenroll_secret
+# above, whose w_reenroll_secret_clear() shares this shredder.
+list(APPEND client-agent_names "test_shred_file")
+list(APPEND client-agent_flags "${DEBUG_OP_WRAPPERS}")
+
+# w_agent_token_bootstrap(): mocks only the https_client module boundary it calls
+# through (hc_fetch_cacerts/hc_enroll/hc_spki_pinned_certificate), the same
+# convention test_https_client_bridge uses for that boundary below -- everything else
+# (IsFile/TempFile/w_move_file_nofollow/w_etoken_*, w_enrollment_build_request/process_response) runs
+# for real against temp files relative to the working directory, same style as
+# test_client_conf_ssl_resolution above.
+# chown/chmod/fchown are wrapped rather than left to run for real because what the bootstrap
+# asks for -- an anchor (and client.keys) owned by root -- is a privileged operation:
+# unwrapped, the suite passes as root and fails as anyone else, which is the difference
+# between a local run and CI. Wrapping them also makes the ownership assertable instead of
+# merely inspectable. client.keys goes through fchown() rather than chown() (see
+# w_token_bootstrap_chown_keys_file() in token_bootstrap.c), so it needs its own wrap.
+list(APPEND client-agent_names "test_token_bootstrap")
+list(APPEND client-agent_flags "-Wl,--wrap,hc_fetch_cacerts -Wl,--wrap,hc_enroll \
+                                -Wl,--wrap,hc_spki_pinned_certificate -Wl,--wrap,OS_IsValidIP \
+                                -Wl,--wrap,chown -Wl,--wrap,chmod -Wl,--wrap,fchown \
+                                -Wl,--wrap,fchmod \
+                                -Wl,--wrap,w_move_file_nofollow -Wl,--wrap,isatty -Wl,--wrap,TempFile \
+                                -Wl,--wrap,rename -Wl,--wrap,OPENSSL_cleanse \
+                                ${DEBUG_OP_WRAPPERS}")
+
+list(APPEND client-agent_names "test_agent_auth_cli")
+# kill() is wrapped for the running-agentd probe only; the wrapper forwards every real signal
+# to __real_kill, or cmocka's own failure handling would go through it too.
+# w_move_file_nofollow is wrapped for one thing the enrollment core cannot be asked for any other way: a
+# commit that fails after the manager has already accepted. That is the state the command has the
+# most to say about, and the branch it says it in is chosen here rather than in the core.
+list(APPEND client-agent_flags "-Wl,--wrap,kill -Wl,--wrap,hc_fetch_cacerts \
+                                -Wl,--wrap,hc_enroll -Wl,--wrap,hc_spki_pinned_certificate \
+                                -Wl,--wrap,OS_WriteXMLToStream -Wl,--wrap,w_move_file_nofollow \
+                                -Wl,--wrap,Privsep_GetUser -Wl,--wrap,Privsep_GetGroup \
+                                -Wl,--wrap,chown -Wl,--wrap,fchown -Wl,--wrap,fchmodat \
+                                -Wl,--wrap,TempFile -Wl,--wrap,rename -Wl,--wrap,OS_ReadXML \
+                                ${DEBUG_OP_WRAPPERS}")
+
+list(APPEND client-agent_names "test_https_client_bridge")
+list(APPEND client-agent_flags "-Wl,--wrap,wurl_free_response -Wl,--wrap,wurl_http_request \
+                                -Wl,--wrap,metadata_provider_get -Wl,--wrap,metadata_provider_free_metadata \
+                                -Wl,--wrap,hc_create -Wl,--wrap,hc_start -Wl,--wrap,hc_destroy \
+                                -Wl,--wrap,hc_set_agent_identity -Wl,--wrap,hc_submit_event \
+                                -Wl,--wrap,wmcom_send -Wl,--wrap,ag_send_syscheck \
+                                -Wl,--wrap,hc_set_config_hash -Wl,--wrap,hc_enroll \
+                                -Wl,--wrap,try_enroll_to_server \
+                                -Wl,--wrap,CreateThread -Wl,--wrap,sleep -Wl,--wrap,getpid \
+                                -Wl,--wrap,w_agentd_state_update -Wl,--wrap,getDefine_Int \
+                                -Wl,--wrap,getDefine_Int_default \
+                                -Wl,--wrap,w_copy_file -Wl,--wrap,UnmergeFiles -Wl,--wrap,cldir_ex_ignore \
+                                -Wl,--wrap,IsFile -Wl,--wrap,rename_ex -Wl,--wrap,time \
+                                -Wl,--wrap,startup_gate_mark_download_pending \
+                                -Wl,--wrap,startup_gate_clear_download_pending \
+                                -Wl,--wrap,wfopen -Wl,--wrap,w_fopen_nofollow -Wl,--wrap,unlink \
+                                ${STDIO_OP_WRAPPERS} -Wl,--wrap,popen -Wl,--wrap,ferror \
+                                -Wl,--wrap,verifyRemoteConf -Wl,--wrap,reloadAgent \
+                                -Wl,--wrap,w_agentd_populate_metadata \
+                                -Wl,--wrap,startup_gate_release_from_https_apply \
+                                -Wl,--wrap,startup_gate_is_ready \
+                                -Wl,--wrap,os_delwait -Wl,--wrap,os_setwait \
+                                -Wl,--wrap,OS_SHA256_File \
+                                -Wl,--wrap,task_registry_check_and_record \
+                                -Wl,--wrap,vd_offset_client_observe \
+                                -Wl,--wrap,vd_offset_client_clear_pending \
+                                -Wl,--wrap,restartAgent \
+                                -Wl,--wrap,OS_SendUnix -Wl,--wrap,w_ref_parent_folder \
+                                -Wl,--wrap,w_is_bare_filename \
+                                -Wl,--wrap,OS_ConnectUnixDomain \
+                                -Wl,--wrap,OS_SendSecureTCP -Wl,--wrap,OS_RecvSecureTCP \
+                                ${DEBUG_OP_WRAPPERS}")
+endif()
+
+# The aggregator reaches the daemons differently per platform, so each side
+# wraps what it actually calls: sockets on POSIX, the dispatchers in-process on
+# Windows. The assertions in the test are shared.
+list(APPEND client-agent_names "test_agent_report")
+if(${TARGET} STREQUAL "winagent")
+list(APPEND client-agent_flags "-Wl,--wrap,agcom_dispatch -Wl,--wrap,syscom_dispatch \
+                                -Wl,--wrap,lccom_dispatch -Wl,--wrap,wmcom_dispatch \
+                                -Wl,--wrap,wcom_dispatch -Wl,--wrap,startup_gate_is_settled \
+                                -Wl,--wrap=Start_win32_Syscheck -Wl,--wrap=is_fim_shutdown \
+                                -Wl,--wrap=fim_db_teardown -Wl,--wrap=_imp__dbsync_initialize \
+                                -Wl,--wrap=_imp__rsync_initialize ${DEBUG_OP_WRAPPERS}")
+else()
+list(APPEND client-agent_flags "-Wl,--wrap,OS_ConnectUnixDomain -Wl,--wrap,OS_SendSecureTCP \
+                                -Wl,--wrap,OS_RecvSecureTCP -Wl,--wrap,startup_gate_is_settled \
+                                ${DEBUG_OP_WRAPPERS}")
+endif()
+
+list(LENGTH client-agent_names count)
+math(EXPR count "${count} - 1")
+foreach(counter RANGE ${count})
+    list(GET client-agent_names ${counter} client-agent_test_name)
+    list(GET client-agent_flags ${counter} client-agent_test_flags)
+
+    add_executable(${client-agent_test_name} ${client-agent_test_name}.c)
+
+    if(${TARGET} STREQUAL "winagent")
+        # On winagent, agentd objects come from DEPENDENCIES_O (in TEST_DEPS)
+        target_link_libraries(
+            ${client-agent_test_name}
+            ${WAZUHLIB}
+            ${WAZUHEXT}
+            ${TEST_DEPS}
+        )
+        target_link_libraries(${client-agent_test_name} fimdb)
+    else()
+        target_link_libraries(
+            ${client-agent_test_name}
+            ${WAZUHLIB}
+            ${WAZUHEXT}
+            CLIENT-AGENT
+            ${TEST_DEPS}
+        )
+    endif()
+
+    if(NOT client-agent_test_flags STREQUAL " ")
+        target_link_libraries(
+            ${client-agent_test_name}
+            ${client-agent_test_flags}
+        )
+    endif()
+    add_test(NAME ${client-agent_test_name} COMMAND ${client-agent_test_name})
+endforeach()
+
+if(TARGET test_https_client_bridge)
+    # https_client.h (the module's C ABI) isn't on the global include path.
+    target_include_directories(test_https_client_bridge PRIVATE ${SRC_FOLDER}/client-agent/https_client/include)
+    # ferror_wrapper.c is compiled only into this target (not globbed into libwazuh_test.a
+    # like unit_tests/wrappers/**/*.c) so that -Wl,--wrap,ferror -- and the __real_ferror
+    # it requires -- stays scoped to the one test binary that needs it, instead of touching
+    # every other unit test that links the shared wrapper library.
+    target_sources(test_https_client_bridge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/ferror_wrapper.c)
+endif()
+
+if(TARGET test_enrollment)
+    # enrollment.h pulls in https_client.h (hc_enroll_result_t), same as
+    # test_https_client_bridge above.
+    target_include_directories(test_enrollment PRIVATE ${SRC_FOLDER}/client-agent/https_client/include)
+endif()
+
+if(TARGET test_agent_auth_cli)
+    # agent_auth_cli.c includes https_client.h through token_bootstrap.h, same as the bootstrap
+    # suite below.
+    target_include_directories(test_agent_auth_cli PRIVATE ${SRC_FOLDER}/client-agent/https_client/include)
+
+    # The agent library is built with -DCLIENT (src/CMakeLists.txt), and several path macros in
+    # defs.h are conditional on it -- WAZUHCONF is "etc/ossec.conf" with it and
+    # "/etc/wazuh-manager/wazuh-manager.conf" without. Without this the test writes one file and the code under
+    # test looks for another, and the failure reads as "the file does not exist" from inside a
+    # function the test just proved could see it.
+    target_compile_definitions(test_agent_auth_cli PRIVATE CLIENT)
+endif()
+
+if(TARGET test_reload_agent)
+    # CONTROL_SOCK in defs.h is "queue/sockets/control" with -DCLIENT (how the agent library is
+    # built) and "queue/sockets/control.sock" without, so the expected path must match.
+    target_compile_definitions(test_reload_agent PRIVATE CLIENT)
+endif()
+
+if(TARGET test_token_bootstrap)
+    # token_bootstrap.c pulls in https_client.h directly (hc_config_t, hc_cacerts_*,
+    # hc_enroll_*), same as test_enrollment/test_https_client_bridge above.
+    target_include_directories(test_token_bootstrap PRIVATE ${SRC_FOLDER}/client-agent/https_client/include)
+endif()
+
+# The agent library is built with -DCLIENT (src/CMakeLists.txt) and the unit-test build is not, while
+# the file macros these suites expect or write through are conditional on it: without CLIENT,
+# KEYS_FILE, AUTHD_PASS and SHAREDCFG_DIR/SHAREDCFG_FILE expand to the manager's absolute
+# /etc/wazuh-manager paths instead of the agent's relative etc/ ones, so the test would expect (or
+# create) one path while the code under test uses another.
+foreach(client_test test_https_client_bridge test_startup_gate test_enrollment test_token_bootstrap test_shred_file)
+    if(TARGET ${client_test})
+        target_compile_definitions(${client_test} PRIVATE CLIENT)
+    endif()
+endforeach()
+
+# Component test for the durable dedup + IPC round-trip: wires the
+# REAL client (task_registry_client.c, via CLIENT-AGENT, unwrapped) to the
+# REAL server-side dispatch chain (wmcom_dispatch -> wm_module_query ->
+# wm_agent_info_query -> the real TaskIdRegistry) over a REAL AF_UNIX
+# socket, all in one process. See test_task_registry_ipc_component.cpp's
+# file banner for exactly what is real vs. test harness. Needs real
+# sockets/threads (POSIX) and gtest; agent target, not winagent.
+if(${TARGET} STREQUAL "agent" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  enable_language(CXX)
+
+  file(GLOB_RECURSE task_registry_ipc_wm_objs
+       ${SRC_FOLDER}/build/wazuh_modules/CMakeFiles/wazuh_modulesd_lib.dir/src/*.c.o)
+  list(REMOVE_ITEM task_registry_ipc_wm_objs
+       ${SRC_FOLDER}/build/wazuh_modules/CMakeFiles/wazuh_modulesd_lib.dir/src/main.c.o)
+
+  add_library(TASK_REGISTRY_IPC_WM_O STATIC ${task_registry_ipc_wm_objs})
+  set_source_files_properties(
+      ${task_registry_ipc_wm_objs}
+      PROPERTIES
+      EXTERNAL_OBJECT true
+      GENERATED true)
+  set_target_properties(TASK_REGISTRY_IPC_WM_O PROPERTIES LINKER_LANGUAGE C)
+  target_link_libraries(TASK_REGISTRY_IPC_WM_O ${WAZUHLIB} ${WAZUHEXT} -lpthread -ldl)
+
+  link_directories(${SRC_FOLDER}/external/googletest/lib/)
+
+  add_executable(test_task_registry_ipc_component test_task_registry_ipc_component.cpp)
+  # The linked agentd and wazuh_modules objects come from the product build, which
+  # defines CLIENT. The harness must agree or it binds the manager's socket name.
+  target_compile_definitions(test_task_registry_ipc_component PRIVATE CLIENT)
+  target_include_directories(
+      test_task_registry_ipc_component
+      PRIVATE ${SRC_FOLDER}/external/googletest/googletest/include/
+              ${SRC_FOLDER}/wazuh_modules/agent_info/include
+              ${SRC_FOLDER}/wazuh_modules/src)
+  target_link_libraries(
+      test_task_registry_ipc_component
+      debug gtestd
+      debug gtest_maind
+      optimized gtest
+      optimized gtest_main
+      CLIENT-AGENT
+      -Wl,--start-group
+      TASK_REGISTRY_IPC_WM_O
+      ${SRC_FOLDER}/build/lib/libagent_info.so
+      ${WAZUHLIB}
+      ${WAZUHEXT}
+      -Wl,--end-group
+      pthread
+      dl
+      cmocka
+      -fprofile-arcs
+      -ftest-coverage)
+  add_test(NAME test_task_registry_ipc_component COMMAND test_task_registry_ipc_component)
+  set_tests_properties(test_task_registry_ipc_component PROPERTIES LABELS "client-agent;agent_info")
+
+  # Component test for the VD feed offset IPC round-trip (issue #38204), same
+  # shape as test_task_registry_ipc_component above -- see
+  # test_vd_offset_ipc_component.cpp's file banner for what is real vs. harness.
+  add_executable(test_vd_offset_ipc_component test_vd_offset_ipc_component.cpp)
+  target_compile_definitions(test_vd_offset_ipc_component PRIVATE CLIENT)
+  target_include_directories(
+      test_vd_offset_ipc_component
+      PRIVATE ${SRC_FOLDER}/external/googletest/googletest/include/
+              ${SRC_FOLDER}/wazuh_modules/agent_info/include
+              ${SRC_FOLDER}/wazuh_modules/src)
+  target_link_libraries(
+      test_vd_offset_ipc_component
+      debug gtestd
+      debug gtest_maind
+      optimized gtest
+      optimized gtest_main
+      CLIENT-AGENT
+      -Wl,--start-group
+      TASK_REGISTRY_IPC_WM_O
+      ${SRC_FOLDER}/build/lib/libagent_info.so
+      ${WAZUHLIB}
+      ${WAZUHEXT}
+      -Wl,--end-group
+      pthread
+      dl
+      cmocka
+      -fprofile-arcs
+      -ftest-coverage)
+  add_test(NAME test_vd_offset_ipc_component COMMAND test_vd_offset_ipc_component)
+  set_tests_properties(test_vd_offset_ipc_component PROPERTIES LABELS "client-agent;agent_info")
+endif()

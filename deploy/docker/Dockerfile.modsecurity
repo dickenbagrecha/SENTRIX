@@ -1,0 +1,47 @@
+# Multi-stage Docker build for OWASP ModSecurity 3 (libmodsecurity)
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    bison \
+    flex \
+    git \
+    pkg-config \
+    libpcre2-dev \
+    libyajl-dev \
+    libxml2-dev \
+    libcurl4-openssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY engines/ModSecurity-3-master/ ./
+
+# Build libmodsecurity
+RUN ./build.sh && \
+    ./configure --prefix=/usr/local/modsecurity --without-lmdb && \
+    make -j$(nproc) && \
+    make install
+
+# Runtime Stage
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpcre2-8-0 \
+    libyajl2 \
+    libxml2 \
+    libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/modsecurity /usr/local/modsecurity
+ENV LD_LIBRARY_PATH=/usr/local/modsecurity/lib
+
+WORKDIR /usr/local/modsecurity
+
+CMD ["/bin/sh", "-c", "echo 'ModSecurity 3 dynamic library ready at /usr/local/modsecurity/lib/libmodsecurity.so' && sleep infinity"]

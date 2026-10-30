@@ -1,0 +1,37 @@
+<!-- SENTRIX Unified Custom Correlation Rules for Wazuh -->
+<group name="sentrix,web,crowdsec,promptfoo,">
+
+  <!-- Rule 100010: Coraza WAF Block Alert -->
+  <rule id="100010" level="8">
+    <decoded_as>json</decoded_as>
+    <field name="engine">coraza</field>
+    <field name="action_taken">BLOCKED</field>
+    <description>SENTRIX WAF: Web exploit attempt blocked by Coraza</description>
+    <mitre>
+      <id>T1190</id>
+    </mitre>
+  </rule>
+
+  <!-- Rule 100020: CrowdSec Remediation Alert -->
+  <rule id="100020" level="10">
+    <decoded_as>json</decoded_as>
+    <field name="engine">crowdsec</field>
+    <field name="action_taken">REMEDIATED</field>
+    <description>SENTRIX IPS: Malicious IP remediation decision issued by CrowdSec</description>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+  </rule>
+
+  <!-- Rule 100030: Promptfoo AI Prompt Injection Alert -->
+  <rule id="100030" level="12">
+    <decoded_as>json</decoded_as>
+    <field name="engine">promptfoo</field>
+    <field name="category">AI_PROMPT_INJECTION</field>
+    <description>SENTRIX AI Security: Adversarial prompt injection detected by Promptfoo</description>
+    <mitre>
+      <id>AML.T0054</id>
+    </mitre>
+  </rule>
+
+</group>

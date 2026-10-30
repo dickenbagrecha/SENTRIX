@@ -1,0 +1,121 @@
+package v1
+
+import (
+	"fmt"
+	"net"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+
+	middlewares "github.com/crowdsecurity/crowdsec/pkg/apiserver/middlewares/v1"
+	"github.com/crowdsecurity/crowdsec/pkg/csconfig"
+	"github.com/crowdsecurity/crowdsec/pkg/csprofiles"
+	"github.com/crowdsecurity/crowdsec/pkg/database"
+	"github.com/crowdsecurity/crowdsec/pkg/models"
+)
+
+type Controller struct {
+	DBClient     *database.Client
+	APIKeyHeader string
+	Middlewares  *middlewares.Middlewares
+	Profiles     []*csprofiles.Runtime
+
+	AlertsAddChan      chan []*models.Alert
+	DecisionDeleteChan chan []*models.Decision
+
+	PluginChannel   chan models.ProfileAlert
+	ConsoleConfig   csconfig.ConsoleConfig
+	TrustedIPs      []net.IPNet
+	AutoRegisterCfg *csconfig.LocalAPIAutoRegisterCfg
+
+	DecisionsStreamPageSize int
+
+	// nil when the stream is not limited
+	streamSlots        chan struct{}
+	streamMaxQueueWait time.Duration
+}
+
+type ControllerV1Config struct {
+	DbClient    *database.Client
+	ProfilesCfg []*csconfig.ProfileCfg
+
+	AlertsAddChan      chan []*models.Alert
+	DecisionDeleteChan chan []*models.Decision
+
+	PluginChannel   chan models.ProfileAlert
+	ConsoleConfig   csconfig.ConsoleConfig
+	TrustedIPs      []net.IPNet
+	AutoRegisterCfg *csconfig.LocalAPIAutoRegisterCfg
+
+	DecisionsStream *csconfig.DecisionsStreamCfg
+}
+
+func New(cfg *ControllerV1Config) (*Controller, error) {
+	var err error
+
+	profiles, err := csprofiles.NewProfile(cfg.ProfilesCfg)
+	if err != nil {
+		return &Controller{}, fmt.Errorf("failed to compile profiles: %w", err)
+	}
+
+	pageSize := csconfig.DefaultDecisionsStreamPageSize
+	if cfg.DecisionsStream != nil {
+		pageSize = cfg.DecisionsStream.PageSize
+	}
+
+	// ent drops LIMIT for 0 and SQLite ignores a negative one: a page would be the whole table,
+	// and the paging loop would never end.
+	if pageSize <= 0 {
+		log.Warningf("decisions_stream.page_size must be greater than 0 (got %d), using the default value of %d", pageSize, csconfig.DefaultDecisionsStreamPageSize)
+
+		pageSize = csconfig.DefaultDecisionsStreamPageSize
+	}
+
+	maxStreams := 0
+	maxQueueWait := csconfig.DefaultDecisionsStreamMaxQueueWait
+
+	if cfg.DecisionsStream != nil {
+		maxStreams = cfg.DecisionsStream.MaxConcurrentRequests
+		maxQueueWait = cfg.DecisionsStream.MaxQueueWait
+	}
+
+	if maxStreams < 0 {
+		log.Warningf("decisions_stream.max_concurrent_requests cannot be negative (got %d), not limiting the decisions stream", maxStreams)
+
+		maxStreams = 0
+	}
+
+	// a timer of 0 or less fires at once, which would turn away every request beyond the limit
+	if maxQueueWait <= 0 {
+		log.Warningf("decisions_stream.max_queue_wait must be greater than 0 (got %s), using the default value of %s", maxQueueWait, csconfig.DefaultDecisionsStreamMaxQueueWait)
+
+		maxQueueWait = csconfig.DefaultDecisionsStreamMaxQueueWait
+	}
+
+	v1 := &Controller{
+		DBClient:           cfg.DbClient,
+		APIKeyHeader:       middlewares.APIKeyHeader,
+		Profiles:           profiles,
+		AlertsAddChan:      cfg.AlertsAddChan,
+		DecisionDeleteChan: cfg.DecisionDeleteChan,
+		PluginChannel:      cfg.PluginChannel,
+		ConsoleConfig:      cfg.ConsoleConfig,
+		TrustedIPs:         cfg.TrustedIPs,
+		AutoRegisterCfg:    cfg.AutoRegisterCfg,
+
+		DecisionsStreamPageSize: pageSize,
+
+		streamMaxQueueWait: maxQueueWait,
+	}
+
+	if maxStreams > 0 {
+		v1.streamSlots = make(chan struct{}, maxStreams)
+	}
+
+	v1.Middlewares, err = middlewares.NewMiddlewares(cfg.DbClient)
+	if err != nil {
+		return v1, err
+	}
+
+	return v1, nil
+}

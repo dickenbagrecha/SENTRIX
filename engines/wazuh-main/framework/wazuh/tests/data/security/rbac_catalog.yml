@@ -1,0 +1,605 @@
+---
+get_rbac_actions:
+  - params:
+      endpoint: GET /agents
+    result:
+      agent:read:
+        description:
+          Access agents information (id, name, group, last keep alive, etc)
+        resources:
+          - "agent:id"
+          - "agent:group"
+        example:
+          actions:
+            - agent:read
+          resources:
+            - agent:id:*
+          effect: allow
+        related_endpoints:
+          - GET /agents
+  - params:
+      endpoint: DELETE /agents/{agent_id}/group
+    result:
+      agent:modify_group:
+        description: Change the group of agents
+        resources:
+          - "agent:id"
+          - "agent:group"
+        example:
+          actions:
+            - agent:modify_group
+          resources:
+            - agent:id:004
+            - agent:group:us-east
+          effect: allow
+        related_endpoints:
+          - DELETE /agents/{agent_id}/group
+      group:modify_assignments:
+        description: Change the agents assigned to the group
+        resources:
+          - "group:id"
+        example:
+          actions:
+            - group:modify_assignments
+          resources:
+            - group:id:*
+          effect: allow
+        related_endpoints:
+          - DELETE /agents/{agent_id}/group
+  - params:
+      endpoint: GET /
+    result: {}
+  - params:
+      endpoint: None
+    result:
+      agent:delete:
+        description: Delete agents
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:delete
+          resources:
+            - agent:id:010
+            - agent:group:pacific
+          effect: allow
+        related_endpoints:
+          - DELETE /agents
+      agent:read:
+        description: Access agents information (id, name, group, last keep alive, etc)
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:read
+          resources:
+            - agent:id:*
+          effect: allow
+        related_endpoints:
+          - GET /agents
+          - GET /agents/no_group
+          - GET /agents/outdated
+          - GET /agents/stats/distinct
+          - GET /agents/summary
+          - GET /agents/summary/os
+          - GET /agents/summary/status
+          - GET /groups/{group_id}/agents
+          - GET /overview/agents
+      agent:read_secrets:
+        description: Read the agents' pre-shared keys -- the secrets stored in client.keys -- in clear
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:read_secrets
+          resources:
+            - agent:id:*
+          effect: allow
+        related_endpoints:
+          - GET /agents/{agent_id}/key
+      agent:create:
+        description: Create new agents
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - agent:create
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - POST /agents
+          - POST /agents/insert
+          - POST /agents/insert/quick
+      agent:modify_group:
+        description: Change the group of agents
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:modify_group
+          resources:
+            - agent:id:004
+            - agent:group:us-east
+          effect: allow
+        related_endpoints:
+          - DELETE /agents/{agent_id}/group
+          - DELETE /agents/{agent_id}/group/{group_id}
+          - PUT /agents/{agent_id}/group/{group_id}
+          - DELETE /agents/group
+          - PUT /agents/group
+      group:modify_assignments:
+        description: Change the agents assigned to the group
+        resources:
+          - group:id
+        example:
+          actions:
+            - group:modify_assignments
+          resources:
+            - group:id:*
+          effect: allow
+        related_endpoints:
+          - DELETE /agents/{agent_id}/group
+          - DELETE /agents/{agent_id}/group/{group_id}
+          - PUT /agents/{agent_id}/group/{group_id}
+          - DELETE /agents/group
+          - PUT /agents/group
+      agent:restart:
+        description: Restart agents
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:restart
+          resources:
+            - agent:id:050
+            - agent:id:049
+          effect: deny
+        related_endpoints:
+          - PUT /agents/{agent_id}/restart
+          - PUT /agents/group/{group_id}/restart
+          - PUT /agents/restart
+      agent:reload:
+        description: Reload agents
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:reload
+          resources:
+            - agent:id:050
+            - agent:id:049
+          effect: deny
+        related_endpoints:
+          - PUT /agents/{agent_id}/reload
+          - PUT /agents/group/{group_id}/reload
+          - PUT /agents/reload
+      agent:scan_vulnerability:
+        description: Trigger an on-demand vulnerability scan on agents
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:scan_vulnerability
+          resources:
+            - agent:id:050
+            - agent:id:049
+          effect: deny
+        related_endpoints:
+          - PUT /agents/scan/vulnerability
+      enrollment_token:create:
+        description: Mint enrollment tokens (the credential a new agent pastes to enroll over HTTPS)
+        example:
+          actions:
+            - enrollment_token:create
+          resources:
+            - "*:*:*"
+          effect: allow
+        resources:
+          - "*:*"
+        related_endpoints:
+          - POST /agents/enrollment-tokens
+      enrollment_token:read:
+        description: List enrollment tokens (their id, address, dates and uses; never their credential)
+        example:
+          actions:
+            - enrollment_token:read
+          resources:
+            - "*:*:*"
+          effect: allow
+        resources:
+          - "*:*"
+        related_endpoints:
+          - GET /agents/enrollment-tokens
+      enrollment_token:delete:
+        description: Revoke enrollment tokens
+        example:
+          actions:
+            - enrollment_token:delete
+          resources:
+            - "*:*:*"
+          effect: allow
+        resources:
+          - "*:*"
+        related_endpoints:
+          - DELETE /agents/enrollment-tokens
+          - DELETE /agents/enrollment-tokens/{token_id}
+      agent:uninstall:
+        description: Check user's permission to uninstall agents
+        example:
+          actions:
+            - agent:uninstall
+          resources:
+            - "*:*:*"
+          effect: allow
+        resources:
+          - "*:*"
+        related_endpoints:
+          - GET /agents/uninstall
+      agent:upgrade:
+        description: Upgrade the version of the agents
+        resources:
+          - agent:id
+          - agent:group
+        example:
+          actions:
+            - agent:upgrade
+          resources:
+            - agent:id:001
+            - agent:group:mediterranean
+          effect: allow
+        related_endpoints:
+          - PUT /agents/upgrade
+          - PUT /agents/upgrade_custom
+      group:delete:
+        description: Delete agent groups
+        resources:
+          - group:id
+        example:
+          actions:
+            - group:delete
+          resources:
+            - group:id:*
+          effect: allow
+        related_endpoints:
+          - DELETE /groups
+      group:read:
+        description: Access agent groups information (id, name, agents, etc)
+        resources:
+          - group:id
+        example:
+          actions:
+            - group:create
+          resources:
+            - group:id:*
+          effect: allow
+        related_endpoints:
+          - GET /groups
+          - GET /groups/{group_id}/agents
+          - GET /groups/{group_id}/configuration
+          - GET /groups/{group_id}/files
+          - GET /groups/{group_id}/files/{file_name}
+          - GET /overview/agents
+      group:create:
+        description: Create new agent groups
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - group:create
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - POST /groups
+      group:update_config:
+        description: Change the configuration of agent groups
+        resources:
+          - group:id
+        example:
+          actions:
+            - group:update_config
+          resources:
+            - group:id:*
+          effect: deny
+        related_endpoints:
+          - PUT /groups/{group_id}/configuration
+      cluster:read:
+        description: Read Wazuh's cluster nodes configuration
+        resources:
+          - node:id
+        example:
+          actions:
+            - cluster:read
+          resources:
+            - node:id:worker1
+            - node:id:worker3
+          effect: deny
+        related_endpoints:
+          - GET /cluster/local/info
+          - GET /cluster/local/config
+          - GET /cluster/nodes
+          - GET /cluster/healthcheck
+          - GET /cluster/{node_id}/status
+          - GET /cluster/{node_id}/info
+          - GET /cluster/{node_id}/configuration
+          - GET /cluster/{node_id}/daemons/stats
+          - GET /cluster/{node_id}/daemons/remoted/tls
+          - GET /cluster/{node_id}/logs
+          - GET /cluster/{node_id}/logs/summary
+          - PUT /cluster/restart
+          - PUT /cluster/reload
+          - GET /cluster/configuration/validation
+          - GET /cluster/{node_id}/configuration/{component}/{configuration}
+      cluster:status:
+        description: Check Wazuh's cluster general status
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - cluster:status
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - GET /cluster/status
+      cluster:read_api_config:
+        description: Check Wazuh's cluster nodes API configuration
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - cluster:read_api_config
+          resources:
+            - node:id:worker1
+            - node:id:worker3
+          effect: allow
+        related_endpoints:
+          - GET /cluster/api/config
+      cluster:read_secrets:
+        description: Read the sensitive configuration values -- the enrollment password and the cluster
+          key -- in clear instead of masked, and change the cluster key or the indexer section
+        example:
+          actions:
+            - cluster:read_secrets
+          resources:
+            - node:id:master-node
+          effect: allow
+        resources:
+          - node:id
+        related_endpoints:
+          - GET /cluster/local/config
+          - GET /cluster/{node_id}/configuration
+          - PUT /cluster/{node_id}/configuration
+          - GET /cluster/{node_id}/configuration/{component}/{configuration}
+      cluster:update_config:
+        description: Change the Wazuh's cluster node configuration
+        resources:
+          - node:id
+        example:
+          actions:
+            - cluster:update_config
+          resources:
+            - node:id:worker1
+          effect: allow
+        related_endpoints:
+          - PUT /cluster/{node_id}/configuration
+      cluster:restart:
+        description: Restart Wazuh's cluster nodes
+        resources:
+          - node:id
+        example:
+          actions:
+            - cluster:restart
+          resources:
+            - node:id:worker1
+          effect: allow
+        related_endpoints:
+          - PUT /cluster/restart
+          - PUT /cluster/reload
+      mitre:read:
+        description: Access information from MITRE database
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - mitre:read
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - GET /mitre/groups
+          - GET /mitre/metadata
+          - GET /mitre/mitigations
+          - GET /mitre/references
+          - GET /mitre/software
+          - GET /mitre/tactics
+          - GET /mitre/techniques
+      security:edit_run_as:
+        description: Change the value of the allow_run_as flag for a user
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - security:edit_run_as
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - PUT /security/users/{user_id}/run_as
+      security:read:
+        description: Access information about system security resources
+        resources:
+          - policy:id
+          - role:id
+          - user:id
+          - rule:id
+        example:
+          actions:
+            - security:read
+          resources:
+            - policy:id:*
+            - role:id:2
+            - user:id:5
+            - rule:id:3
+          effect: allow
+        related_endpoints:
+          - GET /security/users
+          - GET /security/roles
+          - GET /security/rules
+          - GET /security/policies
+      security:create_user:
+        description: Create new system users
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - security:create_user
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - POST /security/users
+      security:delete:
+        description: Delete system security resources
+        resources:
+          - policy:id
+          - role:id
+          - user:id
+          - rule:id
+        example:
+          actions:
+            - security:delete
+          resources:
+            - policy:id:*
+            - role:id:3
+            - user:id:4
+            - rule:id:2
+          effect: deny
+        related_endpoints:
+          - DELETE /security/users
+          - DELETE /security/roles
+          - DELETE /security/rules
+          - DELETE /security/policies
+          - DELETE /security/users/{user_id}/roles
+          - DELETE /security/roles/{role_id}/policies
+          - DELETE /security/roles/{role_id}/rules
+      security:update:
+        description: Update the information of system security resources
+        resources:
+          - policy:id
+          - role:id
+          - user:id
+          - rule:id
+        example:
+          actions:
+            - security:update
+          resources:
+            - policy:id:*
+            - role:id:4
+            - user:id:3
+            - rule:id:4
+          effect: deny
+        related_endpoints:
+          - PUT /security/users/{user_id}
+          - PUT /security/roles/{role_id}
+          - PUT /security/rules/{rule_id}
+          - PUT /security/policies/{policy_id}
+          - POST /security/users/{user_id}/roles
+          - POST /security/roles/{role_id}/policies
+          - POST /security/roles/{role_id}/rules
+      security:create:
+        description: Create new system security resources
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - security:create
+          resources:
+            - "*:*:*"
+          effect: deny
+        related_endpoints:
+          - POST /security/roles
+          - POST /security/rules
+          - POST /security/policies
+      security:read_config:
+        description: Read current system security configuration
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - security:read_config
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - GET /security/actions
+          - GET /security/resources
+          - GET /security/config
+      security:update_config:
+        description: Update current system security configuration
+        resources:
+          - "*:*"
+        example:
+          actions:
+            - security:update_config
+          resources:
+            - "*:*:*"
+          effect: allow
+        related_endpoints:
+          - PUT /security/config
+          - DELETE /security/config
+      security:revoke:
+        description: Revoke all active JWT tokens
+        resources:
+          - "*:*"
+        example:
+          actions:
+          - security:revoke
+          resources:
+          - "*:*:*"
+          effect: deny
+        related_endpoints:
+          - PUT /security/user/revoke
+
+get_rbac_resources:
+  - params:
+      resource: None
+    result:
+      "*:*":
+        description: Resource applied in functions acting on resources that do not yet exist
+          in the system. We call these functions, resourceless functions
+      agent:group:
+        description: Reference agents via group name (i.e. agent:group:web)
+      agent:id:
+        description: Reference agents via agent ID (i.e. agent:id:001)
+      group:id:
+        description: Reference agent groups via group ID (i.e. group:id:default)
+      node:id:
+        description: Reference cluster nodes via node ID (i.e. node:id:worker1)
+      policy:id:
+        description: Reference security policies via its id (i.e. policy:id:1)
+      role:id:
+        description: Reference security roles via its id (i.e. role:id:1)
+      rule:id:
+        description: Reference security rules via its id (i.e. rule:id:1)
+      user:id:
+        description: Reference security users via its id (i.e. user:id:1)
+  - params:
+      resource: "agent:id"
+    result:
+      agent:id:
+        description: Reference agents via agent ID (i.e. agent:id:001)
+  - params:
+      resource: "*:*"
+    result:
+      "*:*":
+        description: "Resource applied in functions acting on resources that do not yet exist
+                                in the system. We call these functions, resourceless functions"

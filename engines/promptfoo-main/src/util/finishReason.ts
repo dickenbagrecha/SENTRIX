@@ -1,0 +1,96 @@
+/**
+ * Mapping of provider-specific finish/stop reasons to standardized OpenAI-compatible values.
+ *
+ * This normalization allows consistent finish reason handling across different LLM providers:
+ *
+ * **OpenAI Standard Values:**
+ * - `stop`: Natural completion (reached end_of_turn, stop sequence, etc.)
+ * - `length`: Token limit reached (max_tokens, context length, etc.)
+ * - `content_filter`: Content filtering triggered
+ * - `tool_calls`: Model made function/tool calls
+ *
+ * **Provider Mappings:**
+ * - OpenAI: `function_call` (legacy) → `tool_calls` (current), Responses `max_output_tokens` → `length`
+ * - Anthropic: `end_turn` → `stop`, `stop_sequence` → `stop`, `max_tokens` → `length`, `tool_use` → `tool_calls`, `refusal` → `content_filter`, `pause_turn` → `pause_turn`
+ * - Vercel AI SDK: `tool-calls` → `tool_calls`, `content-filter` → `content_filter`
+ *
+ * @example
+ * ```typescript
+ * normalizeFinishReason('end_turn')     // Returns: 'stop'
+ * normalizeFinishReason('max_tokens')   // Returns: 'length'
+ * normalizeFinishReason('tool_use')     // Returns: 'tool_calls'
+ * normalizeFinishReason('refusal')      // Returns: 'content_filter'
+ * normalizeFinishReason('function_call') // Returns: 'tool_calls'
+ * normalizeFinishReason(' CUSTOM_REASON ') // Returns: 'custom_reason'
+ * ```
+ */
+export const FINISH_REASON_MAP: Record<string, string> = {
+  // OpenAI - Standard values (pass through unchanged)
+  stop: 'stop',
+  length: 'length',
+  content_filter: 'content_filter',
+  tool_calls: 'tool_calls',
+
+  // OpenAI - Legacy mappings
+  function_call: 'tool_calls', // Legacy function calling → modern tool calling
+
+  // OpenAI - Responses API incomplete reason
+  max_output_tokens: 'length',
+
+  // Anthropic - Messages API mappings
+  end_turn: 'stop', // Natural completion
+  stop_sequence: 'stop', // Stop sequence matched
+  max_tokens: 'length', // Token limit reached
+  model_context_window_exceeded: 'length', // Model context limit reached
+  tool_use: 'tool_calls', // Tool/function was called
+  refusal: 'content_filter', // Content filtering / safety refusal
+  pause_turn: 'pause_turn', // Long-running turn paused, can be continued
+
+  // Vercel AI SDK - unified values use hyphens
+  'tool-calls': 'tool_calls', // Tool/function was called
+  'content-filter': 'content_filter', // Content filtering triggered
+};
+
+/**
+ * Normalize a provider-specific finish or stop reason to a standard OpenAI-compatible value.
+ *
+ * This function standardizes finish reasons across different LLM providers to enable
+ * consistent handling in assertions and application logic. Unknown values are trimmed
+ * and lowercased to preserve provider-specific reasons in a normalized form.
+ *
+ * @param raw - The raw finish_reason/stop_reason from the provider response
+ * @returns A normalized finish reason string, or undefined if input is invalid
+ *
+ * @example Basic usage
+ * ```typescript
+ * const result = await provider.callApi('Hello world');
+ * const normalized = normalizeFinishReason(result.finishReason);
+ * // normalized will be one of: 'stop', 'length', 'content_filter', 'tool_calls', or a trimmed, lowercased value
+ * ```
+ *
+ * @example With finish-reason assertion
+ * ```yaml
+ * assert:
+ *   - type: finish-reason
+ *     value: stop  # Expects natural completion (works for both 'stop' and 'end_turn')
+ * ```
+ */
+export function normalizeFinishReason(raw?: string | null): string | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+
+  // Handle edge cases
+  if (typeof raw !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = raw.trim();
+  if (trimmed === '') {
+    return undefined;
+  }
+
+  // Normalize to lowercase for consistent mapping
+  const key = trimmed.toLowerCase();
+  return FINISH_REASON_MAP[key] ?? key;
+}

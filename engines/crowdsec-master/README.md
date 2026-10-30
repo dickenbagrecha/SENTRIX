@@ -1,0 +1,93 @@
+
+<p align="center">
+<img src="https://raw.githubusercontent.com/crowdsecurity/crowdsec-docs/main/crowdsec-docs/static/img/crowdsec_logo.png" alt="CrowdSec" title="CrowdSec" width="400" height="260"/>
+</p>
+</br>
+</br>
+</br>
+<p align="center">
+<img src="https://github.com/crowdsecurity/crowdsec/actions/workflows/go-tests.yml/badge.svg">
+<img src="https://github.com/crowdsecurity/crowdsec/actions/workflows/bats.yml/badge.svg">
+<img src="https://img.shields.io/github/license/crowdsecurity/crowdsec">
+<a href="https://discord.com/invite/crowdsec">
+  <img src="https://img.shields.io/discord/921520481163673640?label=Discord&logo=discord">
+</a>
+<img src="https://img.shields.io/twitter/follow/Crowd_Security?style=social">
+</p>
+
+<h1 align="center">CrowdSec: open-source IDS/IPS, WAF and bot detection</h1>
+
+_CrowdSec is an open-source and participative security solution offering crowdsourced server detection and protection against malicious IPs. Detect and block with our Security Engine, contribute to the network, and enjoy our real-time community blocklist._
+
+<p align="center">
+<img src="https://raw.githubusercontent.com/crowdsecurity/crowdsec-docs/main/crowdsec-docs/static/img/simplified_SE_overview.svg" alt="CrowdSec schema" title="CrowdSec Schema"/>
+</p>
+
+## Features & Advantages
+
+### Versatile Security Engine
+
+[CrowdSec Security Engine](https://docs.crowdsec.net/docs/next/intro/) is an all-in-one [IDS/IPS](https://docs.crowdsec.net/docs/next/log_processor/intro) and [WAF](https://docs.crowdsec.net/docs/next/appsec/intro).
+
+It detects bad behaviors by analyzing log sources and HTTP requests, and allows active remediation thanks to the [Remediation Components](https://docs.crowdsec.net/u/bouncers/intro).
+
+[Detection rules are available on our hub](https://hub.crowdsec.net) under MIT license.
+
+### CrowdSec Community Blocklist
+
+<a href="https://docs.crowdsec.net/docs/next/central_api/community_blocklist">
+
+The "Community Blocklist" is a curated list of IP addresses identified as malicious by CrowdSec. The Security Engine proactively blocks the IP addresses of this blocklist, preventing malevolent IPs from reaching your systems.
+
+[![CrowdSec Community Blocklist](https://raw.githubusercontent.com/crowdsecurity/crowdsec-docs/main/crowdsec-docs/static/img/console/blocklists/data_insights.png)](https://docs.crowdsec.net/docs/next/central_api/community_blocklist)
+
+</a>
+
+### Console - Monitoring & Automation of your security stack
+
+[![CrowdSec Console](https://raw.githubusercontent.com/crowdsecurity/crowdsec-docs/main/crowdsec-docs/static/img/console/alert-explorer/overview-full-dark.png)](https://docs.crowdsec.net/u/console/intro)
+
+### Multiple Platforms support
+
+[![Multiple Platforms support](https://raw.githubusercontent.com/crowdsecurity/crowdsec-docs/main/crowdsec-docs/static/img/supported_platforms.png)](https://docs.crowdsec.net/)
+
+
+## How CrowdSec compares
+
+**To fail2ban** — CrowdSec reads the same log files and bans the same IPs, but
+detection and remediation are decoupled: parse logs on one machine, block at the
+firewall, reverse proxy or CDN on another. Attacks you report feed a community
+blocklist, so an IP that hits one user gets blocked for everyone else before it
+reaches them.
+
+**To ModSecurity, Coraza and naxsi** — the AppSec component is a WAF built on
+Coraza, so SecLang rules and the OWASP Core Rule Set load as-is. On top of that 
+it adds a YAML rule format, and shares the IP reputation and remediation layer 
+with the log-based engine.
+
+**Bot and scraper detection** — AppSec can answer a suspicious request with a
+JavaScript proof-of-work challenge at a tunable difficulty, which stops headless
+browsers and scrapers while letting verified crawlers such as Googlebot through.
+
+## Outnumbering hackers all together
+
+By sharing the threat they faced, all users are protecting each other (hence the name Crowd-Security). Crowdsec is designed for modern infrastructures, with its "*Detect Here, Remedy There*" approach, letting you analyze logs coming from several sources in one place and block threats at various levels (applicative, system, infrastructural) of your stack.
+
+CrowdSec ships by default with scenarios (brute force, port scan, web scan, etc.) adapted for most contexts, but you can easily extend it by picking more of them from the **[HUB](https://hub.crowdsec.net)**. It is also easy to adapt an existing one or create one yourself.
+
+## Installation
+
+<!-- make this an image with link ?-->
+
+[Follow our documentation to install CrowdSec in a few minutes on Linux, Windows, Docker, OpnSense, Kubernetes, and more.](https://docs.crowdsec.net/)
+
+
+## Resources
+
+ - [Console](https://app.crowdsec.net): Supercharge your CrowdSec setup with visualization, management capabilities, extra blocklists and premium features.
+ - [Documentation](https://docs.crowdsec.net): Learn how to exploit your CrowdSec setup to deter more attacks.
+ - [Discord](https://discord.gg/crowdsec): A question or a suggestion? This is the place.
+ - [Hub](https://hub.crowdsec.net): Improve your stack protection, find the relevant remediation components for your infrastructure.
+ - [Public Roadmap](https://roadmap.crowdsec.net/): Vote for your favorite features and submit ideas to influence what we build next.
+ - [CrowdSec Academy](https://academy.crowdsec.net/): Learn and grow with our courses.
+ - [Corporate Website](https://crowdsec.net): For everything else.

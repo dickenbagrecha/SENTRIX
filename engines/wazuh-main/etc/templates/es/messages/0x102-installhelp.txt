@@ -1,0 +1,23 @@
+
+  - Dispone de dos posibilidades de instalación: servidor o
+    agente.
+
+    - Si elige 'servidor', será capaz de analizar todos
+      los registros, crear  notificaciónes de correo  y
+      respuestas, así como también recibir registros
+      desde equipos remotos y sistemas  ejecutando  el  'agente'
+      (quienes transmitirán su trafico cifrado hacia el servidor).
+
+    - Si elige 'agente'(cliente), Usted sera capaz de leer
+      registros  locales (de syslog, snort, apache, etc)  y
+      retrasmitirlos al servidor de analisis.
+
+    - Elija 'servidor' si desea instalar un servidor de registros
+      o análisis.
+
+    - Elija 'agente' si tiene otra maquina ejecutando el servidor
+      de lectura de registros y desea transmitir los registros para
+      análisis. (Ideal para servidore WEB, base de datos, etc)
+
+  - Para más información dirijase a:
+    https://documentation.wazuh.com

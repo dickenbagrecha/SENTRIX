@@ -1,0 +1,200 @@
+import { fetchWithCache } from '../../cache';
+import { getEnvFloat, getEnvInt, getEnvString } from '../../envars';
+import logger from '../../logger';
+import { extractProviderResponseAttributes, withGenAISpan } from '../../tracing/genaiTracer';
+import { getRequestTimeoutMs } from '../shared';
+import { OpenAiGenericProvider } from '.';
+import { calculateOpenAIUsageCost } from './billing';
+import {
+  appendOpenAiApiPath,
+  assertOpenAiApiModel,
+  formatOpenAiError,
+  getOpenAiEffectiveServiceTier,
+  getTokenUsage,
+  isOpenAiFirstPartyApiUrl,
+  normalizeOpenAiBillingModelName,
+  OPENAI_COMPLETION_MODELS,
+} from './util';
+
+import type {
+  CallApiContextParams,
+  CallApiOptionsParams,
+  ProviderResponse,
+} from '../../types/index';
+import type { ProviderOptions } from '../../types/providers';
+import type { OpenAiCompletionOptions } from './types';
+
+export class OpenAiCompletionProvider extends OpenAiGenericProvider {
+  static OPENAI_COMPLETION_MODELS = OPENAI_COMPLETION_MODELS;
+
+  static OPENAI_COMPLETION_MODEL_NAMES = OPENAI_COMPLETION_MODELS.map((model) => model.id);
+
+  config: OpenAiCompletionOptions;
+
+  protected getBillingModelName(config: OpenAiCompletionOptions): string {
+    const passthroughModel = (config.passthrough as { model?: unknown } | undefined)?.model;
+    return typeof passthroughModel === 'string'
+      ? passthroughModel
+      : super.getBillingModelName(config);
+  }
+
+  constructor(
+    modelName: string,
+    options: Pick<ProviderOptions<OpenAiCompletionOptions>, 'config' | 'id' | 'env'> = {},
+  ) {
+    super(modelName, options);
+    this.config = options.config || {};
+    if (
+      !OpenAiCompletionProvider.OPENAI_COMPLETION_MODEL_NAMES.includes(modelName) &&
+      this.getApiUrl() === this.getApiUrlDefault()
+    ) {
+      logger.warn(`FYI: Using unknown OpenAI completion model: ${modelName}`);
+    }
+  }
+
+  async callApi(
+    prompt: string,
+    context?: CallApiContextParams,
+    callApiOptions?: CallApiOptionsParams,
+  ): Promise<ProviderResponse> {
+    if (this.requiresApiKey() && !this.getApiKey()) {
+      throw new Error(this.getMissingApiKeyErrorMessage());
+    }
+
+    let stop: unknown;
+    try {
+      stop = getEnvString('OPENAI_STOP')
+        ? JSON.parse(getEnvString('OPENAI_STOP') || '')
+        : this.config?.stop || ['<|im_end|>', '<|endoftext|>'];
+    } catch (err) {
+      throw new Error(`OPENAI_STOP is not a valid JSON string: ${err}`);
+    }
+    const promptConfig = context?.prompt?.config as Partial<OpenAiCompletionOptions> | undefined;
+    const promptReplacesPassthrough =
+      promptConfig && Object.prototype.hasOwnProperty.call(promptConfig, 'passthrough');
+    const effectivePassthrough = promptReplacesPassthrough
+      ? promptConfig.passthrough
+      : this.config.passthrough;
+    const effectiveServiceTier = getOpenAiEffectiveServiceTier(this.config, promptConfig);
+    const isFirstPartyCompletionApi = isOpenAiFirstPartyApiUrl(this.getApiUrl());
+    const requestServiceTier = isFirstPartyCompletionApi ? undefined : effectiveServiceTier;
+    const body = {
+      model: this.modelName,
+      prompt,
+      seed: this.config.seed,
+      max_tokens: this.config.max_tokens ?? getEnvInt('OPENAI_MAX_TOKENS', 1024),
+      temperature: this.config.temperature ?? getEnvFloat('OPENAI_TEMPERATURE', 0),
+      top_p: this.config.top_p ?? getEnvFloat('OPENAI_TOP_P', 1),
+      presence_penalty: this.config.presence_penalty ?? getEnvFloat('OPENAI_PRESENCE_PENALTY', 0),
+      frequency_penalty:
+        this.config.frequency_penalty ?? getEnvFloat('OPENAI_FREQUENCY_PENALTY', 0),
+      best_of: this.config.best_of ?? getEnvInt('OPENAI_BEST_OF', 1),
+      ...(callApiOptions?.includeLogProbs ? { logprobs: callApiOptions.includeLogProbs } : {}),
+      ...(stop ? { stop } : {}),
+      ...(effectivePassthrough || {}),
+      ...(requestServiceTier === undefined ? {} : { service_tier: requestServiceTier }),
+    };
+    // OpenAI's legacy /v1/completions schema rejects service_tier. Custom gateways may support it.
+    if (isFirstPartyCompletionApi) {
+      delete body.service_tier;
+    }
+    assertOpenAiApiModel(body.model, this.getApiUrl());
+    const asNumber = (value: unknown): number | undefined =>
+      typeof value === 'number' ? value : undefined;
+    const stopSequences =
+      typeof body.stop === 'string'
+        ? [body.stop]
+        : Array.isArray(body.stop) &&
+            body.stop.every((item): item is string => typeof item === 'string')
+          ? body.stop
+          : undefined;
+
+    return withGenAISpan(
+      {
+        system: this.getGenAISystem(),
+        operationName: 'text_completion',
+        model: body.model,
+        providerId: this.id(),
+        maxTokens: asNumber(body.max_tokens),
+        temperature: asNumber(body.temperature),
+        topP: asNumber(body.top_p),
+        stopSequences,
+        presencePenalty: asNumber(body.presence_penalty),
+        frequencyPenalty: asNumber(body.frequency_penalty),
+        evalId: context?.evaluationId,
+        testIndex: context?.testIdx ?? (context?.test?.vars?.__testIdx as number | undefined),
+        promptLabel: context?.prompt?.label,
+        traceparent: context?.traceparent,
+        requestBody: prompt,
+      },
+      () => this.callApiInternal(body, context),
+      extractProviderResponseAttributes,
+    );
+  }
+
+  private async callApiInternal(
+    body: Record<string, unknown>,
+    context?: CallApiContextParams,
+  ): Promise<ProviderResponse> {
+    let data,
+      cached = false,
+      latencyMs: number | undefined;
+    try {
+      ({ data, cached, latencyMs } = (await fetchWithCache(
+        appendOpenAiApiPath(this.getApiUrl(), 'completions'),
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(this.getApiKey() ? { Authorization: `Bearer ${this.getApiKey()}` } : {}),
+            ...this.getOpenAiRequestHeaders(),
+          },
+          body: JSON.stringify(body),
+        },
+        getRequestTimeoutMs(),
+        'json',
+        context?.bustCache ?? context?.debug,
+        this.config.maxRetries,
+      )) as unknown as any);
+    } catch (err) {
+      logger.error(`API call error: ${String(err)}`);
+      return {
+        error: `API call error: ${String(err)}`,
+      };
+    }
+
+    if (data?.error) {
+      return {
+        error: formatOpenAiError(data),
+      };
+    }
+    if (!data?.choices?.[0]) {
+      return {
+        error: `Malformed response data: ${JSON.stringify(data)}`,
+        cached,
+      };
+    }
+    try {
+      const billingModelName = this.getBillingModelName({
+        ...this.config,
+        passthrough: { model: body.model },
+      });
+      const billingLookupModel = normalizeOpenAiBillingModelName(billingModelName);
+      return {
+        output: data.choices[0].text,
+        tokenUsage: getTokenUsage(data, cached),
+        cached,
+        latencyMs,
+        cost: calculateOpenAIUsageCost(billingLookupModel, this.config, data.usage, {
+          cachedResponse: cached,
+          serviceTier: data.service_tier ?? body.service_tier,
+          apiUrl: this.getApiUrl(),
+        }),
+      };
+    } catch (err) {
+      return {
+        error: `API error: ${String(err)}: ${JSON.stringify(data)}`,
+      };
+    }
+  }
+}

@@ -1,0 +1,190 @@
+import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+
+import { useCart } from './useFourthwall';
+
+import type { FourthwallCart, FourthwallCartItem, FourthwallCatalogItem } from './types';
+
+const COUPON_STORAGE_KEY = 'promptfoo_coupon_code';
+
+interface CartContextValue {
+  // Cart state
+  cart: FourthwallCart | null;
+  isLoading: boolean;
+  error: string | null;
+  itemCount: number;
+
+  // Cart actions
+  addToCart: (variantId: string, quantity?: number) => Promise<FourthwallCart | undefined>;
+  addBundleToCart: (bundleId: string, variantIds: string[]) => Promise<FourthwallCart | undefined>;
+  removeFromCart: (item: FourthwallCartItem) => Promise<FourthwallCart | undefined>;
+  updateQuantity: (
+    item: FourthwallCartItem,
+    quantity: number,
+  ) => Promise<FourthwallCart | undefined>;
+
+  // Cart drawer state
+  isCartOpen: boolean;
+  openCart: () => void;
+  closeCart: () => void;
+
+  // Product modal state
+  selectedProduct: FourthwallCatalogItem | null;
+  openProductModal: (product: FourthwallCatalogItem) => void;
+  closeProductModal: () => void;
+
+  // Coupon state
+  couponCode: string | null;
+  clearCoupon: () => void;
+}
+
+const CartContext = createContext<CartContextValue | null>(null);
+
+export function CartProvider({ children }: { children: React.ReactNode }) {
+  const {
+    cart,
+    isLoading,
+    error,
+    itemCount,
+    addToCart: addToCartApi,
+    addBundleToCart: addBundleToCartApi,
+    removeFromCart: removeFromCartApi,
+    updateQuantity: updateQuantityApi,
+  } = useCart();
+
+  const [isCartOpen, setIsCartOpen] = useState(false);
+  const [selectedProduct, setSelectedProduct] = useState<FourthwallCatalogItem | null>(null);
+  const [couponCode, setCouponCode] = useState<string | null>(null);
+
+  const ingestCouponFromUrl = useCallback(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlCoupon = params.get('coupon');
+    if (urlCoupon) {
+      const code = urlCoupon.trim().toUpperCase();
+      setCouponCode(code);
+      try {
+        localStorage.setItem(COUPON_STORAGE_KEY, code);
+      } catch {
+        // Private browsing
+      }
+      // Clean the URL without triggering a navigation
+      params.delete('coupon');
+      const newUrl = params.toString()
+        ? `${window.location.pathname}?${params.toString()}`
+        : window.location.pathname;
+      window.history.replaceState(window.history.state, '', `${newUrl}${window.location.hash}`);
+      return true;
+    }
+    return false;
+  }, []);
+
+  // Read coupon from URL or localStorage on mount
+  useEffect(() => {
+    if (!ingestCouponFromUrl()) {
+      // Fall back to localStorage
+      try {
+        const stored = localStorage.getItem(COUPON_STORAGE_KEY);
+        if (stored) {
+          setCouponCode(stored);
+        }
+      } catch {
+        // Private browsing
+      }
+    }
+  }, [ingestCouponFromUrl]);
+
+  // Re-check URL on client-side navigations (Docusaurus SPA route changes)
+  useEffect(() => {
+    // Docusaurus uses pushState/replaceState for navigation
+    window.addEventListener('popstate', ingestCouponFromUrl);
+
+    // Patch pushState/replaceState to detect Docusaurus client-side navigation
+    const originalPushState = window.history.pushState;
+    const originalReplaceState = window.history.replaceState;
+    window.history.pushState = function (...args) {
+      originalPushState.apply(this, args);
+      ingestCouponFromUrl();
+    };
+    window.history.replaceState = function (...args) {
+      originalReplaceState.apply(this, args);
+      ingestCouponFromUrl();
+    };
+
+    return () => {
+      window.removeEventListener('popstate', ingestCouponFromUrl);
+      window.history.pushState = originalPushState;
+      window.history.replaceState = originalReplaceState;
+    };
+  }, [ingestCouponFromUrl]);
+
+  const clearCoupon = useCallback(() => {
+    setCouponCode(null);
+    try {
+      localStorage.removeItem(COUPON_STORAGE_KEY);
+    } catch {
+      // Private browsing
+    }
+  }, []);
+
+  const openCart = useCallback(() => setIsCartOpen(true), []);
+  const closeCart = useCallback(() => setIsCartOpen(false), []);
+
+  const openProductModal = useCallback((product: FourthwallCatalogItem) => {
+    setSelectedProduct(product);
+  }, []);
+
+  const closeProductModal = useCallback(() => {
+    setSelectedProduct(null);
+  }, []);
+
+  // Wrap addToCart to automatically open cart drawer on success
+  const addToCart = useCallback(
+    async (variantId: string, quantity: number = 1) => {
+      const result = await addToCartApi(variantId, quantity);
+      if (result) {
+        setIsCartOpen(true);
+      }
+      return result;
+    },
+    [addToCartApi],
+  );
+
+  const addBundleToCart = useCallback(
+    async (bundleId: string, variantIds: string[]) => {
+      const result = await addBundleToCartApi(bundleId, variantIds);
+      if (result) {
+        setIsCartOpen(true);
+      }
+      return result;
+    },
+    [addBundleToCartApi],
+  );
+
+  const value: CartContextValue = {
+    cart,
+    isLoading,
+    error,
+    itemCount,
+    addToCart,
+    addBundleToCart,
+    removeFromCart: removeFromCartApi,
+    updateQuantity: updateQuantityApi,
+    isCartOpen,
+    openCart,
+    closeCart,
+    selectedProduct,
+    openProductModal,
+    closeProductModal,
+    couponCode,
+    clearCoupon,
+  };
+
+  return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
+}
+
+export function useCartContext() {
+  const context = useContext(CartContext);
+  if (!context) {
+    throw new Error('useCartContext must be used within a CartProvider');
+  }
+  return context;
+}

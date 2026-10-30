@@ -1,0 +1,391 @@
+name: 5.X - Engine - Integration tests - Helper functions and API endpoints
+
+on:
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+    paths:
+      # The engine binary. This lane builds a plain `make TARGET=manager`: the per-module test/
+      # and benchmark/ trees are compiled only under ENGINE_BUILD_TEST / ENGINE_BUILD_BENCHMARK
+      # (every reference is inside those guards in source/*/CMakeLists.txt), so they are left out.
+      - 'src/engine/CMakeLists.txt'
+      - 'src/engine/source/**'
+      - '!src/engine/source/**/test/**'
+      - '!src/engine/source/**/benchmark/**'
+      # What the two test jobs install and run.
+      - 'src/engine/test/setupEnvironment.py'
+      - 'src/engine/test/engine-test-utils/**'
+      - 'src/engine/test/helper_tests/**'
+      - 'src/engine/test/integration_tests/**'
+      - 'src/engine/tools/api-communication/**'
+      - 'src/engine/tools/engine-suite/**'
+      # Copied into the test store by setupEnvironment.py:11-18
+      - 'src/engine/ruleset/schemas/engine-schema.json'
+      - 'src/engine/ruleset/schemas/wazuh-logpar-overrides.json'
+      - 'src/engine/ruleset/schemas/allowed-fields.json'
+      # Loaded by engine-it init (integration_tests/engine-it/src/integration_test/initial_state.py:213)
+      - 'src/engine/ruleset/outputs/**'
+      # Link closure outside src/engine. The engine is configured inside the src/ tree
+      # (add_subdirectory(engine), src/CMakeLists.txt:278).
+      - 'src/CMakeLists.txt'
+      # wazuh_link_jemalloc(wazuh-engine) (src/engine/CMakeLists.txt:373, src/cmake/WazuhJemalloc.cmake:20)
+      - 'src/cmake/**'
+      # wazuhext and the vendored libraries the engine imports from src/external (src/CMakeLists.txt:237)
+      - 'src/external/CMakeLists.txt'
+      # make deps / build; pins http-request (HTTP_REQUEST_BRANCH, src/Makefile:98) and tzdata,
+      # which this lane uploads and the test jobs read
+      - 'src/Makefile'
+      - 'src/deps.lock.mk'
+      # Ref list for every ref-based `make deps` download (src/Makefile:708)
+      - 'tools/get_git_refs.sh'
+      # Submodule gitlink: urlrequest, linked by conf and geo (source/conf/CMakeLists.txt:13,
+      # source/geo/CMakeLists.txt:17) and by indexer_connector. Moves together with src/Makefile:98.
+      - 'src/shared_modules/http-request'
+      # include_directories (src/engine/CMakeLists.txt:195): loggerHelper.h, proc.hpp, zlibHelper.hpp
+      - 'src/shared_modules/utils/**'
+      # commonDefs.h, on the indexer_connector/keystore include path (indexer_connector/CMakeLists.txt:33)
+      - 'src/shared_modules/common/**'
+      # base links manager_config (source/base/CMakeLists.txt:47); schema embedded at build time
+      # (manager_config/CMakeLists.txt:20)
+      - 'src/shared_modules/manager_config/**'
+      # wiconnector links indexer_connector (source/wiconnector/CMakeLists.txt:24); its .so is
+      # uploaded and loaded by the engine at test time
+      - 'src/shared_modules/indexer_connector/**'
+      # linked by indexer_connector (indexer_connector/CMakeLists.txt:52); wazuh-manager-keystore
+      # (keystore/CMakeLists.txt:42) is run by setupEnvironment.py:52-57
+      - 'src/shared_modules/keystore/**'
+      # Other components' test trees, harnesses and tools: never linked into the engine.
+      - '!src/shared_modules/utils/tests/**'
+      - '!src/shared_modules/utils/benchmark/**'
+      - '!src/shared_modules/utils/mocks/**'
+      - '!src/shared_modules/utils/flatbuffers/**'
+      - '!src/shared_modules/manager_config/tests/**'
+      - '!src/shared_modules/manager_config/cli/**'
+      - '!src/shared_modules/indexer_connector/tests/**'
+      - '!src/shared_modules/indexer_connector/qa/**'
+      - '!src/shared_modules/indexer_connector/testtool/**'
+      - '!src/shared_modules/keystore/tests/**'
+      - '!src/shared_modules/keystore/qa/**'
+      - '!src/shared_modules/keystore/testtool/**'
+      # READMEs build nothing ...
+      - '!src/**/*.md'
+      # ... except those pip reads as package metadata when installing the test tools.
+      - 'src/engine/tools/engine-suite/README.md'                # setup.cfg:6 long_description
+      - 'src/engine/test/engine-test-utils/README.md'            # pyproject.toml:10 readme
+      - 'src/engine/test/integration_tests/engine-it/README.md'  # pyproject.toml:10 readme
+      # CI plumbing (the S3 actions carry the build artifacts to the test jobs).
+      - '.github/workflows/5_testintegration_engine.yml'
+      - '.github/actions/reinstall_cmake/**'
+      # run by reinstall_cmake (.github/actions/reinstall_cmake/action.yml:29)
+      - 'tools/devContainer/reinstall-cmake.sh'
+      - '.github/actions/setup-sccache/**'
+      - '.github/actions/upload_s3_artifact/**'
+      - '.github/actions/download_s3_artifact/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ENGINE_DIR: ${{github.workspace}}/src/engine
+
+jobs:
+  build:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    name: Build Server
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install CMake
+        uses: ./.github/actions/reinstall_cmake
+      # Compilation cache (issue 38139). Skipped on fork PRs (no credentials).
+      - name: "Configure AWS credentials for the compilation cache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.CI_AWS_REGION }}
+          role-duration-seconds: 7200
+      - name: "Set up sccache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/setup-sccache
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          region: ${{ secrets.CI_AWS_REGION }}
+          key-prefix: sccache/5.0.0
+      - name: Build Wazuh manager
+        run: |
+          make deps -C src TARGET=manager -j$(nproc)
+          make -C src TARGET=manager -j$(nproc)
+
+      - name: Upload engine binary
+        uses: ./.github/actions/upload_s3_artifact
+        with:
+          name: wazuh-engine
+          path: src/build/engine/wazuh-engine
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws_region: ${{ secrets.CI_AWS_REGION }}
+
+      # setupEnvironment.py stores the test indexer credentials with it.
+      - name: Upload keystore tool
+        uses: ./.github/actions/upload_s3_artifact
+        with:
+          name: wazuh-manager-keystore
+          path: src/build/bin/wazuh-manager-keystore
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws_region: ${{ secrets.CI_AWS_REGION }}
+
+      - name: Upload wazuh shared libraries
+        uses: ./.github/actions/upload_s3_artifact
+        with:
+          name: wazuh-shared-libraries
+          path: |
+            src/build/lib/libwazuhext.so
+            src/build/lib/libindexer_connector.so
+            src/build/lib/libcontent_manager.so
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws_region: ${{ secrets.CI_AWS_REGION }}
+
+      - name: Upload rocksdb shared libraries
+        uses: ./.github/actions/upload_s3_artifact
+        with:
+          name: rocksdb-shared-library
+          path: |
+            src/external/rocksdb/build/librocksdb.so.8
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws_region: ${{ secrets.CI_AWS_REGION }}
+
+      - name: Upload jemalloc shared libraries
+        uses: ./.github/actions/upload_s3_artifact
+        with:
+          name: jemalloc-shared-library
+          path: |
+            src/external/jemalloc/lib/libjemalloc.so.2
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws_region: ${{ secrets.CI_AWS_REGION }}
+
+      - name: Upload timezone database
+        uses: ./.github/actions/upload_s3_artifact
+        with:
+          name: timezone-database
+          path: src/external/tzdata
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws_region: ${{ secrets.CI_AWS_REGION }}
+      - name: "Compilation cache statistics"
+        if: always()
+        run: sccache --show-stats 2>/dev/null | grep -viE "cache location|bucket" || true
+
+  helper_tests:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    name: Helper Functions Test
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    needs: build
+    timeout-minutes: 60
+    env:
+      LD_LIBRARY_PATH: ${{github.workspace}}/src:${{github.workspace}}/src/build/lib:${{github.workspace}}/src/external/rocksdb/build:${{github.workspace}}/src/external/jemalloc/lib
+
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v3
+
+    - name: Download engine binary
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: wazuh-engine
+        path: src/build/engine/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download keystore tool
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: wazuh-manager-keystore
+        path: src/build/bin/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download jemalloc shared libraries
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: jemalloc-shared-library
+        path: src/external/jemalloc/lib/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download rocksdb shared libraries
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: rocksdb-shared-library
+        path: src/external/rocksdb/build/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download wazuh shared libraries
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: wazuh-shared-libraries
+        path: src/build/lib/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
+    - name: Install dependencies
+      run: |
+        ls -la src/build/engine
+        ls -la src/external/rocksdb/build
+        sudo apt-get update && sudo apt-get install -y libcap2-bin
+        pip install ${{env.ENGINE_DIR}}/tools/api-communication/
+        pip install ${{env.ENGINE_DIR}}/tools/engine-suite/
+        pip install ${{env.ENGINE_DIR}}/test/engine-test-utils/
+        pip install ${{env.ENGINE_DIR}}/test/helper_tests/engine-helper-test/
+
+    - name: Download timezone database
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: timezone-database
+        path: src/external/tzdata
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Setup environment
+      run: |
+        chmod +x src/build/engine/wazuh-engine src/build/bin/wazuh-manager-keystore
+        python3 ${{env.ENGINE_DIR}}/test/setupEnvironment.py -e /tmp/actions
+
+    - name: Initial state
+      run: engine-helper-test -e /tmp/actions init --mmdb ${{env.ENGINE_DIR}}/test/helper_tests/mmdb/ --conf ${{env.ENGINE_DIR}}/test/helper_tests/configuration_files/config.env
+
+    - name: Validate helper descriptions
+      run: engine-helper-test -e /tmp/actions validate --input-dir ${{env.ENGINE_DIR}}/test/helper_tests/helpers_description/
+
+    - name: Generate tests
+      run: engine-helper-test -e /tmp/actions generate-tests --input-dir ${{env.ENGINE_DIR}}/test/helper_tests/helpers_description/ -o /tmp/helper_tests/
+
+    - name: Run tests
+      run: engine-helper-test -e /tmp/actions run --input-dir /tmp/helper_tests/
+
+    - name: Validate documentation generation
+      run: engine-helper-test -e /tmp/actions generate-doc --input-dir ${{env.ENGINE_DIR}}/test/helper_tests/helpers_description/ -o /tmp/helper_docs/
+
+  api_tests:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    name: API Endpoints Test
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    needs: build
+    timeout-minutes: 60
+    env:
+      LD_LIBRARY_PATH: ${{github.workspace}}/src:${{github.workspace}}/src/build/lib:${{github.workspace}}/src/external/rocksdb/build:${{github.workspace}}/src/external/jemalloc/lib
+
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v3
+
+    - name: Download engine binary
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: wazuh-engine
+        path: src/build/engine/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download rocksdb shared libraries
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: rocksdb-shared-library
+        path: src/external/rocksdb/build/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download keystore tool
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: wazuh-manager-keystore
+        path: src/build/bin/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download jemalloc shared libraries
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: jemalloc-shared-library
+        path: src/external/jemalloc/lib/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Download wazuh shared libraries
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: wazuh-shared-libraries
+        path: src/build/lib/
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+
+    - name: Install dependencies
+      run: |
+        pip install ${{env.ENGINE_DIR}}/tools/api-communication/
+        pip install ${{env.ENGINE_DIR}}/tools/engine-suite/
+        pip install ${{env.ENGINE_DIR}}/test/engine-test-utils/
+        pip install ${{env.ENGINE_DIR}}/test/integration_tests/engine-it
+
+    - name: Download timezone database
+      uses: ./.github/actions/download_s3_artifact
+      with:
+        name: timezone-database
+        path: src/external/tzdata
+        bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+        aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+        aws_region: ${{ secrets.CI_AWS_REGION }}
+
+    - name: Setup environment
+      run: |
+        chmod +x src/build/engine/wazuh-engine src/build/bin/wazuh-manager-keystore
+        python3 ${{env.ENGINE_DIR}}/test/setupEnvironment.py -e /tmp/actions
+
+    - name: Initial state
+      run: engine-it -e /tmp/actions -t ${{env.ENGINE_DIR}}/test/integration_tests/ init
+
+    - name: Integration Test
+      # engine-it runs every <suite>/ holding features/ and steps/ and exits 0 when it finds none
+      # (engine-it/src/integration_test/core.py:24-31): require at least one suite to have started.
+      run: |
+        set -o pipefail
+        engine-it -e /tmp/actions -t ${{env.ENGINE_DIR}}/test/integration_tests/ run | tee /tmp/engine-it.log
+        grep -q '=====> Start Behave' /tmp/engine-it.log || {
+          echo "::error::engine-it ran no behave suite"; exit 1; }

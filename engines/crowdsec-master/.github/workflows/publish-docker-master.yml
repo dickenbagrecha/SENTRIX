@@ -1,0 +1,48 @@
+name: (push-master) Publish latest Docker images
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'pkg/**'
+      - 'cmd/**'
+      - 'build/mk/**'
+      - 'build/docker/Dockerfile'
+      - 'build/docker/Dockerfile.debian'
+      - 'build/docker/docker_start.sh'
+      - 'build/docker/config.yaml'
+      - '.github/workflows/publish-docker-master.yml'
+      - '.github/workflows/publish-docker.yml'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+
+permissions:
+  contents: read
+  packages: write # push images to ghcr.io
+
+jobs:
+  dev-alpine:
+    uses: ./.github/workflows/publish-docker.yml
+    # inherit so the reusable job's `docker` environment secrets resolve
+    secrets: inherit
+    with:
+      platform: linux/amd64
+      crowdsec_version: ""
+      image_version: dev
+      latest: false
+      push: true
+      slim: false
+      debian: false
+
+  dev-debian:
+    uses: ./.github/workflows/publish-docker.yml
+    secrets: inherit
+    with:
+      platform: linux/amd64
+      crowdsec_version: ""
+      image_version: dev
+      latest: false
+      push: true
+      slim: false
+      debian: true

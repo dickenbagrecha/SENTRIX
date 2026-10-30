@@ -1,0 +1,135 @@
+#!/bin/sh
+# postrm script for Wazuh
+# Wazuh, Inc 2015
+set -e
+DPKG_LIST_FILE="/var/lib/dpkg/info/wazuh-manager.list"
+
+DIR="/var/wazuh-manager"
+# The configuration directory is fixed, outside the installation directory.
+CONF_DIR="/etc/wazuh-manager"
+if [ "$1" = "abort-upgrade" ] || [ "$1" = "failed-upgrade" ]; then
+    # The installation directory of the package being rolled back, from dpkg's file list.
+    DIR=""
+    if [ -r "${DPKG_LIST_FILE}" ]; then
+        while IFS= read -r LISTED_PATH || [ -n "${LISTED_PATH}" ]; do
+            case "${LISTED_PATH}" in
+                */bin/wazuh-manager-control) DIR="${LISTED_PATH%/bin/wazuh-manager-control}"; break ;;
+                */bin/wazuh-control) DIR="${LISTED_PATH%/bin/wazuh-control}"; break ;;
+            esac
+        done < "${DPKG_LIST_FILE}"
+    fi
+
+    if [ -z "${DIR}" ] || [ ! -d "${DIR}" ]; then
+        exit 0
+    fi
+fi
+
+WAZUH_TMP_DIR="${DIR}/packages_files/manager_config_files"
+WAZUH_PRESERVE_DIR="${DIR}/packages_files/manager_upgrade_preserve"
+ROLLBACK_MARKER="${WAZUH_TMP_DIR}/rollback_prepared"
+
+# If preinst did not prepare rollback state, abort safely.
+if [ "$1" = "abort-upgrade" ] || [ "$1" = "failed-upgrade" ]; then
+    if [ ! -f "${ROLLBACK_MARKER}" ]; then
+        exit 0
+    fi
+fi
+
+case "$1" in
+    remove|failed-upgrade|abort-install|abort-upgrade|disappear)
+
+        case "$1" in
+            failed-upgrade|abort-upgrade)
+                if [ -d "${WAZUH_TMP_DIR}" ]; then
+                    echo "Wazuh upgrade recovery files were preserved at ${WAZUH_TMP_DIR}. Restore them manually if needed." >&2
+                fi
+                if [ -d "${WAZUH_PRESERVE_DIR}" ]; then
+                    echo "Wazuh upgrade recovery files were preserved at ${WAZUH_PRESERVE_DIR}. Restore them manually if needed." >&2
+                fi
+                ;;
+            *)
+                if [ -d ${WAZUH_TMP_DIR} ]; then
+                    rm -rf ${WAZUH_TMP_DIR}
+                fi
+                if [ -d "${WAZUH_PRESERVE_DIR}" ]; then
+                    rm -rf "${WAZUH_PRESERVE_DIR}"
+                fi
+                ;;
+        esac
+
+        # A failed or aborted upgrade leaves the old package installed and configured: its
+        # configuration stays in place, untouched. Only a removal keeps it aside as .save.
+        if [ "$1" != "failed-upgrade" ] && [ "$1" != "abort-upgrade" ]; then
+            # Back up the old configuration files as .save
+            if [ ! -d ${CONF_DIR}/shared/default ]; then
+                mkdir -p ${CONF_DIR}/shared/default
+            fi
+
+            # Only the directory prerm made, root's and not a link, is read back: tmp/ is writable by
+            # wazuh-manager.
+            if [ -d ${DIR}/tmp/conffiles ] && [ ! -L ${DIR}/tmp/conffiles ] \
+                && [ -n "$(find ${DIR}/tmp/conffiles -maxdepth 0 -user 0)" ]; then
+                # Move files from ${DIR}/tmp to ${CONF_DIR}
+                if [ -f ${DIR}/tmp/conffiles/shared/default/agent.conf ]; then
+                    mv ${DIR}/tmp/conffiles/shared/default/agent.conf ${CONF_DIR}/shared/default/agent.conf.save
+                fi
+
+                # Move files from ${DIR}/tmp to ${DIR}/api
+                if [ -f ${DIR}/tmp/conffiles/api.yaml ]; then
+                    mkdir -p ${DIR}/api/configuration
+                    mv ${DIR}/tmp/conffiles/api.yaml ${DIR}/api/configuration/api.yaml
+                fi
+
+                # If the directory is not empty, copy the files into ${CONF_DIR}, which wazuh-manager
+                # can write: --remove-destination replaces a link planted at a destination instead of
+                # writing through it, and cp refuses to copy a directory onto a link.
+                if [ -n "$(ls -A ${DIR}/tmp/conffiles)" ]; then
+                    cp -Rf --remove-destination ${DIR}/tmp/conffiles/* ${CONF_DIR} \
+                        || echo "WARNING: some configuration files could not be kept in ${CONF_DIR}." >&2
+                fi
+            fi
+            rm -rf ${DIR}/tmp
+            if [ "$1" = "remove" ]; then
+                rm -rf ${DIR}/ruleset
+                rm -rf ${DIR}/var
+                rm -rf ${DIR}/logs
+                rm -rf ${DIR}/data
+            fi
+
+            # Delete old .save
+            find ${CONF_DIR}/ -type f  -name "*save" -exec rm -f {} \;
+
+            # Rename the files
+            find ${CONF_DIR}/ -type f ! -name "*shared*" -exec mv {} {}.save \;
+
+            if [ -d "${DIR}/api" ]; then
+                find "${DIR}/api/" -type f -name "*save" -exec rm -f {} \;
+                find "${DIR}/api/" -type f -exec mv {} {}.save \;
+            fi
+
+        fi
+    ;;
+
+    purge)
+        if getent passwd wazuh-manager > /dev/null 2>&1 ; then
+            userdel wazuh-manager > /dev/null 2>&1 || true
+        fi
+        if getent group wazuh-manager > /dev/null 2>&1; then
+            groupdel wazuh-manager > /dev/null 2>&1 || true
+        fi
+        rm -rf ${DIR} ${CONF_DIR}
+    ;;
+
+    upgrade)
+
+    ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 0
+
+    ;;
+
+esac
+
+exit 0

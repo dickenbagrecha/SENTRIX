@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: GPL-2.0-only OR AGPL-3.0-or-later
+// Inventory synchronization schema (manager side) -- the FINAL wire contract
+// agreed with the agent team: a whole synchronization session travels as ONE
+// Message{FullSession} request over remoted's POST /stateful route, and the
+// HTTP response IS the session result. There are no acks, no End, no
+// retransmission and no per-item sequence numbers (design decisions D1-D4/D19
+// in inventory_sync_server_docs).
+//
+// This file replaced the legacy session-based schema when the inventory_sync
+// module was retired; inventory_sync_server is its only manager-side consumer
+// (remoted relays the body opaquely, and the module itself cross-checks
+// Start.agentid against the authenticated identity).
+//
+// Build a FullSession WITHOUT shared objects: no two offsets may name the same
+// string or table (no CreateSharedString). The server charges every object a
+// message reaches its minimum encoded size and answers 400 when the total
+// exceeds the message (inventory_sync_server D25); Start.groups (128 x 255 B)
+// and Start.index (64 x 255 B) are capped too (D26).
+namespace Wazuh.SyncSchema;
+
+enum Mode: byte {
+    ModuleDelta,
+    ModuleCheck,
+    MetadataDelta,
+    MetadataCheck,
+    GroupDelta,
+    GroupCheck
+}
+
+enum Operation: byte {
+    Upsert,
+    Delete
+}
+
+enum Option: byte {
+    Sync,
+    VDFirst,
+    VDSync
+}
+
+table DataValue {
+    operation: Operation;
+    id: string;
+    index: string;
+    version: ulong;
+    data: [byte];
+}
+
+table DataContext {
+    id: string;
+    index: string;
+    data: [byte];
+}
+
+table Start {
+    module: string;
+    mode: Mode;
+    index: [string];
+    option: Option;
+    architecture: string;
+    hostname: string;
+    osname: string;
+    osplatform: string;
+    ostype: string;
+    osversion: string;
+    agentversion: string;
+    agentname: string;
+    agentid: string;
+    groups: [string];
+    global_version: ulong;
+    cluster_name: string;
+    feed_offset: ulong;
+}
+
+table DataClean {
+    index: string;
+}
+
+table ChecksumModule {
+    index: string;
+    checksum: string;
+}
+
+/// The data-sync payload of a FullSession: DataValue items (module/metadata
+/// upserts and deletes) and DataContext items (vulnerability-detection data)
+/// travel together in the same session, so both live here side by side.
+table SyncData {
+    values: [DataValue];
+    contexts: [DataContext];
+}
+
+/// A session may clean several indices at once (e.g. FIM clearing files,
+/// registry keys, and registry values together), so this is a real array.
+table Cleans {
+    items: [DataClean];
+}
+
+/// A session carries exactly one of these: a data sync, a clean notification,
+/// or an integrity checksum - never a combination. An integrity check always
+/// covers a single index/module, so it references ChecksumModule directly
+/// instead of wrapping it in an array table.
+union SessionPayload {
+    SyncData,
+    Cleans,
+    ChecksumModule
+}
+
+/// A whole synchronization session as ONE message. Re-applying the same
+/// session is idempotent, so a retry is simply a re-POST of the same buffer.
+table FullSession {
+    start: Start;
+    payload: SessionPayload;
+}
+
+union MessageType {
+    DataValue,
+    DataClean,
+    ChecksumModule,
+    Start,
+    DataContext,
+    FullSession
+}
+
+table Message {
+    content: MessageType;
+}
+
+root_type Message;

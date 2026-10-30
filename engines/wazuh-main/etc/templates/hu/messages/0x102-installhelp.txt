@@ -1,0 +1,22 @@
+
+  - Két féle telepítési lehetősége van: szerver vagy agent(kliens).
+
+    - Ha a 'szerver' opciót választja, akkor képes lesz kielemezni
+      minden naplót, létrehozni e-mail értesítéseket és válaszokat,
+      és ugyancsak lehetősége nyílik távoli syslog gépektől és
+      az 'agent'(kliens)-t futtató rendszerektől naplókat fogadni
+      (ahol a forgalom titkosított kapcsolaton keresztül zajlik a szerver felé).
+
+    - Ha az 'agent'(kliens) opciót választja, lehetősége lesz olvasni a
+      helyi fájlokat (a syslog-ból, snort-ból, apache-ból, stb.) és
+      továbbküldeni őket (titkosítva) a szerverre elemzés céljából.
+
+  - Válassza a 'szerver' telepítést, ha egy
+    naplózó/elemző szervert szeretne létrehozni.
+
+  - Válassza az 'agent' telepítést, ha van egy gépe, amit naplózó
+    szervernek használ és erre a szerverre szeretné továbbítani
+    a naplókat további elemzés céljából
+    (ideális megoldás webszervereknek, adatbázis szervereknek , stb).
+
+  - További információk: https://documentation.wazuh.com

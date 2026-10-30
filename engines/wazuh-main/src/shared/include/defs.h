@@ -1,0 +1,546 @@
+/* Copyright (C) Wazuh Inc.
+ * Copyright (C) 2009-2012 Trend Micro Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+/* Global Definitions */
+
+#ifndef OS_HEADERS
+#define OS_HEADERS
+
+#define TRUE  1
+#define FALSE 0
+
+#define READ  1
+#define WRITE 2
+
+#define OS_BINARY 0
+#define OS_TEXT   1
+
+/* Size limit control */
+#define OS_SIZE_1048576 1048576
+#define OS_SIZE_65536   65536
+#define OS_SIZE_61440   61440
+#define OS_SIZE_32768   32768
+#define OS_SIZE_20480   20480
+#define OS_SIZE_8192    8192
+#define OS_SIZE_6144    6144
+#define OS_SIZE_4096    4096
+#define OS_SIZE_2048    2048
+#define OS_SIZE_1024    1024
+#define OS_SIZE_512     512
+#define OS_SIZE_256     256
+#define OS_SIZE_128     128
+#define OS_SIZE_64      64
+#define OS_SIZE_32      32
+#define OS_SIZE_16      16
+
+/* Level of log messages */
+#define LOGLEVEL_DEBUG_VERBOSE 5
+#define LOGLEVEL_CRITICAL      4
+#define LOGLEVEL_ERROR         3
+#define LOGLEVEL_WARNING       2
+#define LOGLEVEL_INFO          1
+#define LOGLEVEL_DEBUG         0
+
+#define OS_MAXSTR       OS_SIZE_65536             /* Size for logs, sockets, etc      */
+#define OS_BUFFER_SIZE  OS_SIZE_2048              /* Size of general buffers          */
+#define OS_FLSIZE       OS_SIZE_256               /* Maximum file size                */
+#define OS_HEADER_SIZE  OS_SIZE_128               /* Maximum header size              */
+#define OS_LOG_HEADER   OS_SIZE_256               /* Maximum log header size          */
+#define OS_SK_HEADER    OS_SIZE_6144              /* Maximum syscheck header size     */
+#define IPSIZE          INET6_ADDRSTRLEN          /* IP Address size                  */
+#define AUTH_POOL       1000                      /* Max number of connections        */
+#define BACKLOG         128                       /* Socket input queue length        */
+#define MAX_EVENTS      1024                      /* Max number of epoll events       */
+#define EPOLL_MILLIS    -1                        /* Epoll wait time                  */
+#define MAX_TAG_COUNTER 256                       /* Max retrying counter             */
+#define MIN_ORDER_SIZE  32                        /* Minimum size of orders array     */
+#define KEEPALIVE_SIZE  700                       /* Random keepalive string size     */
+#define MAX_DYN_STR     4194304                   /* Max message size received 4MiB   */
+#define DATE_LENGTH     64                        /* Format date time %D %T           */
+#define OS_MAX_LOG_SIZE OS_MAXSTR - OS_LOG_HEADER /* Maximum log size with a header protection */
+
+/* Some global names */
+#define __wazuh_name    "Wazuh"
+#define __wazuh_version "v5.1.0"
+#define __author        "Wazuh Inc."
+#define __contact       "info@wazuh.com"
+#define __site          "http://www.wazuh.com"
+#define __license                                                                                                      \
+    "\
+This program is free software; you can redistribute it and/or modify\n\
+it under the terms of the GNU General Public License (version 2) as \n\
+published by the Free Software Foundation. For more details, go to \n\
+https://www.gnu.org/licenses/gpl.html\n"
+
+/* Maximum allowed PID */
+#define MAX_PID 32768
+
+/* First ID assigned by authd */
+#ifndef AUTHD_FIRST_ID
+#define AUTHD_FIRST_ID 1024
+#endif
+
+/* Notify the manager */
+#define NOTIFY_TIME    10 // ... every 10 seconds
+#define RECONNECT_TIME 60 // Time to reconnect
+
+/* User Configuration */
+#ifndef USER
+#define USER "wazuh"
+#endif
+
+#ifndef ROOTUSER
+#define ROOTUSER "root"
+#endif
+
+#ifndef GROUPGLOBAL
+#define GROUPGLOBAL "wazuh"
+#endif
+
+// Standard super user UID and GID
+#define ROOT_UID (0)
+
+#define ROOT_GID (0)
+
+// Wazuh home environment variable (target-specific to avoid clashes on
+// co-hosted manager + agent installs).
+#ifdef CLIENT
+#define WAZUH_HOME_ENV "WAZUH_AGENT_HOME"
+#else
+#define WAZUH_HOME_ENV "WAZUH_MANAGER_HOME"
+#endif
+
+/* Manager configuration directory. Fixed: a custom installation home moves the home only, never the
+ * configuration. Defined once per language and kept identical in all of them: here,
+ * shared_modules/utils/managerConfDir.hpp, the engine's base/managerConfig.hpp,
+ * framework/wazuh/core/common.py (CONF_PATH) and src/init/shared.sh (CONF_DIR). */
+#ifndef CLIENT
+#ifndef WAZUH_MANAGER_CONF_DIR
+#define WAZUH_MANAGER_CONF_DIR "/etc/wazuh-manager"
+#endif
+#endif
+
+/* Default queue */
+#define DEFAULTQUEUE "queue/sockets/queue"
+
+/* Stateful sync-session intake (HTTPS agent): a STREAM socket separate from
+ * the DGRAM DEFAULTQUEUE, so whole sync sessions bypass the 64 KB cap. */
+#define SYNCQUEUE "queue/sockets/queue-sync"
+
+// Authd local socket
+#define AUTH_LOCAL_SOCK "queue/sockets/auth.sock"
+
+// Local requests socket
+#define COM_LOCAL_SOCK     "queue/sockets/com"
+#define AG_LOCAL_SOCK      "queue/sockets/agent"
+#define LC_LOCAL_SOCK      "queue/sockets/logcollector"
+#define SYS_LOCAL_SOCK     "queue/sockets/syscheck"
+#define REMOTE_LOCAL_SOCK  "queue/sockets/remote.sock"
+#define ANLSYS_LOCAL_SOCK  "queue/sockets/engine-api-http.sock"
+#define ANLSYS_ENRICH_SOCK "queue/sockets/engine-ingest-http.sock"
+#define INV_SYNC_SOCK      "queue/sockets/inventory-sync-http.sock"
+#define CLUSTER_SOCK       "queue/sockets/cluster-internal.sock"
+#define AGENT_UPGRADE_SOCK "queue/sockets/upgrade"
+
+// Both products create these two from this same code. The manager carries the
+// standardized names; the agent keeps the legacy ones until the agent sockets are
+// renamed as a whole. Delete this fork then.
+#ifdef CLIENT
+#define WM_LOCAL_SOCK      "queue/sockets/wmodules"
+#define CONTROL_SOCK       "queue/sockets/control"
+#else
+#define WM_LOCAL_SOCK      "queue/sockets/wmodules.sock"
+#define CONTROL_SOCK       "queue/sockets/control.sock"
+#endif
+
+// Attempts to check sockets availability
+#define SOCK_ATTEMPTS 10
+
+// Database socket
+#define WDB_LOCAL_SOCK "queue/sockets/wdb.sock"
+
+/* Tasks socket. The task manager serves everything on it, including remote agent upgrades on
+ * /v1/agents/upgrade and /v1/agents/upgrade-custom. */
+#define WM_TASK_MODULE_SOCK "queue/sockets/task-http.sock"
+
+/* Host part of every task manager URL.
+ *
+ * The socket above is where the request actually goes -- libcurl is told the path through
+ * CURLOPT_UNIX_SOCKET_PATH and never resolves this host. It is still required: libcurl parses the
+ * URL before it looks at the socket option, and rejects a bare path with CURLE_URL_MALFORMAT (3)
+ * and no HTTP status, which reads to a caller exactly like an unreachable task manager. */
+#define WM_TASK_MODULE_URL "http://localhost"
+
+/* Active Response files */
+#define AR_BINDIR      "active-response/bin"
+#ifndef WIN32
+#ifdef CLIENT
+#define AGENTCONFIG  "etc/shared/agent.conf"
+#define DEF_CA_STORE "etc/wpk_root.pem"
+#else
+#define AGENTCONFIG  WAZUH_MANAGER_CONF_DIR "/shared/agent.conf"
+#define DEF_CA_STORE WAZUH_MANAGER_CONF_DIR "/wpk_root.pem"
+#endif
+#else
+#define AGENTCONFIG  "shared/agent.conf"
+#define DEF_CA_STORE "wpk_root.pem"
+#endif
+
+/* Exec queue */
+#define EXECQUEUE "queue/sockets/execq"
+
+/* Agent groups location */
+#define GROUPS_DIR "queue/agent-groups"
+
+/* Default group name */
+#define DEFAULT_GROUP "default"
+
+/* Syscollector normalization configs */
+#ifdef WAZUH_UNIT_TESTING
+#ifdef WIN32
+#define SYSCOLLECTOR_NORM_CONFIG_DISK_PATH ".\\norm_config.json"
+#else
+#define SYSCOLLECTOR_NORM_CONFIG_DISK_PATH "./norm_config.json"
+#endif // WIN32
+#else
+#define SYSCOLLECTOR_NORM_CONFIG_DISK_PATH "queue/syscollector/norm_config.json"
+#endif // WAZUH_UNIT_TESTING
+
+#if defined(__MACH__)
+#define SYSCOLLECTOR_NORM_TYPE "macos"
+#elif defined(WIN32)
+#define SYSCOLLECTOR_NORM_TYPE "windows"
+#else
+#define SYSCOLLECTOR_NORM_TYPE "linux"
+#endif // __MACH__
+
+/* Syscollector db directory */
+#ifndef WAZUH_UNIT_TESTING
+#define SYSCOLLECTOR_DB_DISK_PATH "queue/syscollector/db/local.db"
+#else
+#ifndef WIN32
+#define SYSCOLLECTOR_DB_DISK_PATH "./local.db"
+#else
+#define SYSCOLLECTOR_DB_DISK_PATH ".\\local.db"
+#endif // WIN32
+#endif // WAZUH_UNIT_TESTING
+
+/* Wazuh Database */
+#define WDB_DIR              "var/db"
+#define WDB2_DIR             "queue/db"
+#define WDB_GLOB_NAME        "global"
+#define WDB_MITRE_NAME       "mitre"
+#define WDB_TASK_DIR         "queue/tasks"
+#define WDB_TASK_NAME        "tasks"
+#define WDB_BACKUP_FOLDER    "backup/db"
+#define WDB_GLOB_BACKUP_NAME WDB_GLOB_NAME ".db-backup"
+
+/* Diff queue */
+#define DIFF_DIR       "queue/diff"
+#define DIFF_NEW_FILE  "new-entry"
+#define DIFF_LAST_FILE "last-entry"
+#define DIFF_GZ_FILE   "last-entry.gz"
+#define DIFF_TEST_HOST "__test"
+
+/* Syscheck data */
+#define SYSCHECK     "syscheck"
+#define SYSCHECK_REG "syscheck-registry"
+
+/* Rule path */
+#define RULEPATH "rules"
+
+/* Wait file */
+#ifndef WIN32
+#define WAIT_FILE "queue/sockets/.wait"
+#else
+#define WAIT_FILE ".wait"
+#endif
+
+/* Agent information file */
+#ifndef WIN32
+#define AGENT_INFO_FILE "queue/sockets/.agent_info"
+#else
+#define AGENT_INFO_FILE ".agent_info"
+#endif
+
+/* Internal definitions files */
+#ifndef WIN32
+#ifdef CLIENT
+#define WAZUH_DEFINES  "etc/internal_options.conf"
+#define WAZUH_LDEFINES "etc/local_internal_options.conf"
+#else
+/* Manager: defaults live in code via getDefine_Int_default(); only the
+ * user-overrides file is needed. WAZUH_DEFINES is intentionally not defined. */
+#define WAZUH_LDEFINES WAZUH_MANAGER_CONF_DIR "/wazuh-manager-internal-options.conf"
+#endif
+#else
+#define WAZUH_DEFINES  "internal_options.conf"
+#define WAZUH_LDEFINES "local_internal_options.conf"
+#endif
+
+/* Authentication keys file */
+#ifndef WIN32
+#ifdef CLIENT
+#define KEYS_FILE  "etc/client.keys"
+#define AUTHD_PASS "etc/authd.pass"
+#define ENROLLMENT_TOKENS_FILE "etc/enrollment_tokens.json"
+#else
+#define KEYS_FILE  WAZUH_MANAGER_CONF_DIR "/client.keys"
+#define AUTHD_PASS WAZUH_MANAGER_CONF_DIR "/authd.pass"
+#define ENROLLMENT_TOKENS_FILE WAZUH_MANAGER_CONF_DIR "/enrollment_tokens.json"
+#endif
+#else
+#define KEYS_FILE  "client.keys"
+#define AUTHD_PASS "authd.pass"
+#define ENROLLMENT_TOKENS_FILE "enrollment_tokens.json"
+#endif
+
+/* Agent trust anchor: the CA the agent verifies the manager against when <ssl> does not
+ * name one (#38940 requirement 4). Its presence is the verification state -- see
+ * w_agent_resolve_ssl_posture() -- so it deliberately lives outside ossec.conf, which a
+ * configuration-management run templates and would otherwise overwrite.
+ *
+ * Relative, like KEYS_FILE above: both platforms chdir() into the install directory before
+ * ClientConf() runs (main.c, win_agent.c), and Windows keeps these files without the etc/
+ * prefix. Nothing in the agent packages creates etc/certs -- only the manager's do -- so on a
+ * stock install the directory does not exist and the probe simply finds nothing.
+ *
+ * The same path is hard-coded in the two WPK upgrade gates (src/init/pkg_installer.sh and
+ * src/win32/do_upgrade.ps1), which predate this constant and cannot include it. They also
+ * still mirror the pre-#39025 resolution; reconciling them is #38949 question 6. */
+#ifndef WIN32
+#define AGENT_ANCHOR_CA "etc/certs/root-ca.pem"
+#else
+#define AGENT_ANCHOR_CA "certs/root-ca.pem"
+#endif
+
+/* Written beside the anchor once one has been committed, and never removed. Records that this
+ * install has held a trust anchor, which the anchor's own presence can no longer answer: since
+ * #39321 the agent owns the anchor so it can replace it on a CA rotation, and an agent that can
+ * replace a file can also delete it. Without this, deleting one file would send
+ * w_agent_resolve_ssl_posture() back to 'none' and the agent would come up unverified, looking
+ * exactly like a stock install that never had an anchor at all.
+ *
+ * Root-owned in a sticky directory, so the runtime user cannot remove it even though it can
+ * replace the anchor next to it. Empty: only its existence carries meaning.
+ *
+ * This does not stop that user OVERWRITING the anchor with a CA of its own -- nothing short of
+ * a privileged writer could, once the agent is able to adopt a rotation unaided. What it closes
+ * is the cheaper attack and the commoner accident: silently losing verification entirely. */
+#ifndef WIN32
+#define AGENT_ANCHOR_MARKER "etc/certs/.anchor-committed"
+#else
+#define AGENT_ANCHOR_MARKER "certs/.anchor-committed"
+#endif
+
+/* Where a remote upgrade stages the manager's CA. The Linux installer leaves it here when it
+ * cannot validate it; the Windows one always removes it. */
+#ifndef WIN32
+#define AGENT_DELIVERED_CA "var/incoming/root-ca.pem"
+#endif
+
+/* Enrollment-token bootstrap: the one-shot file src/init/register_configure_agent.sh's
+ * WAZUH_ENROLLMENT_TOKEN_PATH writes at install time. w_agent_token_bootstrap() reads it once,
+ * before AGENT_ANCHOR_CA exists, and deletes it once a committed success is already in place
+ * (an anchor on disk, or a non-empty KEYS_FILE) or once this run's own bootstrap succeeds --
+ * kept on disk through almost every failure, permanent or transient, since a failure is usually
+ * exactly what makes a later attempt worth retrying. The one exception is a 403 in which authd
+ * names this token itself unknown, revoked or out of uses (#39064): no later attempt can turn
+ * that into a success, so it is deleted rather than re-presented to the same refusal on every
+ * restart. See token_bootstrap.c. Relative, same convention as AGENT_ANCHOR_CA above. */
+#ifndef WIN32
+#define AGENT_ENROLLMENT_TOKEN_FILE "etc/enrollment_token"
+#else
+#define AGENT_ENROLLMENT_TOKEN_FILE "enrollment_token"
+#endif
+
+/* Per-agent re-enrollment secret (issue #39064): the credential this agent re-enrolls with when
+ * the manager says its key is unknown, replacing the fleet-wide etc/authd.pass as the endpoint's
+ * recovery capability. Written from the `reenroll_secret` field of an /enroll 200 and rotated by
+ * every subsequent one; holds "<id> <secret>", because the bearer's `kid` is the agent's own id
+ * and an agent that has lost client.keys still has to know which id to present.
+ *
+ * Given client.keys's protection (0640, owned by the same user), NOT the anchor's: the secret's
+ * power is exactly client.keys's power -- it rotates the key of the same id and cannot mint a new
+ * identity -- so a process that can rewrite client.keys already owns the agent. It also has to be
+ * writable by the unprivileged user, because rotation happens in the running daemon, after the
+ * privilege drop. See reenroll_secret.h for the full argument.
+ *
+ * Relative, same convention as AGENT_ANCHOR_CA above. */
+#ifndef WIN32
+#define AGENT_REENROLL_SECRET "etc/reenroll.secret"
+#else
+#define AGENT_REENROLL_SECRET "reenroll.secret"
+#endif
+
+/* Timestamp file */
+#define TIMESTAMP_FILE "queue/agents-timestamp"
+
+/* authd's own durable state: the agent deletions whose indexer purge it still owes. Kept out of
+ * client.keys on purpose -- that file is read by other daemons and its format is a contract. */
+#define AUTHD_QUEUE_DIR     "queue/authd"
+#define PENDING_PURGES_FILE "queue/authd/pending-purges"
+
+/* The credentials authd has already handed out and the database has not stored yet (issue #39078).
+ * Same directory and the same reason: it is authd's own durable state, and it carries secrets, so
+ * it is written 0640 and never shared with the other daemons. */
+#define PENDING_IDENTITIES_FILE "queue/authd/pending-identities"
+
+/* Shared config directory */
+#ifndef WIN32
+#ifdef CLIENT
+#define SHAREDCFG_DIR "etc/shared"
+#else
+#define SHAREDCFG_DIR WAZUH_MANAGER_CONF_DIR "/shared"
+#endif
+#else
+#define SHAREDCFG_DIR "shared"
+#endif
+
+/* Multi-groups directory */
+#define MULTIGROUPS_DIR           "var/multigroups"
+#define MAX_GROUP_NAME            255
+#define MULTIGROUP_SEPARATOR      ','
+#define MAX_GROUPS_PER_MULTIGROUP 128
+
+// Incoming directory
+#ifndef WIN32
+#define INCOMING_DIR "var/incoming"
+#else
+#define INCOMING_DIR "incoming"
+#endif
+
+// Upgrade directory
+#ifndef WIN32
+#define UPGRADE_DIR "var/upgrade"
+#else
+#define UPGRADE_DIR "upgrade"
+#endif
+
+// Download directory
+#define DOWNLOAD_DIR "var/download"
+
+/* Built-in defines */
+
+#ifndef WAZUHCONF
+#ifndef WIN32
+#ifdef CLIENT
+#define WAZUHCONF "etc/ossec.conf"
+#else
+#define WAZUHCONF WAZUH_MANAGER_CONF_DIR "/wazuh-manager.conf"
+#endif
+#else
+#define WAZUHCONF "ossec.conf"
+#endif
+#endif
+
+#ifndef WAZUHCONFIG
+#ifndef WIN32
+#ifdef CLIENT
+#define WAZUHCONFIG "ossec_config"
+#else
+#define WAZUHCONFIG "wazuh_config"
+#endif
+#else
+#define WAZUHCONFIG "ossec_config"
+#endif
+#endif
+
+#define SHAREDCFG_FILE     SHAREDCFG_DIR "/merged.mg"
+#define SHAREDCFG_FILENAME "merged.mg"
+/* Bundle being received by the agent. As an 8.3 name it gets no NTFS short alias that an entry could write through,
+ * and managers never distribute files whose names start with merged.mg. */
+#define SHAREDCFG_TMPFILENAME "merged.mgt"
+
+#define MAX_QUEUED_EVENTS_PATH "/proc/sys/fs/inotify/max_queued_events"
+
+#define TMP_DIR "tmp"
+
+/* Windows COMSPEC */
+#define COMSPEC "C:\\Windows\\System32\\cmd.exe"
+
+/* Default ports */
+#ifndef DEFAULT_REMOTE_PORT
+#define DEFAULT_REMOTE_PORT 1514 /* Default encrypted */
+#endif
+
+#ifndef DEFAULT_HTTPS_REMOTE_PORT
+#define DEFAULT_HTTPS_REMOTE_PORT 1517 /* Default agent HTTPS control port */
+#endif
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+/* Not every agent platform this tree still builds for (AIX, Solaris 10, HP-UX) is guaranteed to define
+ * O_DIRECTORY. Falling back to 0 only loses an early "this must be a directory" check: openat() on a
+ * descriptor that is not a directory fails with ENOTDIR anyway. Note that O_NOFOLLOW deliberately gets
+ * no such fallback -- defining it to 0 would silently disable a security check instead of failing the
+ * build, which is the outcome we want to hear about. */
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+
+/* XML global elements */
+#ifndef xml_global
+#define xml_global "global"
+#endif
+
+#ifndef xml_rules
+#define xml_rules "rules"
+#endif
+
+#ifndef xml_localfile
+#define xml_localfile "localfile"
+#endif
+
+#ifndef xml_remote
+#define xml_remote "remote"
+#endif
+
+#ifndef xml_client
+#define xml_client "client"
+#endif
+
+#ifndef xml_execd
+#define xml_execd "execd"
+#endif
+
+#ifndef xml_syscheck
+#define xml_syscheck "syscheck"
+#endif
+
+#ifndef xml_rootcheck
+#define xml_rootcheck "rootcheck"
+#endif
+
+#ifndef xml_command
+#define xml_command "command"
+#endif
+
+#ifndef xml_ar
+#define xml_ar "active-response"
+#endif
+
+#define CLOCK_LENGTH 256
+
+#define SECURITY_CONFIGURATION_ASSESSMENT_DIR "ruleset/sca"
+
+#define SECURITY_CONFIGURATION_ASSESSMENT_DIR_WIN "ruleset\\sca"
+
+#ifdef WIN32
+#define FTELL_TT    "%lld"
+#define FTELL_INT64 (int64_t)
+#else
+#define FTELL_TT    "%ld"
+#define FTELL_INT64 (long)
+#endif
+
+#endif /* OS_HEADERS */

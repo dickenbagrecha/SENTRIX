@@ -1,0 +1,27 @@
+# Multi-stage Docker build for SENTRIX Core Orchestrator
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /src
+
+# Copy go module definitions
+COPY core/go.mod core/go.sum* ./
+
+# Copy core source code
+COPY core/ ./
+
+# Build optimized static binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/sentrixd ./cmd/sentrixd
+
+# Runtime Stage
+FROM alpine:3.20
+
+RUN apk --no-cache add ca-certificates tzdata
+
+WORKDIR /app
+
+COPY --from=builder /bin/sentrixd /app/sentrixd
+
+EXPOSE 9000
+
+ENTRYPOINT ["/app/sentrixd"]
+CMD ["-config", "/etc/sentrix/core.yaml"]

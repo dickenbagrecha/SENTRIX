@@ -1,0 +1,7 @@
+- blocks:
+    upload_configuration:
+      agents:
+        allow_higher_versions:
+          allow: yes
+      indexer:
+        allow: yes

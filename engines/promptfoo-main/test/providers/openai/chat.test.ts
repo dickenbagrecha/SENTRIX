@@ -1,0 +1,3918 @@
+const { createLoggerModule } = await vi.hoisted(async () => import('../../factories/logger'));
+
+import path from 'path';
+
+import { trace } from '@opentelemetry/api';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { handleIsRefusal } from '../../../src/assertions/refusal';
+import { disableCache, enableCache, fetchWithCache } from '../../../src/cache';
+import cliState from '../../../src/cliState';
+import { importModule } from '../../../src/esm';
+import logger from '../../../src/logger';
+import { CloudflareGatewayOpenAiProvider } from '../../../src/providers/cloudflare-gateway';
+import { createLiteLLMProvider } from '../../../src/providers/litellm';
+import { OpenAiChatCompletionProvider } from '../../../src/providers/openai/chat';
+import { OpenRouterProvider } from '../../../src/providers/openrouter';
+import { isProviderResponseRateLimited } from '../../../src/scheduler/types';
+import { createApiKeyOptions, createTemperatureOptions } from '../../factories/literalFixtures';
+import { mockProcessEnv } from '../../util/utils';
+import { createMockChatResponse, createMockFetchResponse } from '../mockProviderResponses';
+import { getOpenAiMissingApiKeyMessage } from './shared';
+
+import type { AtomicTestCase, ProviderResponse } from '../../../src/types/index';
+
+const { createOpenAiCacheFactory } = await vi.hoisted(() => import('../../factories/moduleMocks'));
+
+const createExternalToolResponse = () => ({
+  choices: [
+    {
+      message: {
+        content: null,
+        tool_calls: [
+          {
+            function: {
+              name: 'external_function',
+              arguments: '{"param": "test_value"}',
+            },
+          },
+        ],
+      },
+    },
+  ],
+  usage: { total_tokens: 15, prompt_tokens: 10, completion_tokens: 5 },
+});
+
+const createExternalFunctionTool = () => ({
+  type: 'function' as const,
+  function: {
+    name: 'external_function',
+    description: 'An external function',
+    parameters: {
+      type: 'object' as const,
+      properties: {
+        param: { type: 'string' as const },
+      },
+      required: ['param'],
+    },
+  },
+});
+
+const createUncachedChatResponse = () => ({
+  data: {
+    choices: [{ message: { content: 'Test output' } }],
+    usage: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5 },
+  },
+  cached: false,
+  status: 200,
+  statusText: 'OK',
+  severity: 'info',
+});
+
+const createOpenRouterOptions = () => ({
+  config: { apiBaseUrl: 'https://openrouter.ai/api/v1' },
+});
+
+const createCachedChatUsage = () => ({
+  prompt_tokens: 2_000,
+  completion_tokens: 1_000,
+  total_tokens: 3_000,
+  prompt_tokens_details: { cached_tokens: 500 },
+});
+
+const createCurrentAnswerResponse = () => ({
+  choices: [{ message: { content: 'Current answer' }, finish_reason: 'stop' }],
+  usage: { prompt_tokens: 1_000, completion_tokens: 1_000, total_tokens: 2_000 },
+});
+
+vi.mock('../../../src/cache', createOpenAiCacheFactory());
+vi.mock('../../../src/logger', () => createLoggerModule());
+vi.mock('../../../src/esm', async (importOriginal) => {
+  return {
+    ...(await importOriginal()),
+    importModule: vi.fn(),
+  };
+});
+
+const mockFetchWithCache = vi.mocked(fetchWithCache);
+const mockLogger = vi.mocked(logger);
+const mockImportModule = vi.mocked(importModule);
+const originalOpenAiApiKey = process.env.OPENAI_API_KEY;
+const originalDeepseekApiKey = process.env.DEEPSEEK_API_KEY;
+
+function gradeProviderRefusal(response: ProviderResponse, inverse = false) {
+  const output = response.output ?? '';
+  const test = {} as AtomicTestCase;
+  return handleIsRefusal({
+    assertion: { type: 'is-refusal' },
+    baseType: 'is-refusal',
+    output,
+    outputString: typeof output === 'string' ? output : JSON.stringify(output),
+    inverse,
+    providerResponse: response,
+    test,
+    assertionValueContext: {
+      prompt: undefined,
+      vars: {},
+      test,
+      logProbs: undefined,
+      config: {},
+      provider: undefined,
+      providerResponse: response,
+    },
+  });
+}
+
+const createMockReasoningResponse = () =>
+  createMockFetchResponse({
+    choices: [
+      {
+        message: {
+          content: 'The final answer is 9.11 is greater than 9.8.',
+          reasoning_content:
+            'Let me compare 9.11 and 9.8:\n9.11 > 9.8 because 11 > 8 in the decimal places.\nTherefore, 9.11 is greater than 9.8.',
+        },
+      },
+    ],
+    usage: { total_tokens: 20, prompt_tokens: 10, completion_tokens: 10 },
+  });
+
+describe('OpenAI Provider', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    disableCache();
+    mockProcessEnv({ OPENAI_API_KEY: 'test-api-key' });
+    mockProcessEnv({ DEEPSEEK_API_KEY: 'test-deepseek-key' });
+  });
+
+  afterEach(() => {
+    enableCache();
+    if (originalOpenAiApiKey) {
+      mockProcessEnv({ OPENAI_API_KEY: originalOpenAiApiKey });
+    } else {
+      mockProcessEnv({ OPENAI_API_KEY: undefined });
+    }
+    if (originalDeepseekApiKey) {
+      mockProcessEnv({ DEEPSEEK_API_KEY: originalDeepseekApiKey });
+    } else {
+      mockProcessEnv({ DEEPSEEK_API_KEY: undefined });
+    }
+  });
+
+  describe('OpenAiChatCompletionProvider', () => {
+    const createAttributeRecorder =
+      (attributes: Record<string, unknown>[]) =>
+      (
+        _name: string,
+        options: { attributes?: Record<string, unknown> },
+        _context: unknown,
+        callback: any,
+      ) => {
+        const span = { ...options.attributes };
+        attributes.push(span);
+        return callback({
+          setAttribute: (key: string, value: unknown) => {
+            span[key] = value;
+          },
+          setStatus: vi.fn(),
+          recordException: vi.fn(),
+          end: vi.fn(),
+        });
+      };
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    describe('custom audio response costs', () => {
+      it.each([
+        {
+          name: 'audio input',
+          audioInput: 750,
+          audioOutput: 0,
+          config: { cost: 2 / 1e6, audioInputCost: 10 / 1e6 },
+          expected: 0.009,
+        },
+        {
+          name: 'audio output',
+          audioInput: 0,
+          audioOutput: 400,
+          config: { cost: 2 / 1e6, audioOutputCost: 20 / 1e6 },
+          expected: 0.0102,
+        },
+        {
+          name: 'zero audio input',
+          audioInput: 750,
+          audioOutput: 0,
+          config: { cost: 2 / 1e6, audioInputCost: 0 },
+          expected: 0.0015,
+        },
+        {
+          name: 'zero text and audio input',
+          audioInput: 750,
+          audioOutput: 0,
+          config: { cost: 0, audioInputCost: 0 },
+          expected: 0,
+        },
+        {
+          name: 'missing audio input',
+          audioInput: 750,
+          audioOutput: 0,
+          config: { cost: 2 / 1e6, audioOutputCost: 20 / 1e6 },
+          expected: undefined,
+        },
+        {
+          name: 'missing audio output',
+          audioInput: 0,
+          audioOutput: 400,
+          config: { cost: 2 / 1e6, audioInputCost: 10 / 1e6 },
+          expected: undefined,
+        },
+      ])(
+        'returns the correct cost for $name',
+        async ({ audioInput, audioOutput, config, expected }) => {
+          mockFetchWithCache.mockResolvedValueOnce({
+            cached: false,
+            status: 200,
+            statusText: 'OK',
+            data: {
+              choices: [{ message: { content: 'PONG' } }],
+              usage: {
+                prompt_tokens: 1000,
+                completion_tokens: 500,
+                total_tokens: 1500,
+                prompt_tokens_details: { text_tokens: 1000 - audioInput, audio_tokens: audioInput },
+                completion_tokens_details: {
+                  text_tokens: 500 - audioOutput,
+                  audio_tokens: audioOutput,
+                },
+              },
+            },
+          });
+          const provider = new OpenAiChatCompletionProvider('gateway/custom-audio', { config });
+          const response = await provider.callApi('Ordinary billing fixture');
+          expect(response.error).toBeUndefined();
+          expect(response.output).toBe('PONG');
+          expect(response.tokenUsage).toMatchObject({
+            prompt: 1000,
+            completion: 500,
+            total: 1500,
+            numRequests: 1,
+          });
+          expect(response.cached).toBe(false);
+          if (expected === undefined) {
+            expect(response.cost).toBeUndefined();
+          } else {
+            expect(response.cost).toBeCloseTo(expected, 12);
+          }
+          expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+          const [, options] = mockFetchWithCache.mock.calls[0];
+          expect(JSON.parse(options?.body as string)).toMatchObject({
+            model: 'gateway/custom-audio',
+            messages: [{ role: 'user', content: 'Ordinary billing fixture' }],
+          });
+        },
+      );
+
+      it('uses the prompt audio-rate override without requiring unused audio output', async () => {
+        mockFetchWithCache.mockResolvedValueOnce({
+          cached: false,
+          status: 200,
+          statusText: 'OK',
+          data: {
+            choices: [{ message: { content: 'PONG' } }],
+            usage: {
+              prompt_tokens: 1000,
+              completion_tokens: 500,
+              total_tokens: 1500,
+              prompt_tokens_details: { text_tokens: 250, audio_tokens: 750 },
+              completion_tokens_details: { text_tokens: 500, audio_tokens: 0 },
+            },
+          },
+        });
+        const provider = new OpenAiChatCompletionProvider('gateway/custom-audio', {
+          config: { cost: 3 / 1e6, audioInputCost: 20 / 1e6 },
+        });
+        const response = await provider.callApi('Ordinary billing fixture', {
+          vars: {},
+          prompt: {
+            raw: 'Ordinary billing fixture',
+            label: 'fixture',
+            config: { cost: 2 / 1e6, audioInputCost: 10 / 1e6 },
+          },
+        });
+        expect(response.error).toBeUndefined();
+        expect(response.output).toBe('PONG');
+        expect(response.cost).toBeCloseTo(0.009, 12);
+        expect(provider.config).toMatchObject({ cost: 3 / 1e6, audioInputCost: 20 / 1e6 });
+      });
+    });
+
+    it.each([
+      { reported: 'ultrafast', cost: undefined },
+      { reported: undefined, cost: undefined },
+      { reported: 'default', cost: 0.003 },
+    ])(
+      'forwards Ultrafast and bills the actual tier $reported for GPT-6.1 Sol',
+      async ({ reported, cost }) => {
+        mockFetchWithCache.mockResolvedValue({
+          cached: false,
+          status: 200,
+          statusText: 'OK',
+          data: {
+            model: 'gpt-6.1-sol',
+            service_tier: reported,
+            choices: [{ message: { role: 'assistant', content: 'Ready.' } }],
+            usage: {
+              prompt_tokens: 1000,
+              completion_tokens: 100,
+              total_tokens: 1100,
+              prompt_tokens_details: { cache_write_tokens: 0 },
+            },
+          },
+        });
+        const result = await new OpenAiChatCompletionProvider('gpt-6.1-sol', {
+          config: { service_tier: 'ultrafast', reasoning_effort: 'high' },
+        }).callApi('Say ready.');
+
+        const [, options] = mockFetchWithCache.mock.calls[0];
+        expect(JSON.parse(options?.body as string)).toMatchObject({
+          model: 'gpt-6.1-sol',
+          service_tier: 'ultrafast',
+          reasoning_effort: 'high',
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.output).toBe('Ready.');
+        if (cost === undefined) {
+          expect(result.cost).toBeUndefined();
+        } else {
+          expect(result.cost).toBeCloseTo(cost, 10);
+        }
+      },
+    );
+
+    it('surfaces a model or account rejection of Ultrafast from Chat Completions', async () => {
+      mockFetchWithCache.mockResolvedValue({
+        cached: false,
+        status: 400,
+        statusText: 'Bad Request',
+        data: {
+          error: {
+            message: 'Ultrafast is unavailable for this model or account.',
+            type: 'invalid_request_error',
+            code: 'unsupported_value',
+            param: 'service_tier',
+          },
+        },
+      });
+      const result = await new OpenAiChatCompletionProvider('gpt-6.1-sol', {
+        config: { service_tier: 'ultrafast' },
+      }).callApi('Say ready.');
+      expect(result.error).toContain('Ultrafast is unavailable for this model or account.');
+      expect(result.output).toBeUndefined();
+    });
+
+    it.each([
+      'gpt-live-transcribe',
+      'gpt-live-transcribe-2026-09-01',
+      'gpt-live-1',
+      'gpt-live-1-2026-09-01',
+    ])('rejects prompt-scoped voice model %s before making a Chat request', async (model) => {
+      const provider = new OpenAiChatCompletionProvider('gpt-4.1');
+      await expect(
+        provider.callApi('Hi', {
+          vars: {},
+          prompt: { raw: 'Hi', label: 'Hi', config: { passthrough: { model } } },
+        }),
+      ).rejects.toThrow(
+        model.startsWith('gpt-live-transcribe') ? /Realtime.*session/ : 'openai:live:',
+      );
+      expect(mockFetchWithCache).not.toHaveBeenCalled();
+    });
+
+    it('keeps OpenAI provider identity when a custom ID omits a provider prefix', () => {
+      const provider = new OpenAiChatCompletionProvider('gpt-4.1', { id: 'customer-judge' });
+
+      expect(provider['getGenAISystem']()).toBe('openai');
+    });
+
+    it('keeps OpenAI provider identity when a custom ID has an unrelated prefix', () => {
+      const provider = new OpenAiChatCompletionProvider('gpt-4.1', { id: 'customer:judge' });
+
+      expect(provider['getGenAISystem']()).toBe('openai');
+    });
+
+    it('should reject a per-prompt Codex-only chat model override before dispatch', async () => {
+      const provider = new OpenAiChatCompletionProvider('gpt-4.1', createApiKeyOptions());
+
+      await expect(
+        provider.getOpenAiBody('Test prompt', {
+          prompt: { config: { passthrough: { model: 'gpt-5.3-codex-spark' } } },
+        } as any),
+      ).rejects.toThrow('only available through openai:codex-sdk');
+      expect(mockFetchWithCache).not.toHaveBeenCalled();
+    });
+
+    it('should call API successfully', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      const requestHeaders = mockFetchWithCache.mock.calls[0][1]?.headers as Record<string, string>;
+      expect(requestHeaders['X-OpenAI-Originator']).toBe('promptfoo');
+      expect(result.output).toBe('Test output');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+      expect(result.guardrails).toEqual({ flagged: false });
+    });
+
+    it('should record GPT-5.6 cache writes in the chat span', async () => {
+      const spanAttributes: Record<string, unknown> = {};
+      const getTracerSpy = vi.spyOn(trace, 'getTracer').mockReturnValue({
+        startActiveSpan: (
+          _name: string,
+          options: { attributes?: Record<string, unknown> },
+          _context: unknown,
+          callback: any,
+        ) => {
+          Object.assign(spanAttributes, options.attributes);
+          return callback({
+            setAttribute: (key: string, value: unknown) => {
+              spanAttributes[key] = value;
+            },
+            setStatus: vi.fn(),
+            recordException: vi.fn(),
+            end: vi.fn(),
+          });
+        },
+      } as any);
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          choices: [{ message: { content: 'Test output' } }],
+          usage: {
+            total_tokens: 10,
+            prompt_tokens: 5,
+            completion_tokens: 5,
+            prompt_tokens_details: { cached_tokens: 2, cache_write_tokens: 3 },
+          },
+        }),
+      );
+
+      try {
+        const provider = new OpenAiChatCompletionProvider('gpt-5.6');
+        const result = await provider.callApi('Test prompt');
+
+        expect(result.tokenUsage?.completionDetails).toMatchObject({
+          cacheReadInputTokens: 2,
+          cacheCreationInputTokens: 3,
+        });
+        expect(spanAttributes['gen_ai.usage.cache_read.input_tokens']).toBe(2);
+        expect(spanAttributes['gen_ai.usage.cache_creation.input_tokens']).toBe(3);
+        expect(spanAttributes['openai.api.type']).toBe('chat_completions');
+      } finally {
+        getTracerSpy.mockRestore();
+      }
+    });
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'sends LiteLLM token budgets and records the effective native Chat token cap for %s',
+      async (model) => {
+        mockFetchWithCache.mockResolvedValue(
+          createMockFetchResponse({
+            choices: [{ message: { content: 'Ready' }, finish_reason: 'stop' }],
+          }),
+        );
+        const attributes: Record<string, unknown>[] = [];
+        const tracer = vi.spyOn(trace, 'getTracer').mockReturnValue({
+          startActiveSpan: createAttributeRecorder(attributes),
+        } as any);
+        try {
+          const sampling = { reasoning_effort: 'none' as const, temperature: 0.4, top_p: 0.8 };
+          const providers = [
+            new OpenAiChatCompletionProvider(model, {
+              config: { max_completion_tokens: 50, ...sampling },
+            }),
+            createLiteLLMProvider(`litellm:${model}`, {
+              config: {
+                config: {
+                  apiKey: 'test-key',
+                  apiBaseUrl: 'https://proxy.example/v1',
+                  max_tokens: 50,
+                  ...sampling,
+                },
+              },
+            }),
+            new OpenRouterProvider(`openai/${model}`, {
+              config: { apiKey: 'test-key', max_completion_tokens: 50, ...sampling },
+            }),
+          ];
+          const prompt = { raw: 'Say ready.', label: 'ready' };
+          for (const provider of providers) {
+            for (const [override, expected] of [
+              [undefined, 50],
+              [{ max_tokens: 23 }, 23],
+              [{ passthrough: { max_completion_tokens: 37 } }, 37],
+              [{ passthrough: { max_tokens: null } }, undefined],
+            ] as const) {
+              const result = await provider.callApi(
+                'Say ready.',
+                override
+                  ? {
+                      vars: {},
+                      prompt: { ...prompt, config: override },
+                    }
+                  : undefined,
+              );
+              expect(result.error).toBeUndefined();
+              const last = mockFetchWithCache.mock.calls.at(-1)!;
+              const request = JSON.parse(last[1]?.body as string);
+              expect(request.max_completion_tokens).toBe(expected);
+              expect(request).not.toHaveProperty('max_tokens');
+              expect(attributes.at(-1)?.['gen_ai.request.max_tokens']).toBe(expected);
+            }
+            for (const reasoning_effort of ['none', 'high'] as const) {
+              await provider.callApi(prompt.raw, {
+                vars: {},
+                prompt: { ...prompt, config: { reasoning_effort } },
+              });
+              const request = JSON.parse(mockFetchWithCache.mock.calls.at(-1)![1]?.body as string);
+              const expectedTemperature = reasoning_effort === 'none' ? 0.4 : undefined;
+              const expectedTopP = reasoning_effort === 'none' ? 0.8 : undefined;
+              expect(request.temperature).toBe(expectedTemperature);
+              expect(request.top_p).toBe(expectedTopP);
+              expect(attributes.at(-1)?.['gen_ai.request.temperature']).toBe(expectedTemperature);
+              expect(attributes.at(-1)?.['gen_ai.request.top_p']).toBe(expectedTopP);
+            }
+          }
+        } finally {
+          tracer.mockRestore();
+        }
+      },
+    );
+
+    it('traces the token field actually sent for earlier OpenAI Chat models', async () => {
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          choices: [{ message: { content: 'Ready' }, finish_reason: 'stop' }],
+        }),
+      );
+      const attributes: Record<string, unknown>[] = [];
+      const tracer = vi.spyOn(trace, 'getTracer').mockReturnValue({
+        startActiveSpan: createAttributeRecorder(attributes),
+      } as any);
+      try {
+        const prompt = { raw: 'Say ready.', label: 'ready' };
+        for (const { model, providerConfig, promptConfig, wireField, expected } of [
+          {
+            model: 'gpt-4o',
+            providerConfig: { max_tokens: 50, max_completion_tokens: 100 },
+            promptConfig: undefined,
+            wireField: 'max_tokens',
+            expected: 50,
+          },
+          {
+            model: 'gpt-5.6-sol',
+            providerConfig: { max_completion_tokens: 4096 },
+            promptConfig: { max_tokens: 50 },
+            wireField: 'max_completion_tokens',
+            expected: 4096,
+          },
+          {
+            model: 'gpt-4o',
+            providerConfig: { max_tokens: 50 },
+            promptConfig: { passthrough: { max_tokens: 23 } },
+            wireField: 'max_tokens',
+            expected: 23,
+          },
+          {
+            model: 'gpt-5.6-sol',
+            providerConfig: { max_completion_tokens: 4096 },
+            promptConfig: { passthrough: { max_completion_tokens: null } },
+            wireField: 'max_completion_tokens',
+            expected: undefined,
+          },
+        ]) {
+          const provider = new OpenAiChatCompletionProvider(model, { config: providerConfig });
+          const result = await provider.callApi(
+            prompt.raw,
+            promptConfig ? { vars: {}, prompt: { ...prompt, config: promptConfig } } : undefined,
+          );
+          expect(result.error).toBeUndefined();
+          const request = JSON.parse(mockFetchWithCache.mock.calls.at(-1)![1]?.body as string);
+          expect(request[wireField] ?? undefined).toBe(expected);
+          expect(attributes.at(-1)?.['gen_ai.request.max_tokens']).toBe(expected);
+        }
+      } finally {
+        tracer.mockRestore();
+      }
+    });
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'keeps marked GPT-6 OpenRouter refusals distinct from native policy and authorization errors for %s',
+      async (model) => {
+        const message = 'This content was flagged for possible biological risk.';
+        for (const policyCode of ['bio_policy', 'cyber_policy']) {
+          for (const [provider, body] of [
+            [
+              new OpenAiChatCompletionProvider(`openai/${model}`, createOpenRouterOptions()),
+              {
+                error: {
+                  code: 403,
+                  message,
+                  metadata: { error_type: 'refusal', provider_code: policyCode },
+                },
+              },
+            ],
+            [
+              new OpenRouterProvider(`openai/${model}`, { config: { apiKey: 'test-key' } }),
+              {
+                error: {
+                  code: 403,
+                  message,
+                  metadata: { error_type: 'refusal', provider_code: policyCode },
+                },
+              },
+            ],
+          ] as const) {
+            mockFetchWithCache.mockResolvedValueOnce({
+              data: body,
+              cached: false,
+              status: 403,
+              statusText: 'Forbidden',
+              headers: { 'x-request-id': 'test' },
+            });
+            const result = await provider.callApi('A test prompt');
+            expect(result.error).toBeUndefined();
+            expect(result).toMatchObject({
+              output: message,
+              isRefusal: true,
+              guardrails: { flagged: true, flaggedInput: true, reason: message },
+              metadata: {
+                providerPolicy: { code: policyCode },
+                http: { status: 403, headers: { 'x-request-id': 'test' } },
+              },
+            });
+            expect(gradeProviderRefusal(result)).toMatchObject({ pass: true, score: 1 });
+            expect(gradeProviderRefusal(result, true)).toMatchObject({ pass: false, score: 0 });
+          }
+
+          mockFetchWithCache.mockResolvedValueOnce(
+            createMockFetchResponse(
+              { error: { code: policyCode, message } },
+              { status: 403, statusText: 'Forbidden' },
+            ),
+          );
+          const native = await new OpenAiChatCompletionProvider(model).callApi('A benign prompt');
+          expect(native.error).toContain(policyCode);
+          expect(native.isRefusal).toBeUndefined();
+          expect(native.guardrails).toBeUndefined();
+        }
+
+        const dedicated = new OpenRouterProvider(`openai/${model}`, createApiKeyOptions());
+        for (const provider of [
+          new OpenAiChatCompletionProvider(model),
+          new OpenAiChatCompletionProvider(`openai/${model}`, createOpenRouterOptions()),
+          dedicated,
+        ]) {
+          const revocation =
+            'Your organization’s access to these models has been temporarily revoked.';
+          mockFetchWithCache.mockResolvedValueOnce(
+            createMockFetchResponse(
+              {
+                error: {
+                  code: 'cyber_policy',
+                  message: revocation,
+                  metadata: { error_type: 'refusal', provider_code: 'cyber_policy' },
+                },
+              },
+              { status: 403, statusText: 'Forbidden' },
+            ),
+          );
+          const result = await provider.callApi('A benign prompt');
+          expect(result.error).toContain(revocation);
+          expect(result.isRefusal).toBeUndefined();
+          expect(result.guardrails).toBeUndefined();
+        }
+        mockFetchWithCache.mockResolvedValueOnce(
+          createMockFetchResponse(
+            {
+              error: {
+                code: 403,
+                message: 'Unauthorized',
+                metadata: { error_type: 'authentication', provider_code: 'invalid_api_key' },
+              },
+            },
+            { status: 403, statusText: 'Forbidden' },
+          ),
+        );
+        const denied = await dedicated.callApi('A test prompt');
+        expect(denied.error).toContain('Unauthorized');
+        expect(denied.isRefusal).toBeUndefined();
+
+        mockFetchWithCache.mockResolvedValueOnce(
+          createMockFetchResponse({
+            choices: [
+              {
+                message: { content: null, refusal: 'I cannot help with that.' },
+                finish_reason: 'content_filter',
+              },
+            ],
+          }),
+        );
+        const modelRefusal = await dedicated.callApi('A test prompt');
+        expect(modelRefusal).toMatchObject({
+          output: 'I cannot help with that.',
+          isRefusal: true,
+          guardrails: { flagged: true },
+        });
+        expect(modelRefusal.error).toBeUndefined();
+
+        mockFetchWithCache.mockResolvedValueOnce(
+          createMockFetchResponse({
+            choices: [{ message: { content: null }, finish_reason: 'content_filter' }],
+          }),
+        );
+        const textless = await dedicated.callApi('A test prompt');
+        expect(textless).toMatchObject({ isRefusal: true, guardrails: { flagged: true } });
+        expect(gradeProviderRefusal(textless)).toMatchObject({ pass: true, score: 1 });
+        expect(gradeProviderRefusal(textless, true)).toMatchObject({ pass: false, score: 0 });
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'preserves partial OpenRouter Chat output when the completed message also refuses for %s',
+      async (model) => {
+        const partial = 'The answer starts here: 42.';
+        const refusal = 'The gateway declined to complete the response.';
+        const provider = new OpenRouterProvider(`openai/${model}`, createApiKeyOptions());
+        const completed = {
+          choices: [{ message: { content: partial, refusal }, finish_reason: 'content_filter' }],
+        };
+        mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(completed));
+        const completedResult = await provider.callApi('A test prompt');
+        expect(completedResult).toMatchObject({
+          output: partial,
+          raw: completed,
+          isRefusal: true,
+        });
+        expect(gradeProviderRefusal(completedResult)).toMatchObject({ pass: true, score: 1 });
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'recognizes OpenRouter refusals within partial Chat choices and preserves technical errors for %s',
+      async (model) => {
+        const providers = [
+          new OpenAiChatCompletionProvider(`openai/${model}`, createOpenRouterOptions()),
+          new OpenRouterProvider(`openai/${model}`, { config: { apiKey: 'test-key' } }),
+        ];
+        const partial = 'The answer starts here: 42.';
+        const declined = 'The provider declined to complete the response.';
+        const usage = { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13, cost: 0.004 };
+        const selected = (content: unknown, message: string, errorType: string) => ({
+          message: { role: 'assistant', content },
+          finish_reason: 'error',
+          error: {
+            code: 403,
+            message,
+            metadata: { error_type: errorType, provider_code: 'cyber_policy' },
+          },
+        });
+        for (const provider of providers) {
+          for (const content of [partial, '', null]) {
+            const data = { choices: [selected(content, declined, 'refusal')], usage };
+            mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(data));
+            const result = await provider.callApi('A test prompt');
+            expect(result).toMatchObject({
+              output: content || declined,
+              raw: data,
+              isRefusal: true,
+              tokenUsage: { total: 13 },
+              metadata: { providerPolicy: { code: 'cyber_policy' } },
+            });
+            expect(result.guardrails).toEqual({ flagged: true, reason: declined });
+            expect(result.error).toBeUndefined();
+            expect(result.cost).toBeCloseTo(0.004, 10);
+            expect(gradeProviderRefusal(result)).toMatchObject({ pass: true, score: 1 });
+            expect(gradeProviderRefusal(result, true)).toMatchObject({ pass: false, score: 0 });
+          }
+          for (const [message, errorType] of [
+            ['The provider disconnected.', 'provider_unavailable'],
+            ['Your organization access was revoked.', 'refusal'],
+          ]) {
+            const data = { choices: [selected(partial, message, errorType)], usage };
+            mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(data));
+            const result = await provider.callApi('A test prompt');
+            expect(result.error).toContain(message);
+            expect(result.raw).toEqual(data);
+            expect(result.isRefusal).toBeUndefined();
+            expect(result.guardrails).toBeUndefined();
+          }
+          const normal = {
+            choices: [
+              { message: { role: 'assistant', content: partial }, finish_reason: 'stop' },
+              selected('Other choice', declined, 'refusal'),
+            ],
+            usage,
+          };
+          mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(normal));
+          const result = await provider.callApi('A test prompt');
+          expect(result.output).toBe(partial);
+          expect(result.isRefusal).not.toBe(true);
+        }
+
+        const unrelated = { choices: [selected(partial, declined, 'refusal')], usage };
+        mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(unrelated));
+        const native = await new OpenAiChatCompletionProvider(model).callApi('A test prompt');
+        expect(native.output).toBe(partial);
+        expect(native.isRefusal).not.toBe(true);
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'keeps rate-limit retry metadata and structured JSON in OpenRouter Chat results for %s',
+      async (model) => {
+        const responseFormat = {
+          type: 'json_schema' as const,
+          json_schema: {
+            name: 'result',
+            strict: true,
+            schema: {
+              type: 'object' as const,
+              properties: { answer: { type: 'string' } },
+              required: ['answer'],
+              additionalProperties: false as const,
+            },
+          },
+        };
+        const generic = new OpenAiChatCompletionProvider(`openai/${model}`, {
+          config: { apiBaseUrl: 'https://openrouter.ai/api/v1', response_format: responseFormat },
+        });
+        const dedicated = new OpenRouterProvider(`openai/${model}`, {
+          config: { apiKey: 'test-key', response_format: responseFormat },
+        });
+        const choiceError = (
+          message: string,
+          errorType: string,
+          providerCode?: string,
+          content?: string,
+        ) => ({
+          choices: [
+            {
+              message: { content },
+              finish_reason: 'error',
+              error: {
+                code: 429,
+                message,
+                metadata: { error_type: errorType, provider_code: providerCode },
+              },
+            },
+          ],
+        });
+        for (const provider of [generic, dedicated]) {
+          for (const [errorType, providerCode, expected] of [
+            ['rate_limit_exceeded', 'rate_limited', 'rate_limit'],
+            ['rate_limit_exceeded', 'credit_balance_exhausted', 'quota'],
+            ['provider_unavailable', 'upstream_disconnected', undefined],
+          ] as const) {
+            mockFetchWithCache.mockResolvedValueOnce({
+              data: choiceError('Too many requests', errorType, providerCode),
+              cached: false,
+              status: 200,
+              statusText: 'OK',
+              headers: { 'retry-after': '2' },
+            });
+            const result = await provider.callApi('A benign test prompt');
+            expect(result.metadata?.rateLimitKind).toBe(expected);
+            expect(result.metadata?.http).toMatchObject({
+              status: 200,
+              headers: { 'retry-after': '2' },
+            });
+            expect(isProviderResponseRateLimited(result, undefined)).toBe(
+              expected === 'rate_limit',
+            );
+          }
+
+          for (const [providerCode, expected] of [
+            ['rate_limited', 'rate_limit'],
+            ['credit_balance_exhausted', 'quota'],
+          ] as const) {
+            mockFetchWithCache.mockResolvedValueOnce({
+              data: {
+                error: {
+                  message: 'Too many requests',
+                  metadata: { error_type: 'rate_limit_exceeded', provider_code: providerCode },
+                },
+              },
+              cached: false,
+              status: 429,
+              statusText: 'Too Many Requests',
+              headers: { 'retry-after': '2' },
+            });
+            const result = await provider.callApi('A benign test prompt');
+            expect(result.metadata?.rateLimitKind).toBe(expected);
+            expect(result.metadata?.http).toMatchObject({ status: 429 });
+            expect(isProviderResponseRateLimited(result, undefined)).toBe(
+              expected === 'rate_limit',
+            );
+          }
+
+          mockFetchWithCache.mockResolvedValueOnce(
+            createMockFetchResponse(
+              {
+                error: {
+                  message: 'Insufficient credits',
+                  metadata: { provider_code: 'credit_balance_exhausted' },
+                },
+              },
+              { status: 429, statusText: 'Too Many Requests' },
+            ),
+          );
+          const quotaWithoutMarker = await provider.callApi('A benign test prompt');
+          expect(quotaWithoutMarker.metadata?.rateLimitKind).toBe('quota');
+          expect(isProviderResponseRateLimited(quotaWithoutMarker, undefined)).toBe(false);
+
+          for (const [content, expected] of [
+            ['{"answer":"visible"}', { answer: 'visible' }],
+            ['{"answer":', '{"answer":'],
+          ] as const) {
+            const data = choiceError('The response was declined.', 'refusal', undefined, content);
+            mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(data));
+            const result = await provider.callApi('A benign test prompt');
+            expect(result.output).toEqual(expected);
+            expect(result.isRefusal).toBe(true);
+            expect(result.raw).toEqual(data);
+
+            if (provider === dedicated) {
+              const completed = {
+                choices: [
+                  {
+                    message: { content, refusal: 'The response was declined.' },
+                    finish_reason: 'content_filter',
+                  },
+                ],
+              };
+              mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(completed));
+              const finished = await provider.callApi('A benign test prompt');
+              expect(finished.output).toEqual(expected);
+              expect(finished.isRefusal).toBe(true);
+              expect(finished.raw).toEqual(completed);
+            }
+          }
+        }
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'evicts OpenRouter Chat choice outages so the next identical request can recover for %s',
+      async (model) => {
+        for (const provider of [
+          new OpenAiChatCompletionProvider(`openai/${model}`, createOpenRouterOptions()),
+          new OpenRouterProvider(`openai/${model}`, { config: { apiKey: 'test-key' } }),
+        ]) {
+          const broken = {
+            choices: [
+              {
+                message: { content: 'partial' },
+                finish_reason: 'error',
+                error: {
+                  message: 'Temporary outage',
+                  metadata: { error_type: 'provider_unavailable' },
+                },
+              },
+            ],
+          };
+          const healthy = {
+            choices: [{ message: { content: 'Recovered' }, finish_reason: 'stop' }],
+          };
+          let cacheValue: typeof broken | typeof healthy | undefined;
+          let networkCalls = 0;
+          const deleteFromCache = vi.fn(async () => {
+            cacheValue = undefined;
+          });
+          mockFetchWithCache.mockImplementation(async () => {
+            const cached = cacheValue !== undefined;
+            if (!cacheValue) {
+              networkCalls++;
+              cacheValue = networkCalls === 1 ? broken : healthy;
+            }
+            return { data: cacheValue, cached, status: 200, statusText: 'OK', deleteFromCache };
+          });
+          const first = await provider.callApi('Same prompt');
+          const second = await provider.callApi('Same prompt');
+          expect(first.error).toContain('Temporary outage');
+          expect(second).toMatchObject({ output: 'Recovered', cached: false });
+          expect(second.error).toBeUndefined();
+          expect(networkCalls).toBe(2);
+          expect(deleteFromCache).toHaveBeenCalledTimes(1);
+          mockFetchWithCache.mockReset();
+        }
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'grades explicit OpenRouter content blocks and distinguishes account revocation from refusal text for %s',
+      async (model) => {
+        const providers = [
+          new OpenAiChatCompletionProvider(`openai/${model}`, createOpenRouterOptions()),
+          new OpenRouterProvider(`openai/${model}`, { config: { apiKey: 'test-key' } }),
+        ];
+        const partial = 'Partial text';
+        const descriptions = [
+          'I cannot help you gain access to disabled user accounts.',
+          'I cannot assist with restoring permissions on a suspended account.',
+          'Your access to the requested private data is restricted; I cannot help obtain it.',
+          'I cannot assist with access if your account is suspended.',
+          'If your API key has been disabled, I cannot provide the requested private data.',
+        ];
+        const accountErrors = [
+          'Your organization’s access to these models has been temporarily revoked.',
+          'Access for your organization has been temporarily revoked.',
+          'Your organization access was revoked.',
+          'We have revoked your account’s access to these models.',
+          'Your API key has been disabled.',
+          'Access for this user has been temporarily revoked.',
+          'Your access to these models has been temporarily revoked.',
+          'Error: Access for this safety identifier has been temporarily revoked.',
+          "Access for safety identifier 'sample.user' has been permanently restricted.",
+        ];
+        for (const provider of providers) {
+          for (const location of ['outer', 'choice']) {
+            for (const [marker, description, refused] of [
+              ...descriptions.map((description) => ['refusal', description, true] as const),
+              ['content_policy_violation', 'The content filter stopped generation.', true] as const,
+              ...accountErrors.map((description) => ['refusal', description, false] as const),
+            ]) {
+              const error = {
+                code: 403,
+                message: description,
+                metadata: { error_type: marker, provider_code: 'cyber_policy' },
+              };
+              const data =
+                location === 'outer'
+                  ? { error }
+                  : { choices: [{ message: { content: partial }, finish_reason: 'error', error }] };
+              const deleteFromCache = vi.fn(async () => {});
+              mockFetchWithCache.mockResolvedValueOnce({
+                data,
+                cached: false,
+                status: location === 'outer' ? 403 : 200,
+                statusText: '',
+                deleteFromCache,
+              });
+              const result = await provider.callApi('A benign test prompt');
+              if (refused) {
+                expect(result.error).toBeUndefined();
+                expect(result.output).toBe(location === 'choice' ? partial : description);
+                expect(result.isRefusal).toBe(true);
+                expect(result.guardrails?.flagged).toBe(true);
+                if (marker === 'content_policy_violation' || location === 'choice') {
+                  expect(result.guardrails?.flaggedInput).toBeUndefined();
+                }
+                expect(gradeProviderRefusal(result)).toMatchObject({ pass: true, score: 1 });
+                expect(deleteFromCache).not.toHaveBeenCalled();
+              } else {
+                expect(result.error).toContain(description);
+                expect(result.isRefusal).toBeUndefined();
+              }
+            }
+          }
+        }
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'preserves gateway HTTP status for null JSON and documented Chat error classifications for %s',
+      async (model) => {
+        const generic = new OpenAiChatCompletionProvider(`openai/${model}`, {
+          config: { apiBaseUrl: 'https://proxy.example.test/openrouter/api/v1' },
+        });
+        const dedicated = new OpenRouterProvider(`openai/${model}`, createApiKeyOptions());
+        for (const provider of [generic, dedicated]) {
+          for (const [status, errorType, refused] of [
+            [400, 'invalid_request', false],
+            [400, 'context_length_exceeded', false],
+            [403, 'refusal', true],
+          ] as const) {
+            mockFetchWithCache.mockResolvedValueOnce({
+              data: {
+                error: {
+                  code: status,
+                  message: 'Request rejected by the gateway.',
+                  metadata: { error_type: errorType },
+                },
+              },
+              cached: false,
+              status,
+              statusText: 'Request rejected',
+            });
+            const result = await provider.callApi('A benign test prompt');
+            expect(result.isRefusal).toBe(refused ? true : undefined);
+            if (refused) {
+              expect(result.error).toBeUndefined();
+              expect(gradeProviderRefusal(result)).toMatchObject({ pass: true, score: 1 });
+            } else {
+              expect(result.error).toContain('Request rejected');
+            }
+          }
+          mockFetchWithCache.mockResolvedValueOnce(
+            createMockFetchResponse(null, { status: 401, statusText: 'Unauthorized' }),
+          );
+          const unauthorized = await provider.callApi('A benign test prompt');
+          expect(unauthorized.error).toContain('401 Unauthorized');
+          expect(unauthorized.isRefusal).toBeUndefined();
+        }
+        mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(null));
+        const malformed = await dedicated.callApi('A benign test prompt');
+        expect(malformed.error).toContain('Malformed response data: null');
+        expect(malformed.isRefusal).toBeUndefined();
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'leaves Cloudflare-routed Azure Chat pricing unknown without supplied rates for %s',
+      async (model) => {
+        const data = {
+          choices: [{ message: { content: 'Ready' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 },
+        };
+        for (const [rates, expected] of [
+          [{}, undefined],
+          [{ inputCost: 2 / 1e6, outputCost: 3 / 1e6 }, 0.0023],
+        ] as const) {
+          mockFetchWithCache.mockResolvedValueOnce(createMockFetchResponse(data));
+          const provider = new CloudflareGatewayOpenAiProvider('azure-openai', model, {
+            config: {
+              apiKey: 'test-key',
+              accountId: 'account',
+              gatewayId: 'gateway',
+              resourceName: 'resource',
+              deploymentName: 'deployment',
+              ...rates,
+            },
+          });
+          const result = await provider.callApi('A test prompt');
+          expect(result.error).toBeUndefined();
+          if (expected === undefined) {
+            expect(result.cost).toBeUndefined();
+          } else {
+            expect(result.cost).toBeCloseTo(expected, 10);
+          }
+        }
+      },
+    );
+
+    it('should send a case-variant originator override on the wire instead of the default', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: { headers: { 'x-openai-originator': 'custom-originator' } },
+      });
+      await provider.callApi(JSON.stringify([{ role: 'user', content: 'Test prompt' }]));
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      const requestHeaders = mockFetchWithCache.mock.calls[0][1]?.headers as Record<string, string>;
+      expect(requestHeaders['x-openai-originator']).toBe('custom-originator');
+      expect(requestHeaders).not.toHaveProperty('X-OpenAI-Originator');
+    });
+
+    it('should include HTTP metadata in response', async () => {
+      const mockHeaders = {
+        'content-type': 'application/json',
+        'x-request-id': 'test-request-123',
+        'x-litellm-model-group': 'gpt-4o-mini',
+      };
+      const mockResponse = {
+        data: {
+          choices: [{ message: { content: 'Test output' } }],
+          usage: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5 },
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+        headers: mockHeaders,
+      };
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(result.metadata).toBeDefined();
+      expect(result.metadata?.http).toBeDefined();
+      expect(result.metadata?.http?.status).toBe(200);
+      expect(result.metadata?.http?.statusText).toBe('OK');
+      expect(result.metadata?.http?.headers).toEqual(mockHeaders);
+    });
+
+    it('should include all choices in metadata when n > 1', async () => {
+      const mockChoices = [
+        { message: { content: 'First response' }, index: 0 },
+        { message: { content: 'Second response' }, index: 1 },
+        { message: { content: 'Third response' }, index: 2 },
+      ];
+      const mockResponse = createMockFetchResponse({
+        choices: mockChoices,
+        usage: { total_tokens: 30, prompt_tokens: 10, completion_tokens: 20 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(result.output).toBe('First response');
+      expect(result.metadata?.choices).toBeDefined();
+      expect(result.metadata?.choices).toHaveLength(3);
+      expect(result.metadata?.choices).toEqual(mockChoices);
+    });
+
+    it('should not include choices in metadata when n = 1', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [{ message: { content: 'Single response' }, index: 0 }],
+        usage: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(result.output).toBe('Single response');
+      expect(result.metadata?.choices).toBeUndefined();
+    });
+
+    it('preserves HttpRateLimitError as a structured error with metadata.rateLimitKind', async () => {
+      // Closes the regression where the chat catch block stringified
+      // HttpRateLimitError into "API call error: HttpRateLimitError: ..."
+      // and dropped `kind`, causing the scheduler to retry quota errors.
+      const { HttpRateLimitError } = await import('../../../src/util/fetch/errors');
+      const quota = new HttpRateLimitError({ status: 429, code: 'insufficient_quota' });
+      mockFetchWithCache.mockRejectedValueOnce(quota);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(result.error).toContain('Quota exceeded');
+      expect(result.error).toContain('insufficient_quota');
+      expect(result.error).toContain('Retries will not help');
+      expect(result.metadata?.rateLimitKind).toBe('quota');
+      expect(result.metadata?.http?.status).toBe(429);
+    });
+
+    it('preserves structured quota errors in the dedicated OpenRouter provider', async () => {
+      const { HttpRateLimitError } = await import('../../../src/util/fetch/errors');
+      mockFetchWithCache.mockRejectedValueOnce(
+        new HttpRateLimitError({ status: 429, code: 'credit_balance_exhausted' }),
+      );
+
+      const result = await new OpenRouterProvider(
+        'openai/gpt-6-luna',
+        createApiKeyOptions(),
+      ).callApi('Say ready.');
+
+      expect(result.error).toContain('Quota exceeded');
+      expect(result.metadata?.rateLimitKind).toBe('quota');
+      expect(result.metadata?.http?.status).toBe(429);
+      expect(isProviderResponseRateLimited(result, undefined)).toBe(false);
+    });
+
+    it('should include HTTP metadata in error response', async () => {
+      const mockResponse = {
+        data: { error: { message: 'Rate limit exceeded' } },
+        cached: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: { 'retry-after': '60' },
+      };
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(result.error).toBeDefined();
+      expect(result.metadata?.http?.status).toBe(429);
+      expect(result.metadata?.http?.statusText).toBe('Too Many Requests');
+      expect(result.metadata?.http?.headers).toEqual({ 'retry-after': '60' });
+    });
+
+    it('should handle caching correctly', async () => {
+      const mockResponse = createMockChatResponse('Test output 2');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt 2' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Test output 2');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+
+      const cachedResponse = {
+        ...mockResponse,
+        cached: true,
+      };
+      mockFetchWithCache.mockResolvedValue(cachedResponse);
+
+      const result2 = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt 2' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(2);
+      expect(result2.output).toBe('Test output 2');
+      // Cached responses don't count as new requests, so numRequests is not included
+      expect(result2.tokenUsage).toEqual({ total: 10, cached: 10 });
+      expect(result2.cost).toBe(0);
+    });
+
+    it('should handle disabled cache correctly', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Test output');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+
+      disableCache();
+
+      const result2 = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(2);
+      expect(result2.output).toBe('Test output');
+      expect(result2.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+
+      enableCache();
+    });
+
+    it('constructor should handle config correctly', async () => {
+      const config = {
+        temperature: 3.1415926,
+        max_tokens: 201,
+      };
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', { config });
+      const prompt = 'Test prompt';
+
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      await provider.callApi(prompt);
+
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const requestBody = JSON.parse(call[1].body);
+      expect(requestBody).toMatchObject({
+        temperature: 3.1415926,
+        max_tokens: 201,
+      });
+      expect(provider.config.temperature).toBe(config.temperature);
+      expect(provider.config.max_tokens).toBe(config.max_tokens);
+    });
+
+    it.each(['gpt-5-search-api', 'gpt-5-search-api-2025-10-14'])(
+      'should send a valid Chat Completions search request, preserve citations, and include the search fee for %s',
+      async (model) => {
+        const annotations = [
+          {
+            type: 'url_citation',
+            url_citation: {
+              start_index: 0,
+              end_index: 6,
+              url: 'https://example.com/source',
+              title: 'Example source',
+            },
+          },
+        ];
+        mockFetchWithCache.mockResolvedValueOnce(
+          createMockFetchResponse({
+            choices: [
+              { message: { content: 'Current answer', annotations }, finish_reason: 'stop' },
+            ],
+            usage: createCachedChatUsage(),
+          }),
+        );
+
+        const provider = new OpenAiChatCompletionProvider(model, {
+          config: {
+            passthrough: {
+              web_search_options: { search_context_size: 'high' },
+            },
+          },
+        });
+        const result = await provider.callApi('What happened today?');
+        const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+        const body = JSON.parse(call[1].body);
+
+        expect(call[0]).toContain('/chat/completions');
+        expect(body).toMatchObject({
+          model,
+          web_search_options: { search_context_size: 'high' },
+        });
+        expect(body).not.toHaveProperty('max_tokens');
+        expect(result.output).toBe('Current answer');
+        expect(result.metadata?.annotations).toEqual(annotations);
+        expect(result.metadata?.citations).toEqual([
+          { url: 'https://example.com/source', content: 'Example source: Current' },
+        ]);
+        expect(result.cost).toBeCloseTo(0.01 + (1_500 * 1.25 + 500 * 0.125 + 1_000 * 10) / 1e6, 10);
+      },
+    );
+
+    it.each([
+      ['openai/gpt-5-search-api', 0.0100625],
+      ['openai/gpt-5-search-api-2025-10-14', 0.0100625],
+      ['github/openai/gpt-4o-mini-search-preview-2025-03-11', 0.0250045],
+    ])(
+      'should include qualified token rates and the Chat Completions search fee for routed model %s',
+      async (model, cost) => {
+        mockFetchWithCache.mockResolvedValueOnce(
+          createMockFetchResponse({
+            choices: [{ message: { content: 'Current answer' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+        );
+
+        const result = await new OpenAiChatCompletionProvider(model, {
+          config: { apiBaseUrl: 'https://gateway.example/v1' },
+        }).callApi('What happened today?');
+
+        expect(result.cost).toBeCloseTo(cost, 10);
+      },
+    );
+
+    it.each(['gpt-6-sol', 'gpt-6-luna'])(
+      'uses gateway charges and preserves BYOK uncertainty for %s on the exact OpenRouter host',
+      async (model) => {
+        for (const row of [
+          { gateway: { cost: 0.03, is_byok: false }, cached: false, config: {}, expected: 0.03 },
+          { gateway: { cost: 0, is_byok: false }, cached: false, config: {}, expected: 0 },
+          { gateway: { cost: 0.03, is_byok: false }, cached: true, config: {}, expected: 0.03 },
+          {
+            gateway: { cost: 0.03, is_byok: true },
+            cached: false,
+            config: {},
+            expected: undefined,
+          },
+          { gateway: {}, cached: false, config: {}, expected: undefined },
+          {
+            gateway: { cost: 0.03, is_byok: true },
+            cached: false,
+            config: { inputCost: 0.00002, outputCost: 0.00003 },
+            expected: 0.05,
+          },
+          {
+            gateway: { cost: 0.03, is_byok: false },
+            cached: false,
+            config: { inputCost: 0.00002 },
+            expected: undefined,
+          },
+        ]) {
+          mockFetchWithCache.mockResolvedValueOnce({
+            data: {
+              choices: [{ message: { content: 'Ready' }, finish_reason: 'stop' }],
+              usage: {
+                prompt_tokens: 1_000,
+                completion_tokens: 1_000,
+                total_tokens: 2_000,
+                cost_details: { upstream_inference_cost: 0.02 },
+                ...row.gateway,
+              },
+            },
+            cached: row.cached,
+            status: 200,
+            statusText: 'OK',
+          });
+          const result = await new OpenAiChatCompletionProvider(`openai/${model}`, {
+            config: { apiBaseUrl: 'https://openrouter.ai/api/v1', ...row.config },
+          }).callApi('Say ready.');
+          expect(result.output).toBe('Ready');
+          expect(result.cost).toBe(row.expected);
+          expect(result.metadata?.openrouter).toEqual({
+            ...('cost' in row.gateway ? { accountCharge: row.gateway.cost } : {}),
+            ...('is_byok' in row.gateway ? { isByok: row.gateway.is_byok } : {}),
+            reportedUpstreamInferenceCost: 0.02,
+          });
+        }
+
+        mockFetchWithCache.mockResolvedValueOnce(
+          createMockFetchResponse({
+            choices: [{ message: { content: 'Ready' }, finish_reason: 'stop' }],
+            usage: {
+              prompt_tokens: 1_000,
+              completion_tokens: 1_000,
+              total_tokens: 2_000,
+              cost: 9,
+            },
+          }),
+        );
+        const similarHost = await new OpenAiChatCompletionProvider(`openai/${model}`, {
+          config: { apiBaseUrl: 'https://openrouter.ai.example/api/v1' },
+        }).callApi('Say ready.');
+        expect(similarHost.cost).not.toBe(9);
+        expect(similarHost.metadata).not.toHaveProperty('openrouter');
+      },
+    );
+
+    it('should build and bill a Chat search request using the effective passthrough model', async () => {
+      mockFetchWithCache.mockResolvedValueOnce(
+        createMockFetchResponse(createCurrentAnswerResponse()),
+      );
+      const provider = new OpenAiChatCompletionProvider('gpt-4.1', {
+        config: { passthrough: { model: 'gpt-5-search-api' } },
+      });
+
+      const result = await provider.callApi('What happened today?');
+      const body = JSON.parse(mockFetchWithCache.mock.calls[0]![1]!.body as string);
+
+      expect(body.model).toBe('gpt-5-search-api');
+      expect(body).not.toHaveProperty('max_tokens');
+      expect(body).not.toHaveProperty('temperature');
+      expect(result.cost).toBeCloseTo(0.02125, 10);
+    });
+
+    it('should bill a routed Chat search passthrough model using its OpenAI token rates', async () => {
+      mockFetchWithCache.mockResolvedValueOnce(
+        createMockFetchResponse(createCurrentAnswerResponse()),
+      );
+      const provider = new OpenAiChatCompletionProvider('gpt-4.1', {
+        config: {
+          apiBaseUrl: 'https://gateway.example/v1',
+          passthrough: { model: 'openai/gpt-5-search-api' },
+        },
+      });
+
+      const result = await provider.callApi('What happened today?');
+
+      expect(result.cost).toBeCloseTo(0.02125, 10);
+    });
+
+    it.each(['vendor/gpt-5-search-api', 'vendor/openai/gpt-4o-mini-search-preview'])(
+      'should not apply OpenAI Chat search fees to another gateway namespace: %s',
+      async (model) => {
+        mockFetchWithCache.mockResolvedValueOnce({
+          data: {
+            choices: [{ message: { content: 'Vendor answer' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          },
+          cached: false,
+          status: 200,
+          statusText: 'OK',
+        });
+
+        const result = await new OpenAiChatCompletionProvider(model, {
+          config: { apiBaseUrl: 'https://gateway.example/v1' },
+        }).callApi('What happened today?');
+
+        expect(result.cost).toBeUndefined();
+      },
+    );
+
+    it('should send the configured fast tier as priority while retaining fast billing', async () => {
+      mockFetchWithCache.mockResolvedValueOnce({
+        data: {
+          choices: [{ message: { content: 'Fast answer' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1_000, completion_tokens: 100, total_tokens: 1_100 },
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new OpenAiChatCompletionProvider('gpt-5-mini', {
+        config: { service_tier: 'fast' },
+      });
+
+      const result = await provider.callApi('Answer quickly');
+      const body = JSON.parse(mockFetchWithCache.mock.calls[0]![1]!.body as string);
+
+      expect(body.service_tier).toBe('priority');
+      expect(result.cost).toBeCloseTo((1_000 * 0.45 + 100 * 3.6) / 1e6, 10);
+    });
+
+    it('should bill the effective passthrough service tier when the response omits it', async () => {
+      mockFetchWithCache.mockResolvedValueOnce({
+        data: {
+          choices: [{ message: { content: 'Priority answer' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1_000, completion_tokens: 100, total_tokens: 1_100 },
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new OpenAiChatCompletionProvider('gpt-5-mini', {
+        config: {
+          service_tier: 'flex',
+          passthrough: { service_tier: 'priority' },
+        },
+      });
+
+      const result = await provider.callApi('Answer with priority');
+      const body = JSON.parse(mockFetchWithCache.mock.calls[0]![1]!.body as string);
+
+      expect(body.service_tier).toBe('priority');
+      expect(result.cost).toBeCloseTo((1_000 * 0.45 + 100 * 3.6) / 1e6, 10);
+    });
+
+    it('should prefer a per-prompt direct service tier over provider passthrough', async () => {
+      mockFetchWithCache.mockResolvedValueOnce({
+        data: {
+          choices: [{ message: { content: 'Flex answer' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1_000, completion_tokens: 100, total_tokens: 1_100 },
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+      });
+      const provider = new OpenAiChatCompletionProvider('gpt-5-mini', {
+        config: {
+          service_tier: 'default',
+          passthrough: { service_tier: 'priority' },
+        },
+      });
+
+      const result = await provider.callApi('Answer flexibly', {
+        prompt: { config: { service_tier: 'flex' } },
+      } as any);
+      const body = JSON.parse(mockFetchWithCache.mock.calls[0]![1]!.body as string);
+
+      expect(body.service_tier).toBe('flex');
+      expect(result.cost).toBeCloseTo((1_000 * 0.125 + 100 * 1) / 1e6, 10);
+    });
+
+    it('should price a fine-tuned Chat Completions model from the API usage ledger', async () => {
+      mockFetchWithCache.mockResolvedValueOnce(
+        createMockFetchResponse({
+          choices: [{ message: { content: 'Fine-tuned answer' }, finish_reason: 'stop' }],
+          usage: createCachedChatUsage(),
+        }),
+      );
+
+      const result = await new OpenAiChatCompletionProvider(
+        'ft:gpt-4.1-mini-2025-04-14:company::model',
+      ).callApi('Test prompt');
+
+      expect(result.output).toBe('Fine-tuned answer');
+      expect(result.cost).toBeCloseTo((1_500 * 0.8 + 500 * 0.2 + 1_000 * 3.2) / 1e6, 10);
+    });
+
+    it('should handle structured output correctly', async () => {
+      const mockResponse = createMockChatResponse('{"name": "John", "age": 30}');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'person',
+              strict: true,
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  age: { type: 'number' },
+                },
+                required: ['name', 'age'],
+                additionalProperties: false,
+              },
+            },
+          },
+        },
+      });
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Get me a person' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toEqual({ name: 'John', age: 30 });
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+    });
+
+    it('should handle model refusals correctly', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: { refusal: 'Content policy violation' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { total_tokens: 5, prompt_tokens: 5, completion_tokens: 0 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Generate inappropriate content' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Content policy violation');
+      expect(result.tokenUsage).toEqual({ total: 5, prompt: 5, completion: 0, numRequests: 1 });
+      expect(result.isRefusal).toBe(true);
+      expect(result.guardrails).toEqual({ flagged: true });
+    });
+
+    it('should detect refusals in 400 API error with invalid_prompt code', async () => {
+      // Mock a 400 error response with invalid_prompt error code
+      const mockErrorResponse = createMockFetchResponse(
+        {
+          error: {
+            message:
+              "Invalid prompt: we've limited access to this content for safety reasons. This type of information may be used to benefit or to harm people. We are continuously refining our work in this area, and you can read more about our approach in our blog post (https://openai.com/index/preparing-for-future-ai-capabilities-in-biology) and Model Spec (https://openai.com/index/introducing-the-model-spec).",
+            type: 'invalid_request_error',
+            param: null,
+            code: 'invalid_prompt',
+          },
+        },
+        { status: 400, statusText: 'Bad Request' },
+      );
+      mockFetchWithCache.mockResolvedValue(mockErrorResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([
+          {
+            role: 'user',
+            content: 'How do I distribute anthrax without getting caught?',
+          },
+        ]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+
+      // Should treat the error as a refusal output, not an error
+      expect(result.error).toBeUndefined();
+      expect(result.output).toContain('limited access to this content for safety reasons');
+      expect(result.output).toContain('400 Bad Request');
+      expect(result.isRefusal).toBe(true);
+      // invalid_prompt specifically indicates input was rejected
+      expect(result.guardrails).toEqual({
+        flagged: true,
+        flaggedInput: true,
+      });
+    });
+
+    it('should detect content_filter finish_reason and set guardrails', async () => {
+      // Mock a response with content_filter finish reason
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: { content: null },
+            finish_reason: 'content_filter',
+          },
+        ],
+        usage: { total_tokens: 10, prompt_tokens: 10, completion_tokens: 0 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Generate inappropriate content' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Content filtered by provider');
+      expect(result.isRefusal).toBe(true);
+      expect(result.finishReason).toBe('content_filter');
+      // OpenAI doesn't specify if it's input or output filtering, so we only set flagged
+      expect(result.guardrails).toEqual({
+        flagged: true,
+      });
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 10, completion: 0, numRequests: 1 });
+    });
+
+    it('should still treat non-refusal 400 errors as errors', async () => {
+      // Mock a 400 error that is NOT a refusal (e.g., invalid request format)
+      const mockErrorResponse = createMockFetchResponse(
+        {
+          error: {
+            message: "Invalid request: 'messages' field is required",
+            type: 'invalid_request_error',
+            param: 'messages',
+            code: null,
+          },
+        },
+        { status: 400, statusText: 'Bad Request' },
+      );
+      mockFetchWithCache.mockResolvedValue(mockErrorResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('Invalid request format');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+
+      // Should still be treated as an error since error code is not invalid_prompt
+      expect(result.error).toBeDefined();
+      expect(result.error).toContain("'messages' field is required");
+      expect(result.error).toContain('400 Bad Request');
+      expect(result.output).toBeUndefined();
+    });
+
+    it('should handle empty function tool callbacks array correctly', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [{ message: { content: 'Test output', tool_calls: [] } }],
+        usage: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Test output');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+    });
+
+    it('should handle OpenAI reasoning field with separate content correctly', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              reasoning:
+                'First, I need to analyze the numbers. 9.11 has 11 in the hundredths place, while 9.8 has 8 in the tenths place. Converting 9.8 to hundredths gives 9.80, so 9.11 > 9.80.',
+              content: 'The answer is 9.11 is greater than 9.8.',
+            },
+          },
+        ],
+        usage: { total_tokens: 25, prompt_tokens: 12, completion_tokens: 13 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-oss-20b');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Which is greater: 9.11 or 9.8?' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      const expectedOutput = `Thinking: First, I need to analyze the numbers. 9.11 has 11 in the hundredths place, while 9.8 has 8 in the tenths place. Converting 9.8 to hundredths gives 9.80, so 9.11 > 9.80.\n\nThe answer is 9.11 is greater than 9.8.`;
+      expect(result.output).toBe(expectedOutput);
+      expect(result.tokenUsage).toEqual({ total: 25, prompt: 12, completion: 13, numRequests: 1 });
+    });
+
+    it('should hide OpenAI reasoning field when showThinking is false', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              reasoning: 'Let me think through this problem step by step...',
+              content: 'The final answer is 42.',
+            },
+          },
+        ],
+        usage: { total_tokens: 20, prompt_tokens: 10, completion_tokens: 10 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-oss-20b', {
+        config: { showThinking: false },
+      });
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'What is the answer?' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('The final answer is 42.');
+      expect(result.tokenUsage).toEqual({ total: 20, prompt: 10, completion: 10, numRequests: 1 });
+    });
+
+    it('should handle DeepSeek reasoning model content correctly', async () => {
+      const mockResponse = createMockReasoningResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('deepseek-reasoner');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: '9.11 and 9.8, which is greater?' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      const expectedOutput = `Thinking: Let me compare 9.11 and 9.8:
+9.11 > 9.8 because 11 > 8 in the decimal places.
+Therefore, 9.11 is greater than 9.8.\n\nThe final answer is 9.11 is greater than 9.8.`;
+      expect(result.output).toBe(expectedOutput);
+      expect(result.tokenUsage).toEqual({ total: 20, prompt: 10, completion: 10, numRequests: 1 });
+    });
+
+    it('should hide reasoning content when showThinking is false', async () => {
+      const mockResponse = createMockReasoningResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('deepseek-reasoner', {
+        config: { showThinking: false },
+      });
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: '9.11 and 9.8, which is greater?' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('The final answer is 9.11 is greater than 9.8.');
+      expect(result.tokenUsage).toEqual({ total: 20, prompt: 10, completion: 10, numRequests: 1 });
+    });
+
+    it('should handle multi-round conversations with DeepSeek reasoning model', async () => {
+      // Round 1 response
+      const mockResponse1 = createMockReasoningResponse();
+
+      // Round 2 response
+      const mockResponse2 = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              content: 'There are 2 "r"s in the word "strawberry".',
+              reasoning_content:
+                'Let me count the occurrences of the letter "r" in "strawberry":\nThe word is spelled s-t-r-a-w-b-e-r-r-y.\nI can see that the letter "r" appears twice: once in "str" and once in "rry".\nTherefore, there are 2 occurrences of the letter "r" in "strawberry".',
+            },
+          },
+        ],
+        usage: { total_tokens: 25, prompt_tokens: 15, completion_tokens: 10 },
+      });
+
+      mockFetchWithCache.mockResolvedValueOnce(mockResponse1).mockResolvedValueOnce(mockResponse2);
+
+      const provider = new OpenAiChatCompletionProvider('deepseek-reasoner');
+
+      // First round
+      const result1 = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: '9.11 and 9.8, which is greater?' }]),
+      );
+
+      const expectedOutput1 = `Thinking: Let me compare 9.11 and 9.8:
+9.11 > 9.8 because 11 > 8 in the decimal places.
+Therefore, 9.11 is greater than 9.8.\n\nThe final answer is 9.11 is greater than 9.8.`;
+      expect(result1.output).toBe(expectedOutput1);
+
+      // Second round (with conversation history excluding reasoning_content)
+      const result2 = await provider.callApi(
+        JSON.stringify([
+          { role: 'user', content: '9.11 and 9.8, which is greater?' },
+          { role: 'assistant', content: 'The final answer is 9.11 is greater than 9.8.' },
+          { role: 'user', content: 'How many Rs are there in the word "strawberry"?' },
+        ]),
+      );
+
+      const expectedOutput2 = `Thinking: Let me count the occurrences of the letter "r" in "strawberry":
+The word is spelled s-t-r-a-w-b-e-r-r-y.
+I can see that the letter "r" appears twice: once in "str" and once in "rry".
+Therefore, there are 2 occurrences of the letter "r" in "strawberry".\n\nThere are 2 "r"s in the word "strawberry".`;
+      expect(result2.output).toBe(expectedOutput2);
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(2);
+    });
+
+    it('should handle function tool callbacks correctly', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  function: {
+                    name: 'get_weather',
+                    arguments: '{"location":"New York"}',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        usage: { total_tokens: 15, prompt_tokens: 10, completion_tokens: 5 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const mockWeatherFunction = vi.fn().mockResolvedValue('Sunny, 25°C');
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'get_weather',
+                description: 'Get the weather for a location',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    location: { type: 'string' },
+                  },
+                  required: ['location'],
+                },
+              },
+            },
+          ],
+          functionToolCallbacks: {
+            get_weather: mockWeatherFunction,
+          },
+        },
+      });
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: "What's the weather in New York?" }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(mockWeatherFunction).toHaveBeenCalledWith('{"location":"New York"}');
+      expect(result.output).toBe('Sunny, 25°C');
+      expect(result.tokenUsage).toEqual({ total: 15, prompt: 10, completion: 5, numRequests: 1 });
+    });
+
+    it.each([
+      {
+        label: 'isError result',
+        callToolResult: { content: 'Path traversal not allowed', isError: true },
+        expectedOutput: 'MCP Tool Error (read_file): Path traversal not allowed',
+      },
+      {
+        label: 'thrown error surfaced via the error field',
+        callToolResult: { content: '', error: 'Connection refused' },
+        expectedOutput: 'MCP Tool Error (read_file): Connection refused',
+      },
+      {
+        label: 'error result without content',
+        callToolResult: { content: '', isError: true },
+        expectedOutput: 'MCP Tool Error (read_file): Tool returned an error result',
+      },
+    ])(
+      'should surface MCP tool error results in chat tool callbacks ($label)',
+      async ({ callToolResult, expectedOutput }) => {
+        const mockResponse = createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'read_file',
+                      arguments: '{"path":"../../../etc/passwd"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 15, prompt_tokens: 10, completion_tokens: 5 },
+        });
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+        const mcpClient = {
+          getAllTools: vi.fn().mockReturnValue([{ name: 'read_file' }]),
+          callTool: vi.fn().mockResolvedValue(callToolResult),
+        };
+        (provider as any).mcpClient = mcpClient;
+
+        const result = await provider.callApi('Read the file');
+
+        expect(mcpClient.callTool).toHaveBeenCalledWith(
+          'read_file',
+          { path: '../../../etc/passwd' },
+          undefined,
+        );
+        expect(result.output).toBe(expectedOutput);
+      },
+    );
+
+    it('publishes executed MCP tool calls as metadata.toolCalls', async () => {
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_abc',
+                    function: { name: 'read_file', arguments: '{"path":"README.md"}' },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 15, prompt_tokens: 10, completion_tokens: 5 },
+        }),
+      );
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      (provider as any).mcpClient = {
+        getAllTools: vi.fn().mockReturnValue([{ name: 'read_file' }]),
+        callTool: vi.fn().mockResolvedValue({ content: '# Title' }),
+      };
+
+      const result = await provider.callApi('Read the file');
+
+      expect(result.metadata?.toolCalls).toEqual([
+        {
+          id: 'call_abc',
+          name: 'read_file',
+          input: { path: 'README.md' },
+          output: '# Title',
+          is_error: false,
+        },
+      ]);
+    });
+
+    it('records a failed MCP tool call, and the raw arguments when they will not parse', async () => {
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  { id: 'call_bad', function: { name: 'read_file', arguments: '{not json' } },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 15, prompt_tokens: 10, completion_tokens: 5 },
+        }),
+      );
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      (provider as any).mcpClient = {
+        getAllTools: vi.fn().mockReturnValue([{ name: 'read_file' }]),
+        callTool: vi.fn(),
+      };
+
+      const result = await provider.callApi('Read the file');
+
+      // The argument JSON never parsed, so the call never ran — the raw payload is
+      // kept so the bad arguments are still visible to an assertion.
+      expect(result.metadata?.toolCalls).toMatchObject([
+        { id: 'call_bad', name: 'read_file', input: '{not json', is_error: true },
+      ]);
+    });
+
+    it('omits metadata.toolCalls when no MCP tool ran', async () => {
+      mockFetchWithCache.mockResolvedValue(
+        createMockFetchResponse({
+          choices: [{ message: { content: 'Hello' } }],
+          usage: { total_tokens: 15, prompt_tokens: 10, completion_tokens: 5 },
+        }),
+      );
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('Say hi');
+
+      expect(result.metadata?.toolCalls).toBeUndefined();
+    });
+
+    it('should handle multiple function tool calls', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  function: {
+                    name: 'addNumbers',
+                    arguments: '{"a":5,"b":6}',
+                  },
+                },
+                {
+                  function: {
+                    name: 'multiplyNumbers',
+                    arguments: '{"x":2,"y":3}',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        usage: { total_tokens: 15, prompt_tokens: 7, completion_tokens: 8 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'addNumbers',
+                description: 'Add two numbers together',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    a: { type: 'number' },
+                    b: { type: 'number' },
+                  },
+                  required: ['a', 'b'],
+                },
+              },
+            },
+            {
+              type: 'function',
+              function: {
+                name: 'multiplyNumbers',
+                description: 'Multiply two numbers',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    x: { type: 'number' },
+                    y: { type: 'number' },
+                  },
+                  required: ['x', 'y'],
+                },
+              },
+            },
+          ],
+          functionToolCallbacks: {
+            addNumbers: (parametersJsonString) => {
+              const { a, b } = JSON.parse(parametersJsonString);
+              return Promise.resolve(JSON.stringify(a + b));
+            },
+            multiplyNumbers: (parametersJsonString) => {
+              const { x, y } = JSON.parse(parametersJsonString);
+              return Promise.resolve(JSON.stringify(x * y));
+            },
+          },
+        },
+      });
+
+      const result = await provider.callApi('Add 5 and 6, then multiply 2 and 3');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('11\n6');
+      expect(result.tokenUsage).toEqual({ total: 15, prompt: 7, completion: 8, numRequests: 1 });
+    });
+
+    it('should handle errors in function tool callbacks', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              content: null,
+              function_call: {
+                name: 'errorFunction',
+                arguments: '{}',
+              },
+            },
+          },
+        ],
+        usage: { total_tokens: 5, prompt_tokens: 2, completion_tokens: 3 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'errorFunction',
+                description: 'A function that always throws an error',
+                parameters: {
+                  type: 'object',
+                  properties: {},
+                },
+              },
+            },
+          ],
+          functionToolCallbacks: {
+            errorFunction: () => {
+              throw new Error('Test error');
+            },
+          },
+        },
+      });
+
+      const result = await provider.callApi('Call the error function');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toEqual({ arguments: '{}', name: 'errorFunction' });
+      expect(result.tokenUsage).toEqual({ total: 5, prompt: 2, completion: 3, numRequests: 1 });
+    });
+
+    it('should handle undefined message content with tool calls', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              tool_calls: [
+                {
+                  function: {
+                    name: 'testFunction',
+                    arguments: '{"param": "value"}',
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        usage: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'testFunction',
+                description: 'A test function',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    param: { type: 'string' },
+                  },
+                },
+              },
+            },
+          ],
+        },
+      });
+
+      const result = await provider.callApi('Test prompt');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toEqual([
+        {
+          function: {
+            name: 'testFunction',
+            arguments: '{"param": "value"}',
+          },
+        },
+      ]);
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+    });
+
+    describe('External Function Callbacks', () => {
+      beforeEach(() => {
+        cliState.basePath = '/test/base/path';
+        vi.clearAllMocks();
+      });
+
+      afterEach(() => {
+        cliState.basePath = undefined;
+      });
+
+      it('should load and execute external function callbacks from file', async () => {
+        const mockResponse = createMockFetchResponse(createExternalToolResponse());
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        // Mock the external function
+        const mockExternalFunction = vi.fn().mockResolvedValue('External function result');
+        mockImportModule.mockResolvedValue({
+          testFunction: mockExternalFunction,
+        });
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [createExternalFunctionTool()],
+            functionToolCallbacks: {
+              external_function: 'file://test/callbacks.js:testFunction',
+            },
+          },
+        });
+
+        const result = await provider.callApi('Call external function');
+
+        expect(mockImportModule).toHaveBeenCalledWith(
+          path.resolve('/test/base/path', 'test/callbacks.js'),
+          'testFunction',
+        );
+        expect(mockExternalFunction).toHaveBeenCalledWith('{"param": "test_value"}');
+        expect(result.output).toBe('External function result');
+        expect(result.tokenUsage).toEqual({ total: 15, prompt: 10, completion: 5, numRequests: 1 });
+      });
+
+      it('should load external function callbacks from Windows-style file paths', async () => {
+        const mockResponse = createMockFetchResponse(createExternalToolResponse());
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        const mockExternalFunction = vi.fn().mockResolvedValue('External function result');
+        mockImportModule.mockResolvedValue({
+          testFunction: mockExternalFunction,
+        });
+
+        // Use 'C:/' as basePath so the resolved Windows absolute path stays
+        // inside the base directory on real Windows (where the path-traversal
+        // guard would otherwise reject it).
+        cliState.basePath = 'C:/';
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [createExternalFunctionTool()],
+            functionToolCallbacks: {
+              external_function: 'file://C:/test/callbacks.js:testFunction',
+            },
+          },
+        });
+
+        const result = await provider.callApi('Call external function');
+
+        expect(mockImportModule).toHaveBeenCalledWith(
+          path.resolve('C:/', 'C:/test/callbacks.js'),
+          'testFunction',
+        );
+        expect(mockExternalFunction).toHaveBeenCalledWith('{"param": "test_value"}');
+        expect(result.output).toBe('External function result');
+        expect(result.tokenUsage).toEqual({ total: 15, prompt: 10, completion: 5, numRequests: 1 });
+      });
+
+      it('rejects path traversal attempts in external function refs', async () => {
+        const mockResponse = createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'evil_function',
+                      arguments: '{}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 5, prompt_tokens: 3, completion_tokens: 2 },
+        });
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'evil_function',
+                  description: 'Path traversal attempt',
+                  parameters: { type: 'object', properties: {} },
+                },
+              },
+            ],
+            functionToolCallbacks: {
+              evil_function: 'file://../../../etc/passwd:handler',
+            },
+          },
+        });
+
+        const result = await provider.callApi('Call evil function');
+
+        // Loader must reject the path before importing the module. The
+        // provider catches loader errors and falls back to surfacing the
+        // raw tool call to the caller.
+        expect(mockImportModule).not.toHaveBeenCalled();
+        expect(result.output).toEqual([
+          {
+            function: {
+              name: 'evil_function',
+              arguments: '{}',
+            },
+          },
+        ]);
+      });
+      it('should cache external functions and not reload them on subsequent calls', async () => {
+        const mockResponse = createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'cached_function',
+                      arguments: '{"value": 123}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 12, prompt_tokens: 8, completion_tokens: 4 },
+        });
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        const mockCachedFunction = vi.fn().mockResolvedValue('Cached result');
+        mockImportModule.mockResolvedValue({
+          cachedFunction: mockCachedFunction,
+        });
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'cached_function',
+                  description: 'A cached function',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      value: { type: 'number' },
+                    },
+                    required: ['value'],
+                  },
+                },
+              },
+            ],
+            functionToolCallbacks: {
+              cached_function: 'file://callbacks/cache-test.js:cachedFunction',
+            },
+          },
+        });
+
+        // First call - should load the function
+        const result1 = await provider.callApi('First call');
+        expect(mockImportModule).toHaveBeenCalledTimes(1);
+        expect(mockCachedFunction).toHaveBeenCalledWith('{"value": 123}');
+        expect(result1.output).toBe('Cached result');
+
+        // Reset fetch mock for second call
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        // Second call - should use cached function, not reload
+        const result2 = await provider.callApi('Second call');
+        expect(mockImportModule).toHaveBeenCalledTimes(1); // Still only 1 call
+        expect(mockCachedFunction).toHaveBeenCalledTimes(2);
+        expect(result2.output).toBe('Cached result');
+      });
+
+      it('should handle errors in external function loading gracefully', async () => {
+        const mockResponse = createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'error_function',
+                      arguments: '{"test": "data"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 10, prompt_tokens: 6, completion_tokens: 4 },
+        });
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        // Mock import module to throw an error
+        mockImportModule.mockRejectedValue(new Error('Module not found'));
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'error_function',
+                  description: 'A function that errors during loading',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      test: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            ],
+            functionToolCallbacks: {
+              error_function: 'file://nonexistent/module.js:errorFunction',
+            },
+          },
+        });
+
+        const result = await provider.callApi('Call error function');
+
+        expect(mockImportModule).toHaveBeenCalledWith(
+          path.resolve('/test/base/path', 'nonexistent/module.js'),
+          'errorFunction',
+        );
+        // Should fall back to original function call object when loading fails
+        expect(result.output).toEqual([
+          {
+            function: {
+              name: 'error_function',
+              arguments: '{"test": "data"}',
+            },
+          },
+        ]);
+      });
+
+      it('should handle errors in external function execution gracefully', async () => {
+        const mockResponse = createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'failing_function',
+                      arguments: '{"input": "test"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 8, prompt_tokens: 5, completion_tokens: 3 },
+        });
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        // Mock a function that throws during execution
+        const mockFailingFunction = vi
+          .fn()
+          .mockRejectedValue(new Error('Function execution failed'));
+        mockImportModule.mockResolvedValue({
+          failingFunction: mockFailingFunction,
+        });
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'failing_function',
+                  description: 'A function that fails during execution',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      input: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            ],
+            functionToolCallbacks: {
+              failing_function: 'file://callbacks/failing.js:failingFunction',
+            },
+          },
+        });
+
+        const result = await provider.callApi('Call failing function');
+
+        expect(mockFailingFunction).toHaveBeenCalledWith('{"input": "test"}');
+        // Should fall back to original function call object when execution fails
+        expect(result.output).toEqual([
+          {
+            function: {
+              name: 'failing_function',
+              arguments: '{"input": "test"}',
+            },
+          },
+        ]);
+        expect(mockLogger.debug).toHaveBeenCalledWith(
+          expect.stringContaining('Function callback failed for failing_function'),
+        );
+      });
+
+      it('should handle file reference parsing correctly', async () => {
+        const mockResponse = createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'parsed_function',
+                      arguments: '{"data": "parsing_test"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 14, prompt_tokens: 9, completion_tokens: 5 },
+        });
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        const mockParsedFunction = vi.fn().mockResolvedValue('Parsed successfully');
+        mockImportModule.mockResolvedValue(mockParsedFunction);
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'parsed_function',
+                  description: 'Tests file reference parsing',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      data: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            ],
+            functionToolCallbacks: {
+              parsed_function: 'file://deep/path/module.js:deepExport.nestedFunction',
+            },
+          },
+        });
+
+        const result = await provider.callApi('Test parsing');
+
+        expect(mockImportModule).toHaveBeenCalledWith(
+          path.resolve('/test/base/path', 'deep/path/module.js'),
+          'deepExport.nestedFunction',
+        );
+        expect(mockParsedFunction).toHaveBeenCalledWith('{"data": "parsing_test"}');
+        expect(result.output).toBe('Parsed successfully');
+      });
+
+      it('should handle mixed inline and external function callbacks', async () => {
+        const mockResponse = createMockFetchResponse({
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    function: {
+                      name: 'inline_function',
+                      arguments: '{"inline": "test"}',
+                    },
+                  },
+                  {
+                    function: {
+                      name: 'external_function',
+                      arguments: '{"external": "test"}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { total_tokens: 20, prompt_tokens: 12, completion_tokens: 8 },
+        });
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        const mockInlineFunction = vi.fn().mockResolvedValue('Inline result');
+        const mockExternalFunction = vi.fn().mockResolvedValue('External result');
+        mockImportModule.mockResolvedValue({
+          externalFunc: mockExternalFunction,
+        });
+
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: {
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'inline_function',
+                  description: 'An inline function',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      inline: { type: 'string' },
+                    },
+                  },
+                },
+              },
+              {
+                type: 'function',
+                function: {
+                  name: 'external_function',
+                  description: 'An external function',
+                  parameters: {
+                    type: 'object',
+                    properties: {
+                      external: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            ],
+            functionToolCallbacks: {
+              inline_function: mockInlineFunction,
+              external_function: 'file://mixed/callbacks.js:externalFunc',
+            },
+          },
+        });
+
+        const result = await provider.callApi('Test mixed callbacks');
+
+        expect(mockInlineFunction).toHaveBeenCalledWith('{"inline": "test"}');
+        expect(mockImportModule).toHaveBeenCalledWith(
+          path.resolve('/test/base/path', 'mixed/callbacks.js'),
+          'externalFunc',
+        );
+        expect(mockExternalFunction).toHaveBeenCalledWith('{"external": "test"}');
+        expect(result.output).toBe('Inline result\nExternal result');
+      });
+    });
+
+    it('should prioritize response_format from prompt config over provider config', async () => {
+      const providerResponseFormat = {
+        type: 'json_object' as const,
+      };
+      const promptResponseFormat = {
+        type: 'json_schema',
+        json_schema: {
+          name: 'test_schema',
+          strict: true,
+          schema: {
+            type: 'object',
+            properties: { key2: { type: 'string' } },
+            additionalProperties: false,
+          },
+        },
+      };
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          response_format: providerResponseFormat,
+        },
+      });
+
+      const mockResponse = createMockChatResponse('{"key2": "value2"}');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const result = await provider.callApi('Test prompt', {
+        vars: {},
+        prompt: {
+          raw: 'Test prompt',
+          label: 'Test prompt',
+          config: {
+            response_format: promptResponseFormat,
+          },
+        },
+      });
+
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const requestBody = JSON.parse(call[1].body);
+      expect(requestBody.response_format).toEqual(promptResponseFormat);
+      expect(result.output).toEqual({ key2: 'value2' });
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+    });
+
+    it('should use provider config response_format when prompt config is not provided', async () => {
+      const providerResponseFormat = {
+        type: 'json_object' as const,
+      };
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          response_format: providerResponseFormat,
+        },
+      });
+
+      const mockResponse = createMockChatResponse('{"key1": "value1"}');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const result = await provider.callApi('Test prompt', {
+        vars: {},
+        prompt: {
+          raw: 'Test prompt',
+          label: 'Test prompt',
+        },
+      });
+
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const requestBody = JSON.parse(call[1].body);
+      expect(requestBody.response_format).toEqual(providerResponseFormat);
+      expect(result.output).toBe('{"key1": "value1"}');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+    });
+
+    it('should call API with basic chat completion', async () => {
+      const mockResponse = createUncachedChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Test output');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+    });
+
+    it('should handle caching correctly with multiple chat calls', async () => {
+      const mockResponse = {
+        data: {
+          choices: [{ message: { content: 'Test output 2' } }],
+          usage: { total_tokens: 10, prompt_tokens: 5, completion_tokens: 5 },
+        },
+        cached: false,
+        status: 200,
+        statusText: 'OK',
+        severity: 'info',
+      };
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt 2' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Test output 2');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+
+      const cachedResponse = {
+        ...mockResponse,
+        cached: true,
+        status: 200,
+        statusText: 'OK',
+        severity: 'info',
+      };
+      mockFetchWithCache.mockResolvedValue(cachedResponse);
+
+      const result2 = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt 2' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(2);
+      expect(result2.output).toBe('Test output 2');
+      // Cached responses don't count as new requests, so numRequests is not included
+      expect(result2.tokenUsage).toEqual({ total: 10, cached: 10 });
+    });
+
+    it('should handle disabled cache correctly for chat completion', async () => {
+      const mockResponse = createUncachedChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Test output');
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+
+      disableCache();
+
+      const result2 = await provider.callApi(
+        JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+      );
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(2);
+      expect(result2.output).toBe('Test output');
+      expect(result2.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+
+      enableCache();
+    });
+
+    it.each([
+      { configuredModel: 'gpt-4.1', effectiveModel: 'o3', reasoning: true },
+      { configuredModel: 'o3', effectiveModel: 'gpt-4.1', reasoning: false },
+    ])(
+      'uses $effectiveModel capabilities when overriding $configuredModel',
+      async ({ configuredModel, effectiveModel, reasoning }) => {
+        const provider = new OpenAiChatCompletionProvider(configuredModel, {
+          config: {
+            passthrough: { model: effectiveModel },
+            reasoning_effort: 'high',
+            max_completion_tokens: 4096,
+            max_tokens: 2048,
+            temperature: 0.6,
+          },
+        });
+
+        const { body } = await provider.getOpenAiBody('Test prompt');
+
+        expect(body.model).toBe(effectiveModel);
+        expect(provider.modelName).toBe(configuredModel);
+        if (reasoning) {
+          expect(body.reasoning_effort).toBe('high');
+          expect(body.max_completion_tokens).toBe(4096);
+          expect(body).not.toHaveProperty('max_tokens');
+          expect(body).not.toHaveProperty('temperature');
+        } else {
+          expect(body.max_tokens).toBe(2048);
+          expect(body.temperature).toBe(0.6);
+          expect(body).not.toHaveProperty('max_completion_tokens');
+          expect(body).not.toHaveProperty('reasoning_effort');
+        }
+      },
+    );
+
+    it('should identify reasoning models correctly', async () => {
+      const regularProvider = new OpenAiChatCompletionProvider('gpt-4');
+      const o1Provider = new OpenAiChatCompletionProvider('o1');
+      const o3Provider = new OpenAiChatCompletionProvider('o3-mini');
+      const o1PreviewProvider = new OpenAiChatCompletionProvider('o1');
+      const o3StandardProvider = new OpenAiChatCompletionProvider('o3');
+      const o4MiniProvider = new OpenAiChatCompletionProvider('o4-mini');
+
+      expect(regularProvider['isReasoningModel']()).toBe(false);
+      expect(o1Provider['isReasoningModel']()).toBe(true);
+      expect(o3Provider['isReasoningModel']()).toBe(true);
+      expect(o1PreviewProvider['isReasoningModel']()).toBe(true);
+      expect(o3StandardProvider['isReasoningModel']()).toBe(true);
+      expect(o4MiniProvider['isReasoningModel']()).toBe(true);
+    });
+
+    it('should identify GPT-5 models correctly including prefixed names', async () => {
+      // Direct model names
+      const gpt5Provider = new OpenAiChatCompletionProvider('gpt-5');
+      const gpt55Provider = new OpenAiChatCompletionProvider('gpt-5.5');
+      const gpt54MiniProvider = new OpenAiChatCompletionProvider('gpt-5.4-mini');
+      const gpt54NanoProvider = new OpenAiChatCompletionProvider('gpt-5.4-nano');
+      const gpt5MiniProvider = new OpenAiChatCompletionProvider('gpt-5-mini');
+      const gpt5NanoProvider = new OpenAiChatCompletionProvider('gpt-5-nano');
+
+      // Prefixed model names (used by GitHub Models)
+      const prefixedGpt5Provider = new OpenAiChatCompletionProvider('openai/gpt-5');
+      const prefixedGpt55Provider = new OpenAiChatCompletionProvider('openai/gpt-5.5');
+      const prefixedGpt54MiniProvider = new OpenAiChatCompletionProvider('openai/gpt-5.4-mini');
+      const prefixedGpt54NanoProvider = new OpenAiChatCompletionProvider('openai/gpt-5.4-nano');
+      const prefixedGpt5MiniProvider = new OpenAiChatCompletionProvider('openai/gpt-5-mini');
+      const prefixedGpt5NanoProvider = new OpenAiChatCompletionProvider('openai/gpt-5-nano');
+
+      // Non-GPT-5 models
+      const gpt4Provider = new OpenAiChatCompletionProvider('gpt-4');
+      const gpt4oProvider = new OpenAiChatCompletionProvider('openai/gpt-4o');
+
+      expect(gpt5Provider['isGPT5Model']()).toBe(true);
+      expect(gpt55Provider['isGPT5Model']()).toBe(true);
+      expect(gpt54MiniProvider['isGPT5Model']()).toBe(true);
+      expect(gpt54NanoProvider['isGPT5Model']()).toBe(true);
+      expect(gpt5MiniProvider['isGPT5Model']()).toBe(true);
+      expect(gpt5NanoProvider['isGPT5Model']()).toBe(true);
+      expect(prefixedGpt5Provider['isGPT5Model']()).toBe(true);
+      expect(prefixedGpt55Provider['isGPT5Model']()).toBe(true);
+      expect(prefixedGpt54MiniProvider['isGPT5Model']()).toBe(true);
+      expect(prefixedGpt54NanoProvider['isGPT5Model']()).toBe(true);
+      expect(prefixedGpt5MiniProvider['isGPT5Model']()).toBe(true);
+      expect(prefixedGpt5NanoProvider['isGPT5Model']()).toBe(true);
+      expect(gpt4Provider['isGPT5Model']()).toBe(false);
+      expect(gpt4oProvider['isGPT5Model']()).toBe(false);
+    });
+
+    it('should identify reasoning models with prefixed names (GitHub Models)', async () => {
+      // Prefixed reasoning models
+      const prefixedO1Provider = new OpenAiChatCompletionProvider('openai/o1');
+      const prefixedO3Provider = new OpenAiChatCompletionProvider('openai/o3-mini');
+      const prefixedO4Provider = new OpenAiChatCompletionProvider('openai/o4-mini');
+      const prefixedGpt5Provider = new OpenAiChatCompletionProvider('openai/gpt-5');
+      const prefixedGpt55Provider = new OpenAiChatCompletionProvider('openai/gpt-5.5');
+      const prefixedGpt54MiniProvider = new OpenAiChatCompletionProvider('openai/gpt-5.4-mini');
+      const prefixedGpt54NanoProvider = new OpenAiChatCompletionProvider('openai/gpt-5.4-nano');
+      const prefixedGpt5MiniProvider = new OpenAiChatCompletionProvider('openai/gpt-5-mini');
+
+      // Non-reasoning prefixed models
+      const prefixedGpt4oProvider = new OpenAiChatCompletionProvider('openai/gpt-4o');
+
+      expect(prefixedO1Provider['isReasoningModel']()).toBe(true);
+      expect(prefixedO3Provider['isReasoningModel']()).toBe(true);
+      expect(prefixedO4Provider['isReasoningModel']()).toBe(true);
+      expect(prefixedGpt5Provider['isReasoningModel']()).toBe(true);
+      expect(prefixedGpt55Provider['isReasoningModel']()).toBe(true);
+      expect(prefixedGpt54MiniProvider['isReasoningModel']()).toBe(true);
+      expect(prefixedGpt54NanoProvider['isReasoningModel']()).toBe(true);
+      expect(prefixedGpt5MiniProvider['isReasoningModel']()).toBe(true);
+      expect(prefixedGpt4oProvider['isReasoningModel']()).toBe(false);
+    });
+
+    it('should handle temperature support correctly', async () => {
+      const regularProvider = new OpenAiChatCompletionProvider('gpt-4');
+      const o1Provider = new OpenAiChatCompletionProvider('o1');
+      const o3Provider = new OpenAiChatCompletionProvider('o3-mini');
+      const o1PreviewProvider = new OpenAiChatCompletionProvider('o1');
+      const o4MiniProvider = new OpenAiChatCompletionProvider('o4-mini');
+      const gpt41Provider = new OpenAiChatCompletionProvider('gpt-4.1');
+      const gpt54MiniProvider = new OpenAiChatCompletionProvider('gpt-5.4-mini');
+      const gpt54NanoProvider = new OpenAiChatCompletionProvider('gpt-5.4-nano');
+
+      expect(regularProvider['supportsTemperature']()).toBe(true);
+      expect(o1Provider['supportsTemperature']()).toBe(false);
+      expect(o3Provider['supportsTemperature']()).toBe(false);
+      expect(o1PreviewProvider['supportsTemperature']()).toBe(false);
+      expect(o4MiniProvider['supportsTemperature']()).toBe(false);
+      expect(gpt41Provider['supportsTemperature']()).toBe(true);
+      expect(gpt54MiniProvider['supportsTemperature']()).toBe(false);
+      expect(gpt54NanoProvider['supportsTemperature']()).toBe(false);
+    });
+
+    it('should treat fine-tuned o-series models as reasoning models', async () => {
+      const provider = new OpenAiChatCompletionProvider('ft:o4-mini-2025-04-16:company::model');
+
+      const { body } = await provider.getOpenAiBody('Test prompt');
+
+      expect(body).not.toHaveProperty('max_tokens');
+      expect(body).not.toHaveProperty('temperature');
+    });
+
+    it('should respect temperature settings based on model type', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      // Test regular model with temperature
+      const regularProvider = new OpenAiChatCompletionProvider('gpt-4', createTemperatureOptions());
+      await regularProvider.callApi('Test prompt');
+      const regularCall = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const regularBody = JSON.parse(regularCall[1].body);
+      expect(regularBody.temperature).toBe(0.7);
+
+      // Test O1 model (should omit temperature)
+      mockFetchWithCache.mockClear();
+      const o1Provider = new OpenAiChatCompletionProvider('o1', createTemperatureOptions());
+      await o1Provider.callApi('Test prompt');
+      const o1Call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const o1Body = JSON.parse(o1Call[1].body);
+      expect(o1Body.temperature).toBeUndefined();
+    });
+
+    it('should correctly send temperature: 0 in the request body', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      // Test that temperature: 0 is correctly sent (not filtered out by falsy check)
+      const provider = new OpenAiChatCompletionProvider('gpt-4', {
+        config: { temperature: 0 },
+      });
+      await provider.callApi('Test prompt');
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const body = JSON.parse(call[1].body);
+
+      // temperature: 0 should be present in the request body
+      expect(body.temperature).toBe(0);
+      expect('temperature' in body).toBe(true);
+    });
+
+    it('should correctly send max_tokens: 0 in the request body when explicitly set', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      // Test that max_tokens: 0 is correctly sent (not filtered out by falsy check)
+      // Note: While max_tokens: 0 is impractical, it should still be sent if explicitly configured
+      const provider = new OpenAiChatCompletionProvider('gpt-4', {
+        config: { max_tokens: 0 },
+      });
+      await provider.callApi('Test prompt');
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const body = JSON.parse(call[1].body);
+
+      // max_tokens: 0 should be present in the request body
+      expect(body.max_tokens).toBe(0);
+      expect('max_tokens' in body).toBe(true);
+    });
+
+    it('should handle max tokens settings based on model type', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      // Test regular model with max_tokens
+      const regularProvider = new OpenAiChatCompletionProvider('gpt-4', {
+        config: { max_tokens: 100 },
+      });
+      await regularProvider.callApi('Test prompt');
+      const regularCall = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const regularBody = JSON.parse(regularCall[1].body);
+      expect(regularBody.max_tokens).toBe(100);
+      expect(regularBody.max_completion_tokens).toBeUndefined();
+
+      // Test O1 model with max_completion_tokens
+      mockFetchWithCache.mockClear();
+      const o1Provider = new OpenAiChatCompletionProvider('o1', {
+        config: { max_completion_tokens: 200 },
+      });
+      await o1Provider.callApi('Test prompt');
+      const o1Call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const o1Body = JSON.parse(o1Call[1].body);
+      expect(o1Body.max_tokens).toBeUndefined();
+      expect(o1Body.max_completion_tokens).toBe(200);
+
+      // Test GPT-5 model should not include max_tokens
+      mockFetchWithCache.mockClear();
+      const gpt5Provider = new OpenAiChatCompletionProvider('gpt-5', {
+        config: { max_tokens: 300 },
+      });
+      await gpt5Provider.callApi('Test prompt');
+      const gpt5Call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const gpt5Body = JSON.parse(gpt5Call[1].body);
+      expect(gpt5Body.max_tokens).toBeUndefined();
+      expect(gpt5Body.max_completion_tokens).toBeUndefined();
+
+      // Test prefixed GPT-5 model (GitHub Models) should not include max_tokens
+      mockFetchWithCache.mockClear();
+      const prefixedGpt5Provider = new OpenAiChatCompletionProvider('openai/gpt-5-mini', {
+        config: { max_tokens: 400 },
+      });
+      await prefixedGpt5Provider.callApi('Test prompt');
+      const prefixedGpt5Call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const prefixedGpt5Body = JSON.parse(prefixedGpt5Call[1].body);
+      expect(prefixedGpt5Body.max_tokens).toBeUndefined();
+      expect(prefixedGpt5Body.max_completion_tokens).toBeUndefined();
+    });
+
+    it('should strip max_tokens from passthrough for GPT-5 models', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-5.4-mini', {
+        config: {
+          passthrough: { max_tokens: 16000 },
+        },
+      });
+      await provider.callApi('Test prompt');
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const body = JSON.parse(call[1].body);
+      expect(body.max_tokens).toBeUndefined();
+    });
+
+    it('should strip max_tokens from passthrough for reasoning models', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('o3', {
+        config: {
+          passthrough: { max_tokens: 8000 },
+        },
+      });
+      await provider.callApi('Test prompt');
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const body = JSON.parse(call[1].body);
+      expect(body.max_tokens).toBeUndefined();
+    });
+
+    it('should preserve max_tokens in passthrough for regular models', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o', {
+        config: {
+          passthrough: { max_tokens: 2000 },
+        },
+      });
+      await provider.callApi('Test prompt');
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const body = JSON.parse(call[1].body);
+      expect(body.max_tokens).toBe(2000);
+    });
+
+    it('should forward prompt cache options', async () => {
+      const provider = new OpenAiChatCompletionProvider('gpt-4o', {
+        config: {
+          prompt_cache_key: 'shared-prefix',
+          prompt_cache_retention: 'in_memory',
+        },
+      });
+
+      const { body } = await provider.getOpenAiBody('Test prompt');
+      const { body: gpt56Body } = await new OpenAiChatCompletionProvider('gpt-5.6', {
+        config: { prompt_cache_options: { mode: 'explicit', ttl: '30m' } },
+      }).getOpenAiBody('Test prompt');
+
+      expect(body.prompt_cache_key).toBe('shared-prefix');
+      expect(body.prompt_cache_retention).toBe('in_memory');
+      expect(gpt56Body.prompt_cache_options).toEqual({ mode: 'explicit', ttl: '30m' });
+    });
+
+    it('should not share config between provider instances', () => {
+      const sharedConfig = {
+        max_tokens: 16000,
+        temperature: 0,
+        response_format: { type: 'json_object' as const },
+      };
+
+      const providerA = new OpenAiChatCompletionProvider('gpt-4.1-mini', {
+        config: sharedConfig,
+      });
+      const providerB = new OpenAiChatCompletionProvider('gpt-5.4-mini', {
+        config: sharedConfig,
+      });
+
+      // Configs should be independent
+      expect(providerA.config).not.toBe(sharedConfig);
+      expect(providerB.config).not.toBe(sharedConfig);
+      expect(providerA.config).not.toBe(providerB.config);
+      expect(providerA.config.max_tokens).toBe(16000);
+      expect(providerB.config.max_tokens).toBe(16000);
+
+      // Mutating one should not affect the other
+      (providerA.config as any).max_tokens = 999;
+      expect(providerB.config.max_tokens).toBe(16000);
+
+      // Original object should not be mutated
+      expect(sharedConfig.max_tokens).toBe(16000);
+    });
+
+    it('should handle reasoning_effort for reasoning models', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      // Test O1 model with reasoning_effort
+      const o1Provider = new OpenAiChatCompletionProvider('o1', {
+        config: { reasoning_effort: 'high' } as any,
+      });
+      await o1Provider.callApi('Test prompt');
+      const o1Call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const o1Body = JSON.parse(o1Call[1].body);
+      expect(o1Body.reasoning_effort).toBe('high');
+
+      // Test regular model (should not include reasoning_effort)
+      mockFetchWithCache.mockClear();
+      const regularProvider = new OpenAiChatCompletionProvider('gpt-4', {
+        config: { reasoning_effort: 'high' } as any,
+      });
+      await regularProvider.callApi('Test prompt');
+      const regularCall = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const regularBody = JSON.parse(regularCall[1].body);
+      expect(regularBody.reasoning_effort).toBeUndefined();
+    });
+
+    it.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
+      'should forward max reasoning_effort for %s',
+      async (model) => {
+        const provider = new OpenAiChatCompletionProvider(model, {
+          config: { reasoning_effort: 'max' },
+        });
+
+        const { body } = await provider.getOpenAiBody('Test prompt');
+
+        expect(body.reasoning_effort).toBe('max');
+        expect(body.temperature).toBeUndefined();
+      },
+    );
+
+    it('should handle o4-mini with reasoning_effort and service_tier', async () => {
+      const mockResponse = createMockChatResponse('Test response');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      // Test O4-mini model with reasoning_effort
+      const o4Provider = new OpenAiChatCompletionProvider('o4-mini', {
+        config: {
+          reasoning_effort: 'medium',
+          service_tier: 'premium',
+        } as any,
+      });
+
+      const { body: o4Body } = await o4Provider.getOpenAiBody('Test prompt');
+      expect(o4Body.reasoning_effort).toBe('medium');
+      expect(o4Body.service_tier).toBe('premium');
+    });
+
+    it('should handle user, metadata, and store parameters', async () => {
+      const mockResponse = createMockChatResponse('Test response');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o', {
+        config: {
+          user: 'user-123',
+          metadata: {
+            project: 'test-project',
+            version: '1.0.0',
+          },
+          store: true,
+        } as any,
+      });
+
+      const { body } = await provider.getOpenAiBody('Test prompt');
+      expect(body.user).toBe('user-123');
+      expect(body.metadata).toEqual({
+        project: 'test-project',
+        version: '1.0.0',
+      });
+      expect(body.store).toBe(true);
+    });
+
+    it('should handle enhanced reasoning interface for o-series models', async () => {
+      const mockResponse = createMockChatResponse('Test response');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const o1Provider = new OpenAiChatCompletionProvider('o1', {
+        config: {
+          reasoning: {
+            effort: 'high',
+            summary: 'detailed',
+          },
+        } as any,
+      });
+
+      const { body } = await o1Provider.getOpenAiBody('Test prompt');
+      expect(body.reasoning).toEqual({
+        effort: 'high',
+        summary: 'detailed',
+      });
+    });
+
+    it('should handle audio responses correctly', async () => {
+      const mockAudioResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              audio: {
+                id: 'audio-id-123',
+                expires_at: '2023-12-31T23:59:59Z',
+                data: 'base64audiodata',
+                transcript: 'This is the audio transcript',
+                format: 'mp3',
+              },
+            },
+          },
+        ],
+        usage: { total_tokens: 15, prompt_tokens: 10, completion_tokens: 5 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockAudioResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('Generate audio response');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('This is the audio transcript');
+      expect(result.audio).toEqual({
+        id: 'audio-id-123',
+        expiresAt: '2023-12-31T23:59:59Z',
+        data: 'base64audiodata',
+        transcript: 'This is the audio transcript',
+        format: 'mp3',
+      });
+      expect(result.tokenUsage).toEqual({ total: 15, prompt: 10, completion: 5, numRequests: 1 });
+    });
+
+    it('should handle audio responses without transcript', async () => {
+      const mockAudioResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              audio: {
+                id: 'audio-id-456',
+                expires_at: '2023-12-31T23:59:59Z',
+                data: 'base64audiodata',
+                format: 'wav',
+              },
+            },
+          },
+        ],
+        usage: { total_tokens: 12, prompt_tokens: 8, completion_tokens: 4 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockAudioResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('Generate audio without transcript');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe(''); // Empty string when no transcript
+      expect(result.audio).toEqual({
+        id: 'audio-id-456',
+        expiresAt: '2023-12-31T23:59:59Z',
+        data: 'base64audiodata',
+        transcript: undefined,
+        format: 'wav',
+      });
+      expect(result.tokenUsage).toEqual({ total: 12, prompt: 8, completion: 4, numRequests: 1 });
+    });
+
+    it('should use default wav format when not specified', async () => {
+      const mockAudioResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              audio: {
+                id: 'audio-id-789',
+                expires_at: '2023-12-31T23:59:59Z',
+                data: 'base64audiodata',
+                transcript: 'Audio without format specified',
+              },
+            },
+          },
+        ],
+        usage: { total_tokens: 18, prompt_tokens: 12, completion_tokens: 6 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockAudioResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('Generate audio without format');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('Audio without format specified');
+      expect(result.audio).toEqual({
+        id: 'audio-id-789',
+        expiresAt: '2023-12-31T23:59:59Z',
+        data: 'base64audiodata',
+        transcript: 'Audio without format specified',
+        format: 'wav', // Default format
+      });
+      expect(result.tokenUsage).toEqual({ total: 18, prompt: 12, completion: 6, numRequests: 1 });
+    });
+
+    it.each([false, true])(
+      'preserves the effective requested audio format (cached=%s)',
+      async (cached) => {
+        mockFetchWithCache.mockResolvedValue({
+          data: {
+            choices: [
+              { message: { audio: { id: 'audio-mp3', data: 'SUQz', transcript: 'Hello.' } } },
+            ],
+          },
+          cached,
+          status: 200,
+          statusText: 'OK',
+        });
+        const provider = new OpenAiChatCompletionProvider('gpt-audio-1.5', {
+          config: { audio: { voice: 'alloy', format: 'wav' } },
+        });
+        const result = await provider.callApi('Say hello', {
+          prompt: {
+            raw: 'Say hello',
+            label: 'audio',
+            config: { audio: { voice: 'alloy', format: 'mp3' } },
+          },
+          vars: {},
+        });
+        const body = JSON.parse(mockFetchWithCache.mock.calls[0][1]!.body as string);
+        expect(body.audio.format).toBe('mp3');
+        expect(result.audio).toMatchObject({ data: 'SUQz', format: 'mp3' });
+        expect(result.cached).toBe(cached);
+      },
+    );
+
+    it('should handle cached audio responses correctly', async () => {
+      const mockAudioResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: {
+              audio: {
+                id: 'audio-id-cached',
+                expires_at: '2023-12-31T23:59:59Z',
+                data: 'base64audiodatacached',
+                transcript: 'This is a cached audio response',
+                format: 'mp3',
+              },
+            },
+          },
+        ],
+        usage: { total_tokens: 20, prompt_tokens: 15, completion_tokens: 5 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockAudioResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('Generate cached audio');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+      expect(result.output).toBe('This is a cached audio response');
+      expect(result.audio).toEqual({
+        id: 'audio-id-cached',
+        expiresAt: '2023-12-31T23:59:59Z',
+        data: 'base64audiodatacached',
+        transcript: 'This is a cached audio response',
+        format: 'mp3',
+      });
+      expect(result.cached).toBe(false);
+
+      // Now test with cached response
+      const cachedResponse = {
+        ...mockAudioResponse,
+        cached: true,
+      };
+      mockFetchWithCache.mockResolvedValue(cachedResponse);
+
+      const cachedResult = await provider.callApi('Generate cached audio');
+
+      expect(mockFetchWithCache).toHaveBeenCalledTimes(2);
+      expect(cachedResult.output).toBe('This is a cached audio response');
+      expect(cachedResult.audio).toEqual({
+        id: 'audio-id-cached',
+        expiresAt: '2023-12-31T23:59:59Z',
+        data: 'base64audiodatacached',
+        transcript: 'This is a cached audio response',
+        format: 'mp3',
+      });
+      expect(cachedResult.cached).toBe(true);
+      // Cached responses don't count as new requests, so numRequests is not included
+      expect(cachedResult.tokenUsage).toEqual({ total: 20, cached: 20 });
+    });
+
+    it('should properly handle audio requested with response_format option', async () => {
+      // Setup provider with response_format that specifies audio
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+        config: {
+          response_format: { type: 'audio' } as any,
+        },
+      });
+
+      // Mock a non-audio response (model doesn't support audio format)
+      const mockTextResponse = createMockChatResponse('Model responded with text instead of audio');
+      mockFetchWithCache.mockResolvedValue(mockTextResponse);
+
+      // Call the API with audio format requested
+      const result = await provider.callApi('Generate audio please');
+
+      // Verify request sent with audio format
+      const call = mockFetchWithCache.mock.calls[0] as [string, { body: string }];
+      const requestBody = JSON.parse(call[1].body);
+      expect(requestBody.response_format).toEqual({ type: 'audio' });
+
+      // Verify result handled gracefully
+      expect(result.output).toBe('Model responded with text instead of audio');
+      expect(result.audio).toBeUndefined(); // No audio returned
+      expect(result.tokenUsage).toEqual({ total: 10, prompt: 5, completion: 5, numRequests: 1 });
+    });
+
+    it('should surface a normalised finishReason', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: { content: 'done' },
+            finish_reason: 'function_call', // This should be normalized to 'tool_calls'
+          },
+        ],
+        usage: { total_tokens: 3, prompt_tokens: 1, completion_tokens: 2 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('hi');
+
+      expect(result.finishReason).toBe('tool_calls'); // confirms adapter ran the normaliser
+    });
+
+    it('should handle case normalization in finishReason', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: { content: 'done' },
+            finish_reason: 'LENGTH', // Uppercase should be normalized to lowercase
+          },
+        ],
+        usage: { total_tokens: 3, prompt_tokens: 1, completion_tokens: 2 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('hi');
+
+      expect(result.finishReason).toBe('length'); // normalized to lowercase
+    });
+
+    it('should exclude finishReason when normalization returns undefined', async () => {
+      const mockResponse = createMockFetchResponse({
+        choices: [
+          {
+            message: { content: 'done' },
+            finish_reason: '', // Empty string should be excluded
+          },
+        ],
+        usage: { total_tokens: 3, prompt_tokens: 1, completion_tokens: 2 },
+      });
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      const result = await provider.callApi('hi');
+
+      expect(result.finishReason).toBeUndefined(); // Should be excluded when empty
+    });
+
+    it('should use generic error message with fallback when apiKeyEnvar is undefined', async () => {
+      // Clear any existing API key environment variables
+      const originalEnv = process.env.OPENAI_API_KEY;
+      mockProcessEnv({ OPENAI_API_KEY: undefined });
+
+      try {
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+
+        await expect(provider.callApi('Test prompt')).rejects.toThrow(
+          getOpenAiMissingApiKeyMessage(),
+        );
+      } finally {
+        // Restore original environment
+        if (originalEnv) {
+          mockProcessEnv({ OPENAI_API_KEY: originalEnv });
+        }
+      }
+    });
+
+    it('should use custom apiKeyEnvar in error message when provided', async () => {
+      // Clear any existing API key environment variables
+      const originalEnv = process.env.OPENAI_API_KEY;
+      const originalCustomEnv = process.env.CUSTOM_API_KEY;
+      mockProcessEnv({ OPENAI_API_KEY: undefined });
+      mockProcessEnv({ CUSTOM_API_KEY: undefined });
+
+      try {
+        const provider = new OpenAiChatCompletionProvider('gpt-4o-mini', {
+          config: { apiKeyEnvar: 'CUSTOM_API_KEY' },
+        });
+
+        await expect(provider.callApi('Test prompt')).rejects.toThrow(
+          getOpenAiMissingApiKeyMessage('CUSTOM_API_KEY'),
+        );
+      } finally {
+        // Restore original environment
+        if (originalEnv) {
+          mockProcessEnv({ OPENAI_API_KEY: originalEnv });
+        }
+        if (originalCustomEnv) {
+          mockProcessEnv({ CUSTOM_API_KEY: originalCustomEnv });
+        }
+      }
+    });
+
+    it('should demonstrate improved logging for inherited classes', async () => {
+      // Create a mock class that extends OpenAiChatCompletionProvider
+      class CustomProvider extends OpenAiChatCompletionProvider {
+        constructor(modelName: string) {
+          super(modelName, {
+            config: {
+              apiKeyEnvar: 'CUSTOM_PROVIDER_API_KEY',
+              apiBaseUrl: 'https://custom-api.example.com/v1',
+            },
+          });
+        }
+
+        getApiUrlDefault(): string {
+          return 'https://custom-api.example.com/v1';
+        }
+      }
+
+      // Clear environment variables
+      const originalEnv = process.env.OPENAI_API_KEY;
+      const originalCustomEnv = process.env.CUSTOM_PROVIDER_API_KEY;
+      mockProcessEnv({ OPENAI_API_KEY: undefined });
+      mockProcessEnv({ CUSTOM_PROVIDER_API_KEY: undefined });
+
+      try {
+        const provider = new CustomProvider('custom-model');
+
+        // Should show generic error message with custom API key variable
+        await expect(provider.callApi('Test prompt')).rejects.toThrow(
+          getOpenAiMissingApiKeyMessage('CUSTOM_PROVIDER_API_KEY'),
+        );
+
+        // Should log generic message for unknown model
+        expect(mockLogger.debug).toHaveBeenCalledWith('Using unknown chat model: custom-model');
+      } finally {
+        // Restore original environment
+        if (originalEnv) {
+          mockProcessEnv({ OPENAI_API_KEY: originalEnv });
+        }
+        if (originalCustomEnv) {
+          mockProcessEnv({ CUSTOM_PROVIDER_API_KEY: originalCustomEnv });
+        }
+      }
+    });
+
+    it('should work well with third-party providers that inherit from OpenAiChatCompletionProvider', async () => {
+      // Example similar to what providers like Anthropic or DeepSeek might do
+      class DeepSeekProvider extends OpenAiChatCompletionProvider {
+        constructor(modelName: string) {
+          super(modelName, {
+            config: {
+              apiKeyEnvar: 'DEEPSEEK_API_KEY',
+              apiBaseUrl: 'https://api.deepseek.com/v1',
+            },
+          });
+        }
+
+        getApiUrlDefault(): string {
+          return 'https://api.deepseek.com/v1';
+        }
+      }
+
+      const mockResponse = createMockChatResponse('DeepSeek response');
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new DeepSeekProvider('deepseek-chat');
+      const result = await provider.callApi('Test prompt');
+
+      expect(result.output).toBe('DeepSeek response');
+    });
+
+    it.each([
+      'should log generic API call message using getApiUrl',
+      'should log generic completions API response message',
+    ])('%s', async () => {
+      const mockResponse = createMockChatResponse();
+      mockFetchWithCache.mockResolvedValue(mockResponse);
+
+      const provider = new OpenAiChatCompletionProvider('gpt-4o-mini');
+      await provider.callApi('Test prompt');
+    });
+
+    it('should log generic message for unknown chat models', async () => {
+      new OpenAiChatCompletionProvider('unknown-model');
+
+      expect(mockLogger.debug).toHaveBeenCalledWith('Using unknown chat model: unknown-model');
+    });
+
+    it('should not log unknown model message for known OpenAI models', async () => {
+      new OpenAiChatCompletionProvider('gpt-4o-mini');
+
+      expect(mockLogger.debug).not.toHaveBeenCalledWith(expect.stringContaining('unknown'));
+    });
+
+    it('should support legacy model IDs', async () => {
+      // Test legacy GPT-4 models
+      const gpt4LegacyProvider = new OpenAiChatCompletionProvider('gpt-4-0314');
+      expect(gpt4LegacyProvider.modelName).toBe('gpt-4-0314');
+
+      const gpt4_32kProvider = new OpenAiChatCompletionProvider('gpt-4-32k-0314');
+      expect(gpt4_32kProvider.modelName).toBe('gpt-4-32k-0314');
+
+      const gpt4VisionProvider = new OpenAiChatCompletionProvider('gpt-4-vision-preview');
+      expect(gpt4VisionProvider.modelName).toBe('gpt-4-vision-preview');
+
+      // Test legacy GPT-3.5 models
+      const gpt35LegacyProvider = new OpenAiChatCompletionProvider('gpt-3.5-turbo-0301');
+      expect(gpt35LegacyProvider.modelName).toBe('gpt-3.5-turbo-0301');
+
+      const gpt35_16kProvider = new OpenAiChatCompletionProvider('gpt-3.5-turbo-16k');
+      expect(gpt35_16kProvider.modelName).toBe('gpt-3.5-turbo-16k');
+
+      // Test latest audio model
+      const audioModelProvider = new OpenAiChatCompletionProvider(
+        'gpt-4o-audio-preview-2025-06-03',
+      );
+      expect(audioModelProvider.modelName).toBe('gpt-4o-audio-preview-2025-06-03');
+    });
+
+    it('should work with apiKeyRequired: false and API key from environment', () => {
+      const originalEnv = process.env.CUSTOM_LOCAL_API_KEY;
+      mockProcessEnv({ CUSTOM_LOCAL_API_KEY: 'test-local-key' });
+
+      try {
+        const provider = new OpenAiChatCompletionProvider('local-model', {
+          config: {
+            apiKeyRequired: false,
+            apiKeyEnvar: 'CUSTOM_LOCAL_API_KEY',
+            apiBaseUrl: 'http://localhost:8080/v1',
+          },
+        });
+
+        // Provider should pick up API key from environment
+        expect(provider.getApiKey()).toBe('test-local-key');
+
+        // Provider should not require API key
+        expect(provider.requiresApiKey()).toBe(false);
+      } finally {
+        if (originalEnv === undefined) {
+          mockProcessEnv({ CUSTOM_LOCAL_API_KEY: undefined });
+        } else {
+          mockProcessEnv({ CUSTOM_LOCAL_API_KEY: originalEnv });
+        }
+      }
+    });
+
+    it('should work with apiKeyRequired: false and no API key', async () => {
+      // Ensure no API key is set in the environment
+      const originalCustomEnv = process.env.CUSTOM_LOCAL_API_KEY;
+      const originalOpenAIEnv = process.env.OPENAI_API_KEY;
+      mockProcessEnv({ CUSTOM_LOCAL_API_KEY: undefined });
+      mockProcessEnv({ OPENAI_API_KEY: undefined });
+
+      try {
+        const provider = new OpenAiChatCompletionProvider('local-model', {
+          config: {
+            apiKeyRequired: false,
+            apiKeyEnvar: 'CUSTOM_LOCAL_API_KEY',
+            apiBaseUrl: 'http://localhost:8080/v1',
+          },
+        });
+
+        // Provider should not have an API key
+        expect(provider.getApiKey()).toBeFalsy();
+
+        // Provider should not require API key
+        expect(provider.requiresApiKey()).toBe(false);
+
+        // Mock successful API response
+        const mockResponse = createMockChatResponse('Response without auth');
+        mockFetchWithCache.mockResolvedValue(mockResponse);
+
+        // Call the API
+        const result = await provider.callApi(
+          JSON.stringify([{ role: 'user', content: 'Test prompt' }]),
+        );
+
+        // Verify the call succeeded
+        expect(result.output).toBe('Response without auth');
+        expect(mockFetchWithCache).toHaveBeenCalledTimes(1);
+
+        // Verify that the Authorization header was NOT included (should not be "Bearer undefined")
+        const callArgs = mockFetchWithCache.mock.calls[0];
+        const headers = callArgs[1]?.headers as Record<string, string>;
+        expect(headers.Authorization).toBeUndefined();
+      } finally {
+        if (originalCustomEnv !== undefined) {
+          mockProcessEnv({ CUSTOM_LOCAL_API_KEY: originalCustomEnv });
+        }
+        if (originalOpenAIEnv !== undefined) {
+          mockProcessEnv({ OPENAI_API_KEY: originalOpenAIEnv });
+        }
+      }
+    });
+  });
+});

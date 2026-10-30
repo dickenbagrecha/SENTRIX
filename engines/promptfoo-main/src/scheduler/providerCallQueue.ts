@@ -1,0 +1,87 @@
+import { AsyncResource } from 'node:async_hooks';
+
+import { throwIfAborted } from './cancellation';
+
+export interface QueuedProviderCall<T> {
+  call: () => Promise<T>;
+  providerId: string;
+  reject: (error: unknown) => void;
+  resolve: (result: T) => void;
+}
+
+export interface ProviderCallQueue {
+  enqueue<T>(providerId: string, call: () => Promise<T>, abortSignal?: AbortSignal): Promise<T>;
+}
+
+export class ProviderGroupedCallQueue implements ProviderCallQueue {
+  private jobs: QueuedProviderCall<unknown>[] = [];
+  private waiters: (() => void)[] = [];
+
+  enqueue<T>(providerId: string, call: () => Promise<T>, abortSignal?: AbortSignal): Promise<T> {
+    const boundCall = AsyncResource.bind(call);
+    return new Promise<T>((resolve, reject) => {
+      throwIfAborted(abortSignal);
+      const onAbort = () => {
+        const index = this.jobs.indexOf(job);
+        if (index !== -1) {
+          this.jobs.splice(index, 1);
+        }
+        reject(abortSignal!.reason);
+      };
+      const job: QueuedProviderCall<unknown> = {
+        call: () => {
+          abortSignal?.removeEventListener('abort', onAbort);
+          throwIfAborted(abortSignal);
+          return boundCall();
+        },
+        providerId,
+        reject,
+        resolve: resolve as (result: unknown) => void,
+      };
+      this.jobs.push(job);
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+      this.notifyWaiters();
+    });
+  }
+
+  hasJobs(): boolean {
+    return this.jobs.length > 0;
+  }
+
+  takeNextGroup(preferredProviderId?: string): QueuedProviderCall<unknown>[] {
+    if (this.jobs.length === 0) {
+      return [];
+    }
+
+    const providerId =
+      preferredProviderId && this.jobs.some((job) => job.providerId === preferredProviderId)
+        ? preferredProviderId
+        : this.jobs[0].providerId;
+    const group = this.jobs.filter((job) => job.providerId === providerId);
+    this.jobs = this.jobs.filter((job) => job.providerId !== providerId);
+    return group;
+  }
+
+  waitForJob(): Promise<void> {
+    if (this.hasJobs()) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.waiters.push(resolve);
+    });
+  }
+
+  async run(job: QueuedProviderCall<unknown>): Promise<void> {
+    try {
+      job.resolve(await job.call());
+    } catch (error) {
+      job.reject(error);
+    }
+  }
+
+  private notifyWaiters() {
+    for (const waiter of this.waiters.splice(0)) {
+      waiter();
+    }
+  }
+}

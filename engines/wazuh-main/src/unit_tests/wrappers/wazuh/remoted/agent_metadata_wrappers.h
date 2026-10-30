@@ -1,0 +1,23 @@
+/*
+ * Wazuh Shared Configuration Manager
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef AGENT_METADATA_WRAPPERS_H
+#define AGENT_METADATA_WRAPPERS_H
+
+#include "../../../../remoted/src/agent_metadata_db.h"
+
+agent_meta_t*
+__wrap_agent_meta_from_agent_info(const char* id_str, const char* agent_name, const struct agent_info_data* ai);
+
+int __wrap_agent_meta_upsert_locked(const char* agent_id_str, agent_meta_t* fresh);
+
+int __wrap_agent_meta_snapshot_str(const char* agent_id_str, agent_meta_t* out);
+
+#endif // AGENT_METADATA_WRAPPERS_H

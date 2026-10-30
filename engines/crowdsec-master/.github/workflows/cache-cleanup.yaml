@@ -1,0 +1,21 @@
+# https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#managing-caches
+
+name: cleanup caches by a branch
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  actions: write # to delete the branch's Actions caches
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup
+        run: gh cache delete --all --ref "refs/pull/${PR_NUMBER}/merge" --succeed-on-no-caches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}

@@ -1,0 +1,483 @@
+/*
+ * Wazuh SysInfo
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+#include <algorithm>      // For std::min/std::max
+#include <regex>
+#include <sstream>        // For std::ostringstream
+#include <stdexcept>      // For std::runtime_error
+#include <string>         // For std::string and std::wstring
+#include <locale>         // For localization utilities (if needed for string conversion)
+#include <chrono>         // For the bounded WMI enumeration wait (issue #38370)
+
+// encodingWindowsHelper.h brings in winsock2.h, which has to precede the windows.h that
+// utilsWrapperWin.hpp's WMI headers pull in.
+#include "encodingWindowsHelper.h"
+#include "utilsWrapperWin.hpp"
+#include <shellapi.h>
+
+namespace
+{
+    // Releases a COM interface pointer (if non-null) when it goes out of scope, once,
+    // from whichever throw site or normal return exits the function that owns it.
+    // Centralizes the per-throw-site "if (p) p->Release();" pattern that would
+    // otherwise be duplicated at every early-exit point.
+    template <typename T>
+    class ComReleaseGuard
+    {
+        public:
+            explicit ComReleaseGuard(T*& ptr) : m_ptr(ptr) {}
+            ~ComReleaseGuard()
+            {
+                if (m_ptr)
+                {
+                    m_ptr->Release();
+                    m_ptr = nullptr;
+                }
+            }
+            ComReleaseGuard(const ComReleaseGuard&) = delete;
+            ComReleaseGuard& operator=(const ComReleaseGuard&) = delete;
+
+        private:
+            T*& m_ptr;
+    };
+}
+
+// Implement WMI functions
+HRESULT ComHelper::CreateWmiLocator(IWbemLocator*& pLoc)
+{
+    return CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
+}
+
+HRESULT ComHelper::ConnectToWmiServer(IWbemLocator* pLoc, IWbemServices*& pSvc, long maxWaitMs)
+{
+    // ConnectServer() has no timeout parameter of its own; WBEM_FLAG_CONNECT_USE_MAX_WAIT
+    // plus an IWbemContext __MAX_WAIT property is WMI's own documented mechanism for
+    // bounding it instead of blocking indefinitely on an unresponsive Winmgmt (#38370).
+    // Creating/configuring that context object is a COM/WMI registration concern
+    // unrelated to Winmgmt being hung; if it fails, fall back to the pre-existing
+    // unbounded ConnectServer() call instead of failing hotfix collection outright, so
+    // that this narrow COM failure mode doesn't become a hard new dependency.
+    IWbemContext* pCtx = NULL;
+    ComReleaseGuard<IWbemContext> ctxGuard(pCtx);
+
+    bool contextUsable = SUCCEEDED(CoCreateInstance(CLSID_WbemContext, 0, CLSCTX_INPROC_SERVER,
+                                                    IID_IWbemContext, (LPVOID*)&pCtx));
+
+    if (contextUsable)
+    {
+        _variant_t var(static_cast<long>(maxWaitMs));
+        contextUsable = SUCCEEDED(pCtx->SetValue(L"__MAX_WAIT", 0, &var));
+    }
+
+    const long connectFlags = contextUsable ? WBEM_FLAG_CONNECT_USE_MAX_WAIT : 0;
+    IWbemContext* const ctxArg = contextUsable ? pCtx : NULL;
+    return pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, NULL,
+                               connectFlags, NULL, ctxArg, &pSvc);
+}
+
+HRESULT ComHelper::SetProxyBlanket(IWbemServices* pSvc)
+{
+    return CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL,
+                             RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+}
+
+HRESULT ComHelper::ExecuteWmiQuery(IWbemServices* pSvc, IEnumWbemClassObject*& pEnumerator)
+{
+    return pSvc->ExecQuery(bstr_t("WQL"), bstr_t("SELECT * FROM Win32_QuickFixEngineering"),
+                           WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
+}
+
+// Implement Windows Update API functions
+HRESULT ComHelper::CreateUpdateSearcher(IUpdateSearcher*& pUpdateSearcher)
+{
+    return CoCreateInstance(CLSID_UpdateSearcher, NULL, CLSCTX_INPROC_SERVER, IID_IUpdateSearcher, (LPVOID*)&pUpdateSearcher);
+}
+
+HRESULT ComHelper::GetTotalHistoryCount(IUpdateSearcher* pUpdateSearcher, LONG& count)
+{
+    return pUpdateSearcher->GetTotalHistoryCount(&count);
+}
+
+HRESULT ComHelper::QueryHistory(IUpdateSearcher* pUpdateSearcher, IUpdateHistoryEntryCollection*& pHistory, LONG& count)
+{
+    return pUpdateSearcher->QueryHistory(0, count, &pHistory);
+}
+
+HRESULT ComHelper::GetCount(IUpdateHistoryEntryCollection* pHistory, LONG& count)
+{
+    return pHistory->get_Count(&count);
+}
+
+HRESULT ComHelper::GetItem(IUpdateHistoryEntryCollection* pHistory, LONG index, IUpdateHistoryEntry** pEntry)
+{
+    return pHistory->get_Item(index, pEntry);
+}
+
+HRESULT ComHelper::GetTitle(IUpdateHistoryEntry* pEntry, BSTR& title)
+{
+    return pEntry->get_Title(&title);
+}
+
+// This function provides a minimal implementation for converting C strings to BSTRs,
+// avoiding the need to include a full COM library. This can be useful when you only need this specific functionality
+// and want to minimize dependencies.
+namespace _com_util
+{
+    BSTR ConvertStringToBSTR(const char* str)
+    {
+        int len = MultiByteToWideChar(CP_ACP, 0, str, -1, NULL, 0);
+        BSTR bstr = SysAllocStringLen(0, len);
+        MultiByteToWideChar(CP_ACP, 0, str, -1, bstr, len);
+        return bstr;
+    }
+}
+
+// The BstrToString function takes a Windows-specific string (BSTR) and converts it into
+// a standard C++ string (std::string) that can be more easily used in the application.
+std::string BstrToString(BSTR bstr)
+{
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+    std::wstring wstr(bstr, SysStringLen(bstr));
+    return converter.to_bytes(wstr);
+}
+
+void QueryWMIHotFixesBounded(std::set<std::string>& hotfixSet, IComHelper& comHelper,
+                             long perCallTimeoutMs, long overallTimeoutMs, long connectMaxWaitMs)
+{
+    HRESULT hres;
+    IWbemLocator* pLoc = NULL;
+    IWbemServices* pSvc = NULL;
+    IEnumWbemClassObject* pEnumerator = NULL;
+    std::ostringstream oss;
+
+    // Declared in this order so their destructors run in reverse (enumerator, then
+    // service, then locator) at every throw site and at normal function exit alike.
+    ComReleaseGuard<IWbemLocator> locatorGuard(pLoc);
+    ComReleaseGuard<IWbemServices> serviceGuard(pSvc);
+    ComReleaseGuard<IEnumWbemClassObject> enumeratorGuard(pEnumerator);
+
+    hres = comHelper.CreateWmiLocator(pLoc);
+
+    if (FAILED(hres))
+    {
+        oss << "WMI: Error creating IWbemLocator. Code: " << std::hex << hres;
+        throw std::runtime_error(oss.str());
+    }
+
+    hres = comHelper.ConnectToWmiServer(pLoc, pSvc, connectMaxWaitMs);
+
+    if (FAILED(hres))
+    {
+        oss << "WMI: connection failed. Code: " << std::hex << hres;
+        throw std::runtime_error(oss.str());
+    }
+
+    hres = comHelper.SetProxyBlanket(pSvc);
+
+    if (FAILED(hres))
+    {
+        oss << "WMI: security error. Code: " << std::hex << hres;
+        throw std::runtime_error(oss.str());
+    }
+
+    hres = comHelper.ExecuteWmiQuery(pSvc, pEnumerator);
+
+    if (FAILED(hres))
+    {
+        oss << "WMI: query error. Code: " << std::hex << hres;
+        throw std::runtime_error(oss.str());
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(overallTimeoutMs);
+
+    while (pEnumerator)
+    {
+        // Re-checked every iteration (success or timeout) so a Winmgmt that keeps
+        // returning objects without ever finishing can't block forever either
+        // (see #38370: previously WBEM_INFINITE let this block forever).
+        const auto now = std::chrono::steady_clock::now();
+
+        if (now >= deadline)
+        {
+            oss << "WMI: hotfix enumeration did not respond within " << overallTimeoutMs
+                << " ms (Winmgmt unresponsive); aborting this cycle's hotfix collection.";
+            throw std::runtime_error(oss.str());
+        }
+
+        // Clamp the per-call wait to whatever time remains so a single Next() call
+        // can never push total elapsed time past overallTimeoutMs. The millisecond
+        // truncation in duration_cast can round remainingMs down to 0 even though
+        // now < deadline still holds; per WMI's docs, Next(0, ...) is a non-blocking
+        // poll rather than a wait, so clamp to at least 1 ms to keep this an actual wait.
+        const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const long callTimeoutMs = static_cast<long>(std::max<long long>(1, std::min<long long>(perCallTimeoutMs, remainingMs)));
+
+        // Declared fresh each iteration so a provider that fails without touching
+        // these out-params can't leave a stale, already-Release()'d pclsObj or a
+        // stale nonzero uReturn behind from the previous iteration.
+        IWbemClassObject* pclsObj = NULL;
+        ULONG uReturn = 0;
+        const HRESULT nextRes = pEnumerator->Next(callTimeoutMs, 1, &pclsObj, &uReturn);
+
+        if (nextRes == WBEM_S_TIMEDOUT)
+        {
+            // No object was ready within callTimeoutMs -- Winmgmt is slow, not
+            // necessarily done enumerating. Loop head re-checks the deadline.
+            continue;
+        }
+
+        if (FAILED(nextRes))
+        {
+            oss << "WMI: hotfix enumeration failed. Code: " << std::hex << nextRes;
+            throw std::runtime_error(oss.str());
+        }
+
+        if (0 == uReturn)
+        {
+            break;
+        }
+
+        VARIANT vtProp;
+        VariantInit(&vtProp);
+        HRESULT hr = pclsObj->Get(L"HotFixID", 0, &vtProp, 0, 0);
+
+        if (SUCCEEDED(hr) && vtProp.vt == VT_BSTR)
+        {
+            std::string hotfix = BstrToString(vtProp.bstrVal);
+
+            if (hotfixSet.find(hotfix) == hotfixSet.end())
+            {
+                // New HotFix found
+                hotfixSet.insert(hotfix);
+            }
+        }
+
+        VariantClear(&vtProp);
+        pclsObj->Release();
+    }
+
+    // pLoc/pSvc/pEnumerator are released automatically by their guards on scope exit,
+    // including the case where ExecuteWmiQuery reported success but left pEnumerator NULL.
+}
+
+void QueryWMIHotFixes(std::set<std::string>& hotfixSet, IComHelper& comHelper)
+{
+    QueryWMIHotFixesBounded(hotfixSet, comHelper, WMI_HOTFIX_NEXT_TIMEOUT_MS,
+                            WMI_HOTFIX_ENUM_OVERALL_TIMEOUT_MS, WMI_CONNECT_MAX_WAIT_MS);
+}
+
+ProcessCmdLine parseProcessCommandLine(const std::wstring& fullCmdLineW)
+{
+    ProcessCmdLine result;
+
+    if (fullCmdLineW.empty())
+    {
+        return result;
+    }
+
+    // Convert full command line from UTF-16 to UTF-8
+    const int utf8Size = WideCharToMultiByte(
+                             CP_UTF8, 0, fullCmdLineW.c_str(), static_cast<int>(fullCmdLineW.size()),
+                             nullptr, 0, nullptr, nullptr);
+
+    if (utf8Size > 0)
+    {
+        result.cmd.assign(static_cast<std::size_t>(utf8Size), '\0');
+        const int written = WideCharToMultiByte(
+                                CP_UTF8, 0, fullCmdLineW.c_str(), static_cast<int>(fullCmdLineW.size()),
+                                result.cmd.data(), utf8Size, nullptr, nullptr);
+
+        if (written > 0)
+        {
+            if (written < utf8Size)
+            {
+                result.cmd.resize(static_cast<std::size_t>(written));
+            }
+        }
+        else
+        {
+            result.cmd.clear();
+        }
+    }
+
+    // Parse arguments using CommandLineToArgvW for proper Windows command-line tokenization
+    int argc = 0;
+    const auto argv = CommandLineToArgvW(fullCmdLineW.c_str(), &argc);
+
+    if (argv && argc > 1)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            const int argSize = WideCharToMultiByte(
+                                    CP_UTF8, 0, argv[i], -1, nullptr, 0, nullptr, nullptr);
+
+            if (argSize > 0)
+            {
+                std::string arg(argSize, '\0');
+                const int convertedSize = WideCharToMultiByte(
+                                              CP_UTF8, 0, argv[i], -1, arg.data(), argSize, nullptr, nullptr);
+
+                // convertedSize includes the null terminator, so 1 is an empty argument (""),
+                // which is skipped like on Linux and macOS.
+                if (convertedSize > 1)
+                {
+                    arg.resize(static_cast<std::size_t>(convertedSize - 1));
+
+                    if (!result.argvs.empty())
+                    {
+                        result.argvs += " ";
+                    }
+
+                    result.argvs += arg;
+                    ++result.argsCount;
+                }
+            }
+        }
+    }
+
+    if (argv)
+    {
+        LocalFree(argv);
+    }
+
+    return result;
+}
+
+constexpr auto SYSTEM_IDLE_PROCESS_NAME {"System Idle Process"};
+constexpr auto SYSTEM_PROCESS_NAME {"System"};
+
+bool isSystemProcess(const DWORD pid)
+{
+    return pid == 0 || pid == 4;
+}
+
+static std::string processName(const PROCESSENTRY32& processEntry)
+{
+    std::string ret;
+    const DWORD pId { processEntry.th32ProcessID };
+
+    if (isSystemProcess(pId))
+    {
+        ret = (pId == 0) ? SYSTEM_IDLE_PROCESS_NAME : SYSTEM_PROCESS_NAME;
+    }
+    else
+    {
+        ret = processEntry.szExeFile;
+    }
+
+    return ret;
+}
+
+nlohmann::json buildProcessSnapshotRecord(const PROCESSENTRY32& processEntry)
+{
+    // Assigned from json::object(): a braced or empty-brace initialiser would give an array
+    // or a null, and update() rejects both.
+    auto jsProcessInfo = nlohmann::json::object();
+    const DWORD pId { processEntry.th32ProcessID };
+
+    jsProcessInfo["name"] = Utils::EncodingWindowsHelper::stringAnsiToStringUTF8(processName(processEntry));
+    jsProcessInfo["pid"]  = std::to_string(pId);
+
+    // The snapshot reports pid 0 as its own parent; emitting that would leave a self-referential
+    // edge that loops any parent-child walk of the inventory.
+    if (0 != pId)
+    {
+        jsProcessInfo["parent_pid"] = processEntry.th32ParentProcessID;
+    }
+
+    return jsProcessInfo;
+}
+
+nlohmann::json buildProcessRecord(const PROCESSENTRY32& processEntry, const nlohmann::json& handleFields)
+{
+    // Copy-initialised: nlohmann::json jsProcessInfo { ... } would select the initializer_list
+    // constructor and wrap the record in an array.
+    auto jsProcessInfo = buildProcessSnapshotRecord(processEntry);
+
+    // A default-constructed nlohmann::json is a null, which update() rejects. Having no
+    // handle-derived fields is the ordinary outcome here, not an error.
+    if (!handleFields.is_null())
+    {
+        jsProcessInfo.update(handleFields);
+    }
+
+    return jsProcessInfo;
+}
+
+void QueryWUHotFixes(std::set<std::string>& hotfixSet, IComHelper& comHelper)
+{
+    HRESULT hres;
+    IUpdateSearcher* pUpdateSearcher = NULL;
+    IUpdateHistoryEntryCollection* pHistory = NULL;
+    static const std::regex hotfixRegex("KB[0-9]+");
+    std::ostringstream oss;
+
+    hres = comHelper.CreateUpdateSearcher(pUpdateSearcher);
+
+    if (FAILED(hres))
+    {
+        oss << "WUA: UpdateSearcher error. Code: " << std::hex << hres;
+        throw std::runtime_error(oss.str());
+    }
+
+    LONG count;
+    hres = comHelper.GetTotalHistoryCount(pUpdateSearcher, count);
+
+    if (FAILED(hres))
+    {
+        if (pUpdateSearcher) pUpdateSearcher->Release();
+
+        oss << "WUA: Error getting total update history count. Code: 0x" << std::hex << hres;
+        throw std::runtime_error(oss.str());
+    }
+
+    hres = comHelper.QueryHistory(pUpdateSearcher, pHistory, count);
+
+    if (FAILED(hres))
+    {
+        if (pUpdateSearcher) pUpdateSearcher->Release();
+
+        oss << "WUA: Error querying update history. Code: 0x" << std::hex << hres;
+        throw std::runtime_error(oss.str());
+    }
+
+    LONG historyCount;
+    comHelper.GetCount(pHistory, historyCount);
+
+    for (LONG i = 0; i < historyCount; ++i)
+    {
+        IUpdateHistoryEntry* pEntry = NULL;
+        comHelper.GetItem(pHistory, i, &pEntry);
+        BSTR title;
+        comHelper.GetTitle(pEntry, title);
+        std::string titleStr = BstrToString(title);
+
+        std::smatch match;
+
+        if (std::regex_search(titleStr, match, hotfixRegex))
+        {
+            std::string hotfix = match[0];
+
+            if (hotfixSet.find(hotfix) == hotfixSet.end())
+            {
+                // New HotFix found
+                hotfixSet.insert(hotfix);
+            }
+        }
+
+        if (pEntry) pEntry->Release();
+
+        SysFreeString(title);
+    }
+
+    if (pHistory) pHistory->Release();
+
+    if (pUpdateSearcher) pUpdateSearcher->Release();
+}

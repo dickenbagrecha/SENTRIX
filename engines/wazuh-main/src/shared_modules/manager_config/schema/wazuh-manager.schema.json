@@ -1,0 +1,719 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "id": "wazuh-manager.schema.json",
+  "title": "Wazuh manager configuration (/etc/wazuh-manager/wazuh-manager.conf)",
+  "description": "Single source of truth for the manager configuration: types, ranges, defaults and documentation of every option. Consumed by the manager_config C++ module (embedded) and by the Python framework (installed copy).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "cluster",
+    "indexer"
+  ],
+  "definitions": {
+    "boolean": {
+      "type": "boolean"
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "duration": {
+      "description": "Seconds as an integer, or a string with a unit suffix: s, m, h, d, w (same grammar as w_parse_time).",
+      "type": [
+        "integer",
+        "string"
+      ],
+      "minimum": 0,
+      "pattern": "^[0-9]+[smhdw]?$"
+    },
+    "duration_nonzero": {
+      "description": "A duration (same grammar as duration) that must be at least 1 second: zero, in any unit, is rejected.",
+      "type": [
+        "integer",
+        "string"
+      ],
+      "minimum": 1,
+      "pattern": "^0*[1-9][0-9]*[smhdw]?$"
+    },
+    "duration_no_weeks": {
+      "description": "Seconds as an integer, or a string with a unit suffix: s, m, h, d (authd get_time_interval grammar).",
+      "type": [
+        "integer",
+        "string"
+      ],
+      "minimum": 0,
+      "pattern": "^[0-9]+[smhd]?$"
+    },
+    "duration_no_weeks_nonzero": {
+      "description": "A duration (same grammar as duration_no_weeks) that must be at least 1 second: zero, in any unit, is rejected.",
+      "type": [
+        "integer",
+        "string"
+      ],
+      "minimum": 1,
+      "pattern": "^0*[1-9][0-9]*[smhd]?$"
+    },
+    "size": {
+      "description": "Bytes as an integer, or a string with a unit suffix: B, K, M, G (w_parse_size grammar, case-insensitive).",
+      "type": [
+        "integer",
+        "string"
+      ],
+      "minimum": 1,
+      "pattern": "^[0-9]+[bBkKmMgG]?$"
+    },
+    "path": {
+      "description": "File path, absolute or relative to the manager home.",
+      "type": "string"
+    },
+    "ip": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tls13_ciphers": {
+      "description": "Colon-separated TLS 1.3 cipher suites, each one of TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_CCM_SHA256, TLS_AES_128_CCM_8_SHA256 (the suites remoted and authd accept).",
+      "type": "string",
+      "pattern": "^(TLS_AES_128_GCM_SHA256|TLS_AES_256_GCM_SHA384|TLS_CHACHA20_POLY1305_SHA256|TLS_AES_128_CCM_SHA256|TLS_AES_128_CCM_8_SHA256)(:(TLS_AES_128_GCM_SHA256|TLS_AES_256_GCM_SHA384|TLS_CHACHA20_POLY1305_SHA256|TLS_AES_128_CCM_SHA256|TLS_AES_128_CCM_8_SHA256))*$"
+    }
+  },
+  "properties": {
+    "global": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Options shared by remoted and the task manager's disconnection sweep.",
+      "properties": {
+        "agents_disconnection_time": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration_nonzero"
+            }
+          ],
+          "default": "15m",
+          "description": "Time without keep-alives after which an agent is marked disconnected (minimum 1 second; 0 is rejected)."
+        }
+      }
+    },
+    "logging": {
+      "description": "Where and how the manager daemons write their own log: plain (logs/wazuh-manager.log) and/or json (logs/wazuh-manager.json).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "log_format": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "plain",
+              "json"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "default": [
+            "plain"
+          ],
+          "description": "Formats of the manager log: plain (logs/wazuh-manager.log), json (logs/wazuh-manager.json) or both."
+        }
+      }
+    },
+    "remote": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "wazuh-manager-remoted listeners.",
+      "properties": {
+        "legacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Classic TCP/UDP agent listener. Absent block = disabled; present block = enabled unless 'enabled: false'.",
+          "default": {
+            "enabled": false
+          },
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Start the legacy listener."
+            },
+            "ca_delivery": {
+              "type": "boolean",
+              "default": true,
+              "description": "Send the manager's CA certificate to a pre-v5.0.0 agent over the WPK transfer channel during a remote upgrade, so the upgraded agent has a trust anchor. Disable when a corporate PKI or a configuration-management tool distributes the anchor instead."
+            },
+            "port": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/port"
+                }
+              ],
+              "default": 1514,
+              "description": "Listening port."
+            },
+            "protocol": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "tcp",
+                  "udp"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "default": [
+                "tcp"
+              ],
+              "description": "Transport protocols to listen on."
+            },
+            "ipv6": {
+              "type": "boolean",
+              "default": false,
+              "description": "Listen on IPv6."
+            },
+            "local_ip": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ip"
+                }
+              ],
+              "description": "Bind address. Absent: 0.0.0.0, or every IPv6 interface (::) when ipv6 is enabled; remoted applies that default, not the schema."
+            },
+            "queue_size": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 131072,
+              "description": "Event queue size (events). Values above 262144 are accepted with a warning."
+            },
+            "rids_closing_time": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/duration"
+                }
+              ],
+              "default": "5m",
+              "description": "Idle time before a RIDS counter file is closed."
+            },
+            "connection_overtake_time": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3600,
+              "default": 60,
+              "description": "Seconds before an agent may take over an existing connection."
+            }
+          }
+        },
+        "https": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "HTTPS agent listener served by remoted_module.",
+          "properties": {
+            "port": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/port"
+                }
+              ],
+              "default": 1517,
+              "description": "Listening port."
+            },
+            "bind_addr": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ip"
+                }
+              ],
+              "default": "0.0.0.0",
+              "description": "Bind address (IPv4 or IPv6)."
+            },
+            "global_prefix": {
+              "type": "string",
+              "pattern": "^/([A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]*$",
+              "default": "/wazuh-manager/",
+              "description": "Path prefix of every HTTPS route. Must start with '/', may only contain A-Z a-z 0-9 . _ ~ - and '/', no empty, '.' or '..' segments."
+            },
+            "certificate": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/path"
+                }
+              ],
+              "default": "/etc/wazuh-manager/certs/remoted.pem",
+              "description": "Server certificate (PEM). Absolute path directly inside /etc/wazuh-manager/certs: the credential check of wazuh-manager-control start refuses any other location, a relative path included."
+            },
+            "key": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/path"
+                }
+              ],
+              "default": "/etc/wazuh-manager/certs/remoted-key.pem",
+              "description": "Server private key (PEM). Must be set together with 'certificate'. Absolute path directly inside /etc/wazuh-manager/certs: the credential check of wazuh-manager-control start refuses any other location, a relative path included."
+            },
+            "ca": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/path"
+                }
+              ],
+              "default": "",
+              "description": "CA bundle used to verify agent certificates. Empty = client certificate verification disabled, unless 'verification_mode' is set explicitly, in which case /etc/wazuh-manager/certs/root-ca.pem is used."
+            },
+            "ca_certificate": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/path"
+                }
+              ],
+              "minLength": 1,
+              "default": "/etc/wazuh-manager/certs/root-ca.pem",
+              "description": "CA certificate that signs the listener certificate; served on GET /cacerts and pinned by enrollment tokens. Not the client-verification CA ('ca'). Absolute path directly inside /etc/wazuh-manager/certs: the credential check of wazuh-manager-control start refuses any other location, a relative path included."
+            },
+            "verification_mode": {
+              "enum": [
+                "none",
+                "certificate",
+                "full"
+              ],
+              "description": "Agent certificate verification. Absent: 'certificate' when 'ca' is set, 'none' otherwise."
+            },
+            "ciphers": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/tls13_ciphers"
+                }
+              ],
+              "default": "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
+              "description": "TLS 1.3 cipher suites the HTTPS listener negotiates."
+            },
+            "max_body_size": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/size"
+                }
+              ],
+              "default": "10M",
+              "description": "Maximum HTTP request body the transport accepts; a larger request is dropped without a response. Keep it above remoted.auth_max_body_size (internal option, 5 MiB by default)."
+            },
+            "dual_stack": {
+              "type": "boolean",
+              "default": false,
+              "description": "Accept IPv4 clients on an IPv6 bind address (clears IPV6_V6ONLY). Only applies when bind_addr is an IPv6 address; 'no' keeps the socket IPv6-only."
+            },
+            "enroll_rate_limit": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100000,
+              "default": 100,
+              "description": "Sustained POST /enroll requests per second this manager forwards to authd, counted for the node as a whole and not per agent. 0 disables the limit. Applied after the credential check, so a request that fails it never spends it (a verified enrollment also after its body checks), and kept as two buckets of this rate: one for enrollments whose password or enrollment token (with uses left) was verified, one for re-enrollments, enrollments without a credential and enrollment tokens with no uses left. Requests over it get 429 without reaching authd. Short bursts are absorbed: each bucket may serve twice this value back to back before the rate paces it."
+            },
+            "cacerts_rate_limit": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100000,
+              "default": 50,
+              "description": "Sustained GET /cacerts requests per second this manager serves, counted for the endpoint as a whole and not per agent. 0 disables the limit. Requests over it get 429. Short bursts are absorbed: the endpoint may serve twice this value back to back before the rate paces it."
+            }
+          }
+        },
+        "agents": {
+          "description": "Agent version policy of the connection handlers.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allow_higher_versions": {
+              "type": "boolean",
+              "default": false,
+              "description": "Accept agents whose version is higher than the manager's."
+            }
+          }
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "wazuh-manager-authd enrollment service (also read by remoted for HTTPS enrollment).",
+      "properties": {
+        "disabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Do not start authd."
+        },
+        "port": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/port"
+            }
+          ],
+          "default": 1515,
+          "description": "Enrollment listening port. Bound only while legacy enrollment is active (authd enabled, remote_enrollment and legacy_enrollment, which follows remote.legacy.enabled when unset); only then does it count against the other listener ports."
+        },
+        "ipv6": {
+          "type": "boolean",
+          "default": false,
+          "description": "Listen on IPv6."
+        },
+        "use_source_ip": {
+          "type": "boolean",
+          "default": false,
+          "description": "Register the agent with its source IP instead of 'any'."
+        },
+        "force": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Re-enrollment policy for agents that already exist.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Allow forced re-enrollment."
+            },
+            "key_mismatch": {
+              "type": "boolean",
+              "default": true,
+              "description": "Force when the agent key does not match."
+            },
+            "disconnected_time": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Force when the existing agent has been disconnected longer than 'value'.",
+              "properties": {
+                "enabled": {
+                  "description": "Whether the disconnection time is checked before forcing the re-enrollment.",
+                  "type": "boolean",
+                  "default": true
+                },
+                "value": {
+                  "description": "Minimum time the existing agent must have been disconnected.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/duration_no_weeks"
+                    }
+                  ],
+                  "default": "1h"
+                }
+              }
+            },
+            "after_registration_time": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/duration_no_weeks"
+                }
+              ],
+              "default": "1h",
+              "description": "Do not force within this time after the previous registration."
+            }
+          }
+        },
+        "purge": {
+          "type": "boolean",
+          "default": false,
+          "description": "Purge removed agents from the key store."
+        },
+        "use_password": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require the shared password (/etc/wazuh-manager/authd.pass)."
+        },
+        "ciphers": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/tls13_ciphers"
+            }
+          ],
+          "default": "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
+          "description": "TLS 1.3 cipher suites accepted for enrollment."
+        },
+        "ssl_agent_ca": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/path"
+            }
+          ],
+          "default": "",
+          "description": "CA used to verify agent certificates during enrollment. Empty = disabled."
+        },
+        "ssl_verify_host": {
+          "type": "boolean",
+          "default": false,
+          "description": "Verify the agent certificate host name."
+        },
+        "ssl_manager_cert": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/path"
+            }
+          ],
+          "default": "/etc/wazuh-manager/certs/remoted.pem",
+          "description": "Manager certificate (PEM). Absolute path directly inside /etc/wazuh-manager/certs (checked unless auth.disabled): the credential check of wazuh-manager-control start refuses any other location, a relative path included."
+        },
+        "ssl_manager_key": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/path"
+            }
+          ],
+          "default": "/etc/wazuh-manager/certs/remoted-key.pem",
+          "description": "Manager private key (PEM). Absolute path directly inside /etc/wazuh-manager/certs (checked unless auth.disabled): the credential check of wazuh-manager-control start refuses any other location, a relative path included."
+        },
+        "remote_enrollment": {
+          "type": "boolean",
+          "default": true,
+          "description": "Accept enrollment through the HTTPS listener."
+        },
+        "legacy_enrollment": {
+          "type": "boolean",
+          "description": "Accept enrollment through the legacy TLS port (1515), used only by 4.x agents. No default of its own: when absent it follows remote.legacy.enabled, so a configuration without the remote.legacy block has no legacy enrollment either. An explicit value always wins."
+        },
+        "agents": {
+          "description": "Agent version policy of the enrollment service.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allow_higher_versions": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enroll agents whose version is higher than the manager's."
+            }
+          }
+        }
+      }
+    },
+    "wdb": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "wazuh-manager-db.",
+      "properties": {
+        "backup": {
+          "description": "Periodic backups of the wazuh-db databases (backup/db/).",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "global": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Periodic backup of the global database.",
+              "properties": {
+                "enabled": {
+                  "description": "Whether the global database is backed up periodically.",
+                  "type": "boolean",
+                  "default": true
+                },
+                "interval": {
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/duration_nonzero"
+                    }
+                  ],
+                  "default": "1d",
+                  "description": "Time between backups (minimum 1 second; 0 is rejected)."
+                },
+                "max_files": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "default": 3,
+                  "description": "Backups kept on disk."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "vulnerability-detection": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Vulnerability scanner module (modulesd).",
+      "properties": {
+        "enabled": {
+          "description": "Whether the vulnerability scanner module runs.",
+          "type": "boolean",
+          "default": true
+        },
+        "feed-update-interval": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/duration_no_weeks_nonzero"
+            }
+          ],
+          "default": "60m",
+          "description": "Time between CTI feed updates (minimum 1 second; 0 is rejected)."
+        },
+        "pageSize": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 100,
+          "description": "Indexer page size used by the scanner."
+        },
+        "numSlices": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 2,
+          "description": "Parallel indexer slices."
+        }
+      }
+    },
+    "indexer": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Wazuh indexer connection shared by modulesd, the engine and the cluster. Mandatory: wazuh-manager-analysisd cannot start without at least one host.",
+      "properties": {
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^https?://"
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Indexer URLs (scheme://host:port)."
+        },
+        "ssl": {
+          "description": "TLS material of the indexer connection. Every path must be absolute and directly inside /etc/wazuh-manager/certs: the credential check of wazuh-manager-control start refuses any other location, a relative path included.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "certificate_authorities": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/path"
+              },
+              "default": [],
+              "description": "CA bundles (PEM)."
+            },
+            "certificate": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/path"
+                }
+              ],
+              "default": "",
+              "description": "Client certificate (PEM). Empty = no client certificate."
+            },
+            "key": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/path"
+                }
+              ],
+              "default": "",
+              "description": "Client private key (PEM)."
+            }
+          }
+        }
+      },
+      "required": [
+        "hosts"
+      ]
+    },
+    "task-manager": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Task manager module. Also serves remote agent upgrades.",
+      "properties": {
+        "task_ttl": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3600,
+          "description": "Seconds a pending agent task may wait, from its creation, before it is expired. Manager tasks never expire."
+        },
+        "cleanup_interval": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Seconds between cleanup passes."
+        },
+        "max_payload_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1048576,
+          "description": "Maximum task payload."
+        },
+        "max_tasks_per_poll": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 100,
+          "description": "Tasks handed out per poll."
+        },
+        "upgrade_enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the manager serves remote agent upgrades (WPK upgrades requested through the API)."
+        },
+        "wpk_repository": {
+          "type": "string",
+          "minLength": 1,
+          "description": "WPK repository (host/path). A value with an http:// or https:// scheme is kept as given; without one, https:// (or http:// when the upgrade asks for it) is prepended. No default: left unset, the repository is picked from the target agent version."
+        }
+      }
+    },
+    "cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key"],
+      "description": "Cluster identity and transport (wazuh-manager-clusterd; name/node_name/node_type also read by the C daemons and the engine). Mandatory: every manager is a cluster node, and cluster.key has no usable default.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "default": "wazuh",
+          "description": "Cluster name."
+        },
+        "node_name": {
+          "type": "string",
+          "minLength": 1,
+          "default": "node01",
+          "description": "This node's name."
+        },
+        "node_type": {
+          "description": "Role of this node in the cluster.",
+          "enum": [
+            "master",
+            "worker"
+          ],
+          "default": "master"
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{32}$",
+          "description": "32-character shared key; the installer generates a random one."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1025,
+          "maximum": 65534,
+          "default": 1516,
+          "description": "Cluster port."
+        },
+        "bind_addr": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ip"
+            }
+          ],
+          "default": "127.0.0.1",
+          "description": "Address the master listens on for worker connections. Ignored on workers."
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "default": [
+            "127.0.0.1"
+          ],
+          "description": "Master node address(es)."
+        },
+        "hidden": {
+          "type": "boolean",
+          "default": false,
+          "description": "Hide this node in cluster listings. Currently read by no component: setting it has no effect."
+        }
+      }
+    }
+  }
+}

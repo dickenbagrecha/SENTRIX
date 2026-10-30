@@ -1,0 +1,85 @@
+# Copyright (C) Wazuh Inc.
+#
+# This program is free software; you can redistribute it
+# and/or modify it under the terms of the GNU General Public
+# License (version 2) as published by the FSF - Free Software
+# Foundation.
+
+# Generate wmodules library
+file(GLOB_RECURSE wmodules_files
+    ${SRC_FOLDER}/build/wazuh_modules/CMakeFiles/wazuh_modulesd_lib.dir/src/*.c.o)
+list(REMOVE_ITEM wmodules_files ${SRC_FOLDER}/build/wazuh_modules/CMakeFiles/wazuh_modulesd_lib.dir/src/main.c.o)
+
+add_library(WMODULES_O STATIC ${wmodules_files})
+
+set_source_files_properties(
+    ${wmodules_files}
+    PROPERTIES
+    EXTERNAL_OBJECT true
+    GENERATED true
+)
+
+set_target_properties(
+    WMODULES_O
+    PROPERTIES
+    LINKER_LANGUAGE C
+)
+
+target_link_libraries(WMODULES_O ${WAZUHLIB} ${WAZUHEXT} -lpthread)
+
+#include wrappers
+include(${SRC_FOLDER}/unit_tests/wrappers/wazuh/shared/shared.cmake)
+
+# Generate wmodules tests
+list(APPEND wmodules_names "test_wmodules")
+list(APPEND wmodules_flags "-Wl,--wrap,w_query_agentd -Wl,--wrap,_merror -Wl,--wrap,_mdebug1 \
+                            -Wl,--wrap,OS_ConnectUnixDomain")
+
+list(APPEND wmodules_names "test_wmcom")
+list(APPEND wmodules_flags "-Wl,--wrap,getModulesConfig -Wl,--wrap,getModulesInternalOptions \
+                            -Wl,--wrap,w_query_agentd -Wl,--wrap,_merror -Wl,--wrap,_mdebug1")
+
+# wm_handler() lives in main.c, which WMODULES_O leaves out: the test includes it.
+if(${TARGET} STREQUAL "agent")
+    list(APPEND wmodules_names "test_wm_main")
+    list(APPEND wmodules_flags "-Wl,--wrap,sleep -Wl,--wrap,exit")
+endif()
+
+# The listener loop, in its own binary so that wrapping close and accept does not reach the
+# other wmcom tests.
+list(APPEND wmodules_names "test_wmcom_main")
+list(APPEND wmodules_flags "-Wl,--wrap,close -Wl,--wrap,accept -Wl,--wrap,wm_select_interruptible \
+                            -Wl,--wrap,OS_BindUnixDomainWithPerms -Wl,--wrap,OS_SetRecvTimeout \
+                            -Wl,--wrap,OS_SetSendTimeout -Wl,--wrap,OS_RecvSecureTCP -Wl,--wrap,OS_SendSecureTCP \
+                            -Wl,--wrap,w_query_agentd -Wl,--wrap,_merror -Wl,--wrap,_mwarn -Wl,--wrap,_mdebug1")
+
+# Compilig tests
+list(LENGTH wmodules_names count)
+math(EXPR count "${count} - 1")
+foreach(counter RANGE ${count})
+    list(GET wmodules_names ${counter} test_name)
+    list(GET wmodules_flags ${counter} test_flags)
+
+    add_executable(${test_name} ${test_name}.c)
+
+    target_link_libraries(
+        ${test_name}
+        ${WAZUHLIB}
+        ${WAZUHEXT}
+        WMODULES_O
+        ${TEST_DEPS}
+    )
+
+    if(NOT test_flags STREQUAL " ")
+        target_link_libraries(
+            ${test_name}
+            ${test_flags}
+        )
+    endif()
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
+
+if(TARGET test_wm_main)
+    # main.c has to be built as CLIENT, like the agent's WMODULES_O objects.
+    target_compile_definitions(test_wm_main PRIVATE CLIENT)
+endif()

@@ -1,0 +1,21 @@
+/*
+ * Wazuh Shared Configuration Manager
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef REM_QUEUE_WRAPPERS_H
+#define REM_QUEUE_WRAPPERS_H
+
+#include <stddef.h>
+
+size_t __wrap_rem_get_input_bytes_used();
+size_t __wrap_rem_get_input_max_bytes();
+
+int __wrap_rem_msgpush(const char * buffer, unsigned long size, struct sockaddr_storage * addr, int sock);
+
+#endif /* REM_QUEUE_WRAPPERS_H */

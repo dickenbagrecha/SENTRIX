@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: GPL-2.0-only OR AGPL-3.0-or-later
+#include "contentIndexerAdapters.hpp"
+#include "contentLogging.hpp"
+#include "contentRegister.hpp"
+#include "contentSink.hpp"
+#include "contentTypes.hpp"
+#include "indexerConnector.hpp"
+#include "loggerHelper.h"
+#include <chrono>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdio>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <string>
+#include <thread>
+
+/*
+ * Test tool for the Content Manager.
+ *
+ * Registers one topic against a live Wazuh Indexer, lets the library's driver thread run a cycle,
+ * then requests one more through the same call a host's HTTP route makes. The sink below only prints what it is given,
+ * which makes this the shortest way to see the exact shape of the delivery contract.
+ */
+static const std::string TOPIC_NAME {"test"};
+
+/// The registration, built the way a host builds one (D2).
+static content_manager::TopicSpec topicSpec()
+{
+    content_manager::TopicSpec spec;
+    spec.schedule.intervalSeconds = 30;
+    spec.source.indices = {".wazuh-threatintel-vulnerabilities"};
+    spec.readiness = content_manager::Readiness {".wazuh-cti-consumers", "cti:catalog:consumer:vulnerabilities"};
+    spec.detection = content_manager::CursorDetection {};
+    spec.state.databasePath = "/tmp/content_updater/rocksdb";
+    return spec;
+}
+
+// The connector the tool builds, as a host does: the library never opens one of its own (D1). The
+// credentials come from the keystore (`queue/keystore` under the working directory).
+static const nlohmann::json INDEXER_CONNECTION =
+    R"(
+        {
+            "hosts": ["https://localhost:9200"]
+        }
+        )"_json;
+
+// Enable/Disable logging verbosity.
+static const auto VERBOSE {true};
+
+// Enable/Disable the forced full reload on the requested cycle.
+static const auto FORCE_FULL_RELOAD {false};
+
+/**
+ * @brief Log function callback used on the Content Manager test tool.
+ *
+ * @param logLevel Log level.
+ * @param tag Log tag.
+ * @param file File from where the logger is called.
+ * @param line Line from where the logger is called.
+ * @param func Function from where the logger is called.
+ * @param message Message to log.
+ * @param args Message arguments.
+ */
+void logFunction(const int logLevel,
+                 const char* tag,
+                 const char* file,
+                 const int line,
+                 const char* func,
+                 const char* message,
+                 va_list args)
+{
+    auto pos {std::string(file).find_last_of('/')};
+    if (pos != std::string::npos)
+    {
+        pos++;
+    }
+    const auto fileName {std::string(file).substr(pos, std::string(file).size() - pos)};
+
+    // Set log level tag.
+    static const std::map<int, std::string> LOG_LEVEL_TAGS {{Log::LOGLEVEL_DEBUG_VERBOSE, "DEBUG_VERBOSE"},
+                                                            {Log::LOGLEVEL_DEBUG, "DEBUG"},
+                                                            {Log::LOGLEVEL_INFO, "INFO"},
+                                                            {Log::LOGLEVEL_WARNING, "WARNING"},
+                                                            {Log::LOGLEVEL_ERROR, "ERROR"},
+                                                            {Log::LOGLEVEL_CRITICAL, "CRITICAL"}};
+    const auto levelTag {"[" + LOG_LEVEL_TAGS.at(logLevel) + "]"};
+
+    constexpr std::size_t LOG_BUFFER_SIZE {65536};
+    char formattedStr[LOG_BUFFER_SIZE] = {0};
+    vsnprintf(formattedStr, LOG_BUFFER_SIZE, message, args);
+
+    if (logLevel == Log::LOGLEVEL_ERROR || logLevel == Log::LOGLEVEL_CRITICAL)
+    {
+        // Error logs.
+        std::cerr << tag << ":" << levelTag << ": " << formattedStr << std::endl;
+    }
+    else if (logLevel == Log::LOGLEVEL_INFO || logLevel == Log::LOGLEVEL_WARNING)
+    {
+        // Info and warning logs.
+        std::cout << tag << ":" << levelTag << ": " << formattedStr << std::endl;
+    }
+    else
+    {
+        // Debug logs.
+        if (VERBOSE)
+        {
+            std::cout << tag << ":" << levelTag << ":" << fileName << ":" << line << " " << func << ": " << formattedStr
+                      << std::endl;
+        }
+    }
+}
+
+namespace Log
+{
+    std::function<void(const int, const char*, const char*, const int, const char*, const char*, va_list)>
+        GLOBAL_LOG_FUNCTION;
+}; // namespace Log
+
+/**
+ * @brief A sink that accepts everything and prints what it was given.
+ */
+class PrintingSink final : public content_manager::IContentSink
+{
+public:
+    content_manager::SessionDecision beginSession(const content_manager::SessionInfo& info) noexcept override
+    {
+        std::cout << "beginSession topic=" << info.topic << " kind=" << static_cast<int>(info.kind) << " remoteToken='"
+                  << info.remoteToken << "'" << std::endl;
+        return content_manager::SessionDecision::Proceed;
+    }
+
+    content_manager::PageAck acceptPage(const content_manager::ContentPage& page) noexcept override
+    {
+        std::cout << "acceptPage hits=" << (page.hits != nullptr ? page.hits->size() : 0) << " token='"
+                  << page.pageToken << "'" << std::endl;
+        return content_manager::PageAck {content_manager::PageStatus::Durable, {}};
+    }
+
+    content_manager::CommitResult commit(const content_manager::CommitInfo& info) noexcept override
+    {
+        std::cout << "commit topic=" << info.topic << " documents=" << info.documentsDelivered << " finalToken='"
+                  << info.finalToken << "'" << std::endl;
+        return content_manager::CommitResult {content_manager::CommitStatus::Committed, {}};
+    }
+
+    void abort(content_manager::AbortReason reason, const std::string& detail) noexcept override
+    {
+        std::cout << "abort reason=" << static_cast<int>(reason) << " detail=" << detail << std::endl;
+    }
+
+    void cycleFinished(const content_manager::CycleOutcome& outcome) noexcept override
+    {
+        std::cout << "cycleFinished status=" << static_cast<int>(outcome.status) << " token='" << outcome.token
+                  << "' detail=" << outcome.detail << std::endl;
+    }
+};
+
+int main()
+{
+    content_manager::setLogFunction(logFunction, "content-manager-testtool");
+
+    try
+    {
+        const auto& topicName = TOPIC_NAME;
+        const auto connector = std::make_shared<IndexerConnectorSync>(
+            INDEXER_CONNECTION, LoggingContext {"content-manager-testtool", logFunction});
+        ContentRegister registerer {
+            topicName, topicSpec(), std::make_shared<PrintingSink>(), content_manager::makeContentIndexer(connector)};
+
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+
+        registerer.requestRun(content_manager::RunRequest {FORCE_FULL_RELOAD},
+                              [](content_manager::OnDemandResult result)
+                              {
+                                  std::cout << "requested cycle: code=" << static_cast<int>(result.code)
+                                            << " detail=" << result.detail << std::endl;
+                              });
+
+        std::this_thread::sleep_for(std::chrono::seconds(60));
+
+        std::cout << "current token: '" << registerer.currentToken() << "'" << std::endl;
+    }
+    catch (const std::exception& e)
+    {
+        std::cout << "Exception: " << e.what() << std::endl;
+    }
+
+    return 0;
+}

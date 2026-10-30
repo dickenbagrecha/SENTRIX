@@ -1,0 +1,34 @@
+name: (push-master) Update Docker Hub README
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'build/docker/README.md'
+
+permissions:
+  contents: read
+
+jobs:
+  update-docker-hub-readme:
+    runs-on: ubuntu-latest
+    steps:
+
+      -
+        name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ github.repository_owner == 'crowdsecurity' }}
+        with:
+          persist-credentials: false
+
+      -
+        name: Update docker hub README
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        if: ${{ github.repository_owner == 'crowdsecurity' }}
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: crowdsecurity/crowdsec
+          short-description: "Crowdsec - An open-source, lightweight agent to detect and respond to bad behaviours."
+          readme-filepath: "./build/docker/README.md"

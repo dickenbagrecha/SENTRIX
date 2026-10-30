@@ -1,0 +1,15 @@
+name: 4.X - Python - Unit tests coverage
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch"
+        required: true
+        default: "main"
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

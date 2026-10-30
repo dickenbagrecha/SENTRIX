@@ -1,0 +1,849 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getEnvBool, getEnvString } from '../../src/envars';
+import { getUserEmail } from '../../src/globalConfig/accounts';
+import {
+  PromptfooChatCompletionProvider,
+  PromptfooHarmfulCompletionProvider,
+  PromptfooSimulatedUserProvider,
+  REDTEAM_SIMULATED_USER_TASK_ID,
+} from '../../src/providers/promptfoo';
+import { fetchWithRetries } from '../../src/util/fetch/index';
+import { createStatusResponse } from '../factories/literalFixtures';
+
+const { createDisabledCloudConfigFactory } = await vi.hoisted(
+  () => import('../factories/moduleMocks'),
+);
+
+const createGradingResponse = () => ({
+  result: 'test result',
+  tokenUsage: { total: 100 },
+});
+
+vi.mock('../../src/cache');
+vi.mock('../../src/envars');
+vi.mock('../../src/util/fetch/index.ts');
+vi.mock('../../src/globalConfig/accounts');
+vi.mock('../../src/globalConfig/cloud', createDisabledCloudConfigFactory());
+
+afterEach(() => {
+  vi.resetAllMocks();
+});
+
+describe('PromptfooHarmfulCompletionProvider', () => {
+  const options = {
+    harmCategory: 'test-category',
+    n: 1,
+    purpose: 'test-purpose',
+  };
+
+  let provider: PromptfooHarmfulCompletionProvider;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(getUserEmail).mockReturnValue('test@example.com');
+    vi.mocked(getEnvString).mockReturnValue('');
+    vi.mocked(getEnvBool).mockReturnValue(false);
+    provider = new PromptfooHarmfulCompletionProvider(options);
+  });
+
+  it('should initialize with correct options', () => {
+    expect(provider.harmCategory).toBe(options.harmCategory);
+    expect(provider.n).toBe(options.n);
+    expect(provider.purpose).toBe(options.purpose);
+  });
+
+  it('should return correct id', () => {
+    expect(provider.id()).toBe('promptfoo:redteam:test-category');
+  });
+
+  it('should return correct string representation', () => {
+    expect(provider.toString()).toBe(
+      '[Promptfoo Harmful Completion Provider test-purpose - test-category]',
+    );
+  });
+
+  it('should handle successful API call', async () => {
+    const mockResponse = new Response(
+      JSON.stringify({ output: 'test output' }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result).toEqual({ output: ['test output'] });
+  });
+
+  it('preserves token usage returned by harmful generation', async () => {
+    const tokenUsage = { total: 18, prompt: 11, completion: 7 };
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(JSON.stringify({ output: 'test output', tokenUsage }), { status: 200 }),
+    );
+
+    await expect(provider.callApi('test prompt')).resolves.toEqual({
+      output: ['test output'],
+      tokenUsage,
+    });
+  });
+
+  it('preserves reported token usage when harmful generation fails', async () => {
+    const tokenUsage = { total: 18, prompt: 11, completion: 7 };
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Generation failed', tokenUsage }), { status: 500 }),
+    );
+
+    await expect(provider.callApi('test prompt')).resolves.toMatchObject({
+      error: expect.stringContaining('Generation failed'),
+      tokenUsage,
+    });
+  });
+
+  it('should include target context in harmful generation requests', async () => {
+    provider = new PromptfooHarmfulCompletionProvider({
+      ...options,
+      targetId: 'cloud-target-123',
+    });
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(JSON.stringify({ output: 'test output' }), { status: 200 }),
+    );
+
+    await provider.callApi('test prompt');
+
+    expect(fetchWithRetries).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        body: expect.stringContaining('"targetId":"cloud-target-123"'),
+      }),
+      expect.any(Number),
+      expect.any(Number),
+    );
+  });
+
+  it('should filter out null and undefined values from output array', async () => {
+    const mockResponse = new Response(
+      JSON.stringify({ output: ['value1', null, 'value2', undefined] }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result).toEqual({ output: ['value1', 'value2'] });
+  });
+
+  it('should handle null output by returning empty array', async () => {
+    const mockResponse = new Response(
+      JSON.stringify({ output: null }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result).toEqual({ output: [] });
+  });
+
+  it('should handle API error', async () => {
+    const mockResponse = new Response('API Error', createStatusResponse(400, 'Bad Request'));
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result.error).toContain('[HarmfulCompletionProvider]');
+  });
+
+  it('should return error when PROMPTFOO_DISABLE_REMOTE_GENERATION is set', async () => {
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REMOTE_GENERATION';
+    });
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result.error).toContain('Remote generation is disabled');
+    expect(result.error).toContain('Harmful content generation requires');
+    expect(result.error).toContain('PROMPTFOO_DISABLE_REMOTE_GENERATION');
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should return error when PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION is set', async () => {
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION';
+    });
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result.error).toContain('Remote generation is disabled');
+    expect(result.error).toContain('Harmful content generation requires');
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should pass abortSignal to fetchWithRetries', async () => {
+    const abortController = new AbortController();
+    const mockResponse = new Response(
+      JSON.stringify({ output: 'test output' }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    await provider.callApi('test prompt', undefined, { abortSignal: abortController.signal });
+
+    expect(fetchWithRetries).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ signal: abortController.signal }),
+      expect.any(Number),
+      expect.any(Number),
+    );
+  });
+
+  it('should re-throw AbortError and not swallow it', async () => {
+    const abortError = new Error('The operation was aborted');
+    abortError.name = 'AbortError';
+    vi.mocked(fetchWithRetries).mockRejectedValue(abortError);
+
+    await expect(provider.callApi('test prompt')).rejects.toThrow('The operation was aborted');
+  });
+});
+
+describe('PromptfooChatCompletionProvider', () => {
+  const options = {
+    jsonOnly: true,
+    preferSmallModel: false,
+    task: 'crescendo' as const,
+  };
+
+  let provider: PromptfooChatCompletionProvider;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(getUserEmail).mockReturnValue('test@example.com');
+    vi.mocked(getEnvString).mockReturnValue('');
+    vi.mocked(getEnvBool).mockReturnValue(false);
+    provider = new PromptfooChatCompletionProvider(options);
+  });
+
+  it('should return correct id', () => {
+    expect(provider.id()).toBe('promptfoo:chatcompletion');
+  });
+
+  it('should return correct string representation', () => {
+    expect(provider.toString()).toBe('[Promptfoo Chat Completion Provider]');
+  });
+
+  it('should handle successful API call', async () => {
+    const tokenUsage = {
+      total: 100,
+      prompt: 60,
+      completion: 40,
+      cached: 12,
+      numRequests: 3,
+      completionDetails: { reasoning: 8 },
+    };
+    const mockResponse = new Response(
+      JSON.stringify({
+        result: 'test result',
+        tokenUsage,
+      }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result).toEqual({
+      output: 'test result',
+      tokenUsage,
+    });
+  });
+
+  it('should include target context in remote task requests', async () => {
+    provider = new PromptfooChatCompletionProvider({
+      ...options,
+      targetId: 'cloud-target-123',
+    });
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(JSON.stringify({ result: 'test result' }), { status: 200 }),
+    );
+
+    await provider.callApi('test prompt');
+
+    const request = vi.mocked(fetchWithRetries).mock.calls[0]?.[1];
+    expect(request).toBeDefined();
+    if (!request) {
+      throw new Error('Expected remote task request');
+    }
+    expect(JSON.parse(request.body as string)).toMatchObject({
+      targetId: 'cloud-target-123',
+      task: 'crescendo',
+    });
+  });
+
+  it('should pass remote materialization context through to the remote task server', async () => {
+    const mockResponse = new Response(
+      JSON.stringify({
+        result: 'test result',
+      }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    await provider.callApi('test prompt', {
+      prompt: {
+        raw: 'test prompt',
+        label: 'history',
+      },
+      vars: {
+        __promptfooRemoteMaterialization: {
+          injectVar: 'prompt',
+          inputs: {
+            document: {
+              description: 'Uploaded planning document',
+              type: 'docx',
+            },
+          },
+          materializationIndex: 2,
+          pluginId: 'pii:direct',
+          purpose: 'Summarize the uploaded planning document',
+        },
+      },
+    });
+
+    const requestBody = JSON.parse((vi.mocked(fetchWithRetries).mock.calls[0][1] as any).body);
+    expect(requestBody.materializationContext).toEqual({
+      injectVar: 'prompt',
+      inputs: {
+        document: {
+          description: 'Uploaded planning document',
+          type: 'docx',
+        },
+      },
+      materializationIndex: 2,
+      pluginId: 'pii:direct',
+      purpose: 'Summarize the uploaded planning document',
+    });
+  });
+
+  it('should return remote materialization fields from the task server', async () => {
+    const mockResponse = new Response(
+      JSON.stringify({
+        result: 'test result',
+        materializationHandled: true,
+        materializedVars: {
+          document:
+            'data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,Zm9v',
+        },
+        inputMaterialization: {
+          document: {
+            injectionPlacement: 'comment',
+            wrapperSummary: 'Internal planning memo with reviewer note.',
+          },
+        },
+        tokenUsage: { total: 100 },
+      }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result).toEqual({
+      output: 'test result',
+      materializationHandled: true,
+      materializedVars: {
+        document:
+          'data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,Zm9v',
+      },
+      inputMaterialization: {
+        document: {
+          injectionPlacement: 'comment',
+          wrapperSummary: 'Internal planning memo with reviewer note.',
+        },
+      },
+      tokenUsage: { total: 100 },
+    });
+  });
+
+  it('should handle missing result', async () => {
+    const mockResponse = new Response(
+      JSON.stringify({
+        result: null,
+      }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result.error).toBe('LLM did not return a result, likely refusal');
+  });
+
+  it.each(['crescendo', 'judge'] as const)(
+    'preserves terminal %s provider errors and usage instead of stale output',
+    async (task) => {
+      const taskProvider = new PromptfooChatCompletionProvider({ ...options, task });
+      const tokenUsage = {
+        total: 73,
+        prompt: 45,
+        completion: 28,
+        cached: 12,
+        numRequests: 2,
+        completionDetails: { reasoning: 8 },
+      };
+      vi.mocked(fetchWithRetries).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'Provider request failed',
+            result: 'partial output',
+            tokenUsage,
+          }),
+          { status: 200 },
+        ),
+      );
+
+      expect(await taskProvider.callApi('test prompt')).toEqual({
+        error: 'Provider request failed',
+        tokenUsage,
+      });
+      expect(fetchWithRetries).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('preserves an explicit remote provider error without output or usage', async () => {
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Provider request failed' }), { status: 200 }),
+    );
+
+    expect(await provider.callApi('test prompt')).toEqual({ error: 'Provider request failed' });
+  });
+
+  it.each([
+    {
+      response: { result: 'I cannot assist with that request' },
+      output: 'I cannot assist with that request',
+    },
+    { response: {}, error: 'LLM did not return a result, likely refusal' },
+    { response: { error: 'Provider refused' }, error: 'Provider refused' },
+  ])('preserves explicit refusal and usage for $response', async ({ response, output, error }) => {
+    const tokenUsage = { total: 12, prompt: 8, completion: 4 };
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(JSON.stringify({ ...response, isRefusal: true, tokenUsage }), { status: 200 }),
+    );
+
+    expect(await provider.callApi('test prompt')).toEqual({
+      ...(output ? { output } : { error }),
+      isRefusal: true,
+      tokenUsage,
+    });
+  });
+
+  it.each([undefined, '', null, false, {}])(
+    'keeps successful fallback output when the error field is %s',
+    async (error) => {
+      const tokenUsage = { total: 23, prompt: 15, completion: 8, numRequests: 2 };
+      vi.mocked(fetchWithRetries).mockResolvedValue(
+        new Response(
+          JSON.stringify({ result: 'fallback result', error, isRefusal: false, tokenUsage }),
+          { status: 200 },
+        ),
+      );
+
+      expect(await provider.callApi('test prompt')).toEqual({
+        output: 'fallback result',
+        tokenUsage,
+      });
+    },
+  );
+
+  it('preserves token usage when a remote task fails after calling a model', async () => {
+    const tokenUsage = {
+      total: 73,
+      prompt: 45,
+      completion: 28,
+      numRequests: 2,
+    };
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(
+        JSON.stringify({ message: 'Internal Server Error', details: 'Model refused', tokenUsage }),
+        { status: 500 },
+      ),
+    );
+
+    expect(await provider.callApi('test prompt')).toEqual({
+      error: 'LLM did not return a result, likely refusal',
+      tokenUsage,
+    });
+  });
+
+  it('preserves an explicit permanent Meta coordination request error', async () => {
+    const providerError = {
+      status: 400,
+      type: 'invalid_request_error',
+      code: 'invalid_json',
+    };
+    const tokenUsage = { total: 73, prompt: 45, completion: 28, numRequests: 2 };
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(
+        JSON.stringify({ error: 'Coordination request failed', providerError, tokenUsage }),
+        {
+          status: 400,
+        },
+      ),
+    );
+    const metaProvider = new PromptfooChatCompletionProvider({
+      ...options,
+      task: 'meta-agent-decision',
+    });
+
+    expect(await metaProvider.callApi('test prompt')).toEqual({
+      error:
+        'Meta-agent request failed: the upstream provider rejected the coordination request as invalid JSON (invalid_json).',
+      metadata: { remoteGenerationError: providerError },
+      tokenUsage,
+    });
+    expect(fetchWithRetries).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      status: 429,
+      providerError: { status: 429, type: 'rate_limit_error', code: 'rate_limit_exceeded' },
+    },
+    { status: 500, providerError: { status: 500, type: 'server_error', code: 'invalid_json' } },
+    {
+      status: 500,
+      providerError: { status: 400, type: 'invalid_request_error', code: 'invalid_json' },
+    },
+    {
+      status: 400,
+      providerError: { status: 400, type: 'invalid_request_error', code: 'invalid_prompt' },
+    },
+    {
+      status: 400,
+      providerError: { status: 400, type: 'invalid_request_error', code: 'cyber_policy_violation' },
+    },
+    {
+      status: 400,
+      providerError: { status: 400, type: 'invalid_request_error', code: 'bio_policy_violation' },
+    },
+    { status: 400, providerError: { status: 400, type: 'server_error', code: 'invalid_json' } },
+    { status: 400, providerError: undefined },
+    { status: 200, providerError: undefined },
+  ])(
+    'does not classify other Meta errors as permanent: $status $providerError',
+    async ({ status, providerError }) => {
+      vi.mocked(fetchWithRetries).mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            error: 'Customer text mentions invalid_json and invalid_request_error',
+            providerError,
+          }),
+          { status },
+        ),
+      );
+      const metaProvider = new PromptfooChatCompletionProvider({
+        ...options,
+        task: 'meta-agent-decision',
+      });
+
+      expect(await metaProvider.callApi('test prompt')).toEqual({
+        error: 'Customer text mentions invalid_json and invalid_request_error',
+      });
+    },
+  );
+
+  it('keeps other remote strategies unchanged for the Meta request error envelope', async () => {
+    vi.mocked(fetchWithRetries).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          providerError: { status: 400, type: 'invalid_request_error', code: 'invalid_json' },
+        }),
+        { status: 400 },
+      ),
+    );
+
+    expect(await provider.callApi('test prompt')).toEqual({
+      error: 'LLM did not return a result, likely refusal',
+    });
+  });
+
+  it('should handle API error', async () => {
+    vi.mocked(fetchWithRetries).mockRejectedValue(new Error('API Error'));
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result.error).toBe('API call error: Error: API Error');
+  });
+
+  it('should return error when PROMPTFOO_DISABLE_REMOTE_GENERATION is set', async () => {
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REMOTE_GENERATION';
+    });
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result.error).toContain('Remote generation is disabled');
+    expect(result.error).toContain('This red team strategy requires');
+    expect(result.error).toContain('PROMPTFOO_DISABLE_REMOTE_GENERATION');
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should return error when PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION is set', async () => {
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION';
+    });
+
+    const result = await provider.callApi('test prompt');
+
+    expect(result.error).toContain('Remote generation is disabled');
+    expect(result.error).toContain('This red team strategy requires');
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should pass abortSignal to fetchWithRetries', async () => {
+    const abortController = new AbortController();
+    const mockResponse = new Response(
+      JSON.stringify(createGradingResponse()),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    await provider.callApi('test prompt', undefined, { abortSignal: abortController.signal });
+
+    // Verify the signal was passed in the options object
+    expect(fetchWithRetries).toHaveBeenCalled();
+    const callArgs = vi.mocked(fetchWithRetries).mock.calls[0];
+    expect(callArgs[1]).toHaveProperty('signal', abortController.signal);
+  });
+
+  it('should re-throw AbortError and not swallow it', async () => {
+    const abortError = new Error('The operation was aborted');
+    abortError.name = 'AbortError';
+    vi.mocked(fetchWithRetries).mockRejectedValue(abortError);
+
+    await expect(provider.callApi('test prompt')).rejects.toThrow('The operation was aborted');
+  });
+});
+
+describe('PromptfooSimulatedUserProvider', () => {
+  const options = {
+    id: 'test-agent',
+    instructions: 'test instructions',
+  };
+
+  let provider: PromptfooSimulatedUserProvider;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(getUserEmail).mockReturnValue('test@example.com');
+    vi.mocked(getEnvBool).mockReturnValue(false);
+    provider = new PromptfooSimulatedUserProvider(options, 'test-id');
+  });
+
+  it('should return correct id', () => {
+    expect(provider.id()).toBe('test-agent');
+  });
+
+  it('should return default id if not provided', () => {
+    const defaultProvider = new PromptfooSimulatedUserProvider({}, 'test-id');
+    expect(defaultProvider.id()).toBe('promptfoo:agent');
+  });
+
+  it('should return correct string representation', () => {
+    expect(provider.toString()).toBe('[Promptfoo Agent Provider]');
+  });
+
+  it('should handle successful API call', async () => {
+    const mockResponse = new Response(
+      JSON.stringify(createGradingResponse()),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi(JSON.stringify([{ role: 'user', content: 'hello' }]));
+
+    expect(result).toEqual({
+      output: 'test result',
+      tokenUsage: { total: 100 },
+    });
+  });
+
+  it('should include target context in task requests', async () => {
+    const providerWithTarget = new PromptfooSimulatedUserProvider(
+      {
+        instructions: 'test instructions',
+        targetId: 'cloud-target-123',
+      },
+      REDTEAM_SIMULATED_USER_TASK_ID,
+    );
+    const mockResponse = new Response(
+      JSON.stringify(createGradingResponse()),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    await providerWithTarget.callApi(JSON.stringify([{ role: 'user', content: 'hello' }]));
+
+    const requestBody = JSON.parse(String(vi.mocked(fetchWithRetries).mock.calls[0][1]?.body));
+    expect(requestBody).toMatchObject({
+      task: REDTEAM_SIMULATED_USER_TASK_ID,
+      targetId: 'cloud-target-123',
+    });
+  });
+
+  it('should handle API error response', async () => {
+    const mockResponse = new Response('API Error', createStatusResponse(400, 'Bad Request'));
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await provider.callApi(JSON.stringify([{ role: 'user', content: 'hello' }]));
+
+    expect(result.error).toContain('API call error');
+  });
+
+  it('should handle API call exception', async () => {
+    vi.mocked(fetchWithRetries).mockRejectedValue(new Error('Network Error'));
+
+    const result = await provider.callApi(JSON.stringify([{ role: 'user', content: 'hello' }]));
+
+    expect(result.error).toBe('API call error: Error: Network Error');
+  });
+
+  it('should return error when PROMPTFOO_DISABLE_REMOTE_GENERATION is set for regular task', async () => {
+    const regularProvider = new PromptfooSimulatedUserProvider({}, 'tau');
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REMOTE_GENERATION';
+    });
+
+    const result = await regularProvider.callApi(
+      JSON.stringify([{ role: 'user', content: 'hello' }]),
+    );
+
+    expect(result.error).toContain('Remote generation is disabled');
+    expect(result.error).toContain('SimulatedUser requires');
+    expect(result.error).toContain('PROMPTFOO_DISABLE_REMOTE_GENERATION');
+    expect(result.tokenUsage).toEqual({ numRequests: 0 });
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should NOT be disabled when PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION is set for regular task', async () => {
+    const regularProvider = new PromptfooSimulatedUserProvider({}, 'tau');
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION';
+    });
+
+    const mockResponse = new Response(
+      JSON.stringify(createGradingResponse()),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    const result = await regularProvider.callApi(
+      JSON.stringify([{ role: 'user', content: 'hello' }]),
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.output).toBe('test result');
+    expect(fetchWithRetries).toHaveBeenCalled();
+  });
+
+  it('should return error when PROMPTFOO_DISABLE_REMOTE_GENERATION is set for redteam task', async () => {
+    const redteamProvider = new PromptfooSimulatedUserProvider({}, REDTEAM_SIMULATED_USER_TASK_ID);
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REMOTE_GENERATION';
+    });
+
+    const result = await redteamProvider.callApi(
+      JSON.stringify([{ role: 'user', content: 'hello' }]),
+    );
+
+    expect(result.error).toContain('Remote generation is disabled');
+    expect(result.error).toContain(
+      'PROMPTFOO_DISABLE_REMOTE_GENERATION or PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION',
+    );
+    expect(result.tokenUsage).toEqual({ numRequests: 0 });
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should return error when PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION is set for redteam task', async () => {
+    const redteamProvider = new PromptfooSimulatedUserProvider({}, REDTEAM_SIMULATED_USER_TASK_ID);
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION';
+    });
+
+    const result = await redteamProvider.callApi(
+      JSON.stringify([{ role: 'user', content: 'hello' }]),
+    );
+
+    expect(result.error).toContain('Remote generation is disabled');
+    expect(result.error).toContain(
+      'PROMPTFOO_DISABLE_REMOTE_GENERATION or PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION',
+    );
+    expect(result.tokenUsage).toEqual({ numRequests: 0 });
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should show integration: regular SimulatedUser works while redteam is disabled', async () => {
+    // This is the key feature: PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION should
+    // NOT affect regular (non-redteam) SimulatedUser tasks
+    const regularProvider = new PromptfooSimulatedUserProvider({}, 'tau');
+    const redteamProvider = new PromptfooSimulatedUserProvider({}, REDTEAM_SIMULATED_USER_TASK_ID);
+
+    // Set only the redteam-specific flag
+    vi.mocked(getEnvBool).mockImplementation(function (key: string) {
+      return key === 'PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION';
+    });
+
+    const mockResponse = new Response(
+      JSON.stringify({
+        result: 'regular user response',
+        tokenUsage: { total: 50 },
+      }),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    // Regular task should work
+    const regularResult = await regularProvider.callApi(
+      JSON.stringify([{ role: 'user', content: 'hello' }]),
+    );
+    expect(regularResult.error).toBeUndefined();
+    expect(regularResult.output).toBe('regular user response');
+    expect(fetchWithRetries).toHaveBeenCalled();
+
+    // Reset fetch mock
+    vi.mocked(fetchWithRetries).mockClear();
+
+    // Redteam task should be blocked
+    const redteamResult = await redteamProvider.callApi(
+      JSON.stringify([{ role: 'user', content: 'hello' }]),
+    );
+    expect(redteamResult.error).toContain('Remote generation is disabled');
+    expect(fetchWithRetries).not.toHaveBeenCalled();
+  });
+
+  it('should pass abortSignal to fetchWithRetries', async () => {
+    const abortController = new AbortController();
+    const mockResponse = new Response(
+      JSON.stringify(createGradingResponse()),
+      createStatusResponse(200, 'OK'),
+    );
+    vi.mocked(fetchWithRetries).mockResolvedValue(mockResponse);
+
+    await provider.callApi(JSON.stringify([{ role: 'user', content: 'hello' }]), undefined, {
+      abortSignal: abortController.signal,
+    });
+
+    // Verify the signal was passed in the options object
+    expect(fetchWithRetries).toHaveBeenCalled();
+    const callArgs = vi.mocked(fetchWithRetries).mock.calls[0];
+    expect(callArgs[1]).toHaveProperty('signal', abortController.signal);
+  });
+
+  it('should re-throw AbortError and not swallow it', async () => {
+    const abortError = new Error('The operation was aborted');
+    abortError.name = 'AbortError';
+    vi.mocked(fetchWithRetries).mockRejectedValue(abortError);
+
+    await expect(
+      provider.callApi(JSON.stringify([{ role: 'user', content: 'hello' }])),
+    ).rejects.toThrow('The operation was aborted');
+  });
+});

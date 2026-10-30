@@ -1,0 +1,293 @@
+name: 5.X - Code Linter - ClangFormat
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+    # The action checks only `find <path> -name '*.cpp' -o -name '*.hpp'` in each of the fifteen
+    # trees below (.github/actions/clang_format/action.yml), against the nearest .clang-format:
+    # headers (.h), CMake files and docs in those trees cannot change its result.
+    # upload_s3_artifact is not listed: it only uploads the error file of a failed check.
+    paths:
+      - .clang-format
+      - src/engine/.clang-format
+      - src/shared_modules/indexer_connector/**/*.[ch]pp
+      - src/shared_modules/content_manager/**/*.[ch]pp
+      - src/shared_modules/utils/**/*.[ch]pp
+      - src/shared_modules/metrics/**/*.[ch]pp
+      - src/shared_modules/manager_config/**/*.[ch]pp
+      - src/shared_modules/ca_bundle/**/*.[ch]pp
+      - src/shared_modules/manager_certs/**/*.[ch]pp
+      - src/wazuh_modules/inventory_sync_server/**/*.[ch]pp
+      - src/wazuh_modules/task_manager/**/*.[ch]pp
+      - src/wazuh_modules/keystore_server/**/*.[ch]pp
+      - src/shared_modules/keystore/**/*.[ch]pp
+      - src/shared_modules/uds_http_server/**/*.[ch]pp
+      - src/wazuh_modules/vulnerability_scanner/**/*.[ch]pp
+      - src/remoted/remoted_module/**/*.[ch]pp
+      - src/engine/**/*.[ch]pp
+      - .github/workflows/5_codelinter_clangformat.yml
+      - .github/actions/clang_format/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  style:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Cancel previous runs
+        uses: fkirc/skip-duplicate-actions@v5.3.2
+        with:
+          cancel_others: 'true'
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          skip_after_successful_duplicate: 'false'
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Indexer Connector
+      - name: Indexer connector - Coding style
+        id: indexer_connector_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/indexer_connector
+          id: indexer_connector
+
+      # Content Manager
+      - name: Content manager - Coding style
+        id: content_manager_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/content_manager
+          id: content_manager
+
+      # Inventory Sync Server
+      - name: Inventory sync server - Coding style
+        id: inventory_sync_server_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/wazuh_modules/inventory_sync_server
+          id: inventory_sync_server
+
+      # Task Manager
+      - name: Task manager - Coding style
+        id: task_manager_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/wazuh_modules/task_manager
+          id: task_manager
+
+      # Vulnerability Scanner
+      - name: Vulnerability scanner - Coding style
+        id: vulnerability_scanner_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/wazuh_modules/vulnerability_scanner
+          id: vulnerability_scanner
+
+      # Utils
+      - name: Utils - Coding style
+        id: utils_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/utils
+          id: utils
+
+      # Metrics
+      - name: Metrics - Coding style
+        id: metrics_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/metrics
+          id: metrics
+
+      # Remoted module
+      - name: Remoted module - Coding style
+        id: remoted_module_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/remoted/remoted_module
+          id: remoted_module
+
+      # Manager configuration (/etc/wazuh-manager/wazuh-manager.conf reader and CLI)
+      - name: Manager config - Coding style
+        id: manager_config_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/manager_config
+          id: manager_config
+
+      # CA bundle
+      - name: CA bundle - Coding style
+        id: ca_bundle_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/ca_bundle
+          id: ca_bundle
+
+      # Manager certs CLI
+      - name: Manager certs - Coding style
+        id: manager_certs_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/manager_certs
+          id: manager_certs
+
+      # Keystore server
+      - name: Keystore server - Coding style
+        id: keystore_server_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/wazuh_modules/keystore_server
+          id: keystore_server
+
+      # Keystore
+      - name: Keystore - Coding style
+        id: keystore_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/keystore
+          id: keystore
+
+      # UDS HTTP server
+      - name: UDS HTTP server - Coding style
+        id: uds_http_server_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/uds_http_server
+          id: uds_http_server
+
+      # Engine (uses its own src/engine/.clang-format, the closest one to each file)
+      - name: Engine - Coding style
+        id: engine_style
+        continue-on-error: true
+        uses: ./.github/actions/clang_format
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/engine
+          id: engine
+
+      - name: Check all coding style results
+        if: always()
+        run: |
+          FAILED_STEPS=""
+
+          if [ "${{ steps.indexer_connector_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS IndexerConnector"
+          fi
+
+          if [ "${{ steps.content_manager_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS ContentManager"
+          fi
+
+          if [ "${{ steps.inventory_sync_server_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS InventorySyncServer"
+          fi
+
+          if [ "${{ steps.task_manager_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS TaskManager"
+          fi
+
+          if [ "${{ steps.vulnerability_scanner_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS VulnerabilityScanner"
+          fi
+
+          if [ "${{ steps.utils_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS Utils"
+          fi
+
+          if [ "${{ steps.metrics_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS Metrics"
+          fi
+
+          if [ "${{ steps.remoted_module_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS RemotedModule"
+          fi
+
+          if [ "${{ steps.manager_config_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS ManagerConfig"
+          fi
+
+          if [ "${{ steps.ca_bundle_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS CABundle"
+          fi
+
+          if [ "${{ steps.manager_certs_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS ManagerCerts"
+          fi
+
+          if [ "${{ steps.keystore_server_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS KeystoreServer"
+          fi
+
+          if [ "${{ steps.keystore_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS Keystore"
+          fi
+
+          if [ "${{ steps.uds_http_server_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS UdsHttpServer"
+          fi
+
+          if [ "${{ steps.engine_style.outcome }}" != "success" ]; then
+            FAILED_STEPS="$FAILED_STEPS Engine"
+          fi
+
+          if [ -n "$FAILED_STEPS" ]; then
+            echo "❌ The following modules failed coding style verification:$FAILED_STEPS"
+            exit 1
+          else
+            echo "✅ All modules passed coding style verification"
+          fi

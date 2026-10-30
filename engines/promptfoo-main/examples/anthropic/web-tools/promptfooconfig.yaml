@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: 'Web search and fetch tools'
+
+prompts:
+  - |
+    {{task}}
+
+providers:
+  - id: anthropic:messages:claude-sonnet-5
+    config:
+      # Allow room for thinking, tool calls, and the final answer.
+      max_tokens: 8000
+      tools:
+        # Current server-tool versions (dynamic filtering, no beta header required).
+        - type: web_search_20260209
+          name: web_search
+          max_uses: 2
+        - type: web_fetch_20260209
+          name: web_fetch
+          max_uses: 3
+          allowed_domains:
+            - platform.claude.com
+            - github.com
+            - openai.com
+            - arxiv.org
+          citations:
+            enabled: true
+          max_content_tokens: 12000
+
+tests:
+  # Basic web fetch test
+  - vars:
+      task: 'Please fetch and summarize the content from this URL: https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview'
+    assert:
+      - type: contains-any
+        value: ['tool', 'function', 'API', 'capabilities']
+        reason: 'Should mention tool-related concepts'
+      - type: llm-rubric
+        value: 'Provides a clear, structured summary of the web page content'
+
+  # Direct URL fetch test
+  - vars:
+      task: 'Fetch and analyze the GitHub repository at https://github.com/anthropics/anthropic-sdk-typescript'
+    assert:
+      - type: contains
+        value: 'TypeScript'
+      - type: llm-rubric
+        value: 'Describes the TypeScript SDK and its purpose'
+
+  # Bound the research workflow to one search and one fetch.
+  - vars:
+      task: |
+        Research "Claude Opus 5 model capabilities" and write a short report.
+
+        Process:
+        1. Run at most one search for recent information about the topic
+        2. Fetch content from at most one authoritative source
+        3. Synthesize the findings
+
+        Keep the report under 300 words and include:
+        - Overview of the topic
+        - Key capabilities or features
+        - Sources used
+    assert:
+      - type: contains-any
+        value: ['Claude', 'Opus', 'capabilities', 'model']
+        reason: 'Should discuss the Claude model family specifically'
+      # Grade attribution without assuming the grader has seen the retrieved pages.
+      - type: llm-rubric
+        value: >-
+          Provides a focused report on the requested topic that names or links at least one
+          source for its claims. Do not judge factual accuracy against your own knowledge.
+      - type: contains-any
+        value: ['search', 'found', 'according', 'research', 'sources']
+        reason: 'Should indicate research methodology was used'
+
+  # Security-focused research test
+  - vars:
+      task: 'Research web fetch tool security considerations and best practices'
+    assert:
+      - type: contains-any
+        value: ['security', 'domain', 'filtering', 'risk']
+        reason: 'Should address security aspects'
+      - type: llm-rubric
+        value: 'Discusses security considerations and best practices for web fetching'

@@ -1,0 +1,972 @@
+/* Copyright (C) Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+/* Functions to handle operation with files */
+
+#ifndef FILE_OP_H
+#define FILE_OP_H
+
+#include <stdio.h>
+#include <stdint.h>
+#include <time.h>
+#include <stdbool.h>
+#include <sys/stat.h>
+#include <cJSON.h>
+#include <dirent.h>
+#include "../../external/zlib/zlib.h"
+
+#ifdef WIN32
+#include <winsock2.h>
+#include <windows.h>
+#endif
+
+#ifdef __MACH__
+#include <libproc.h>
+#endif
+
+#define OS_PIDFILE  "var/run"
+#define UCS2_LE 1
+#define UCS2_BE 2
+
+#ifdef WIN32
+#define PATH_SEP '\\'
+typedef uint64_t wino_t;
+#else
+#define PATH_SEP '/'
+typedef ino_t wino_t;
+#endif
+
+typedef struct File {
+    char *name;
+    FILE *fp;
+} File;
+
+/**
+ * @brief Set the program name. Must be done before *anything* else.
+ *
+ * @param name Program name.
+ */
+void OS_SetName(const char *name) __attribute__((nonnull));
+
+
+/**
+ * @brief Get the time of the last modification of the specified file.
+ *
+ * @param file File name.
+ * @return Time of last modification or -1 on error.
+ */
+time_t File_DateofChange(const char *file) __attribute__((nonnull));
+
+
+/**
+ * @brief Get the inode number of the specified file.
+ *
+ * @param file File name.
+ * @return File inode or 0 on error.
+ */
+ino_t File_Inode(const char *file) __attribute__((nonnull));
+
+
+/**
+ * @brief Get the inode number of the specified file pointer.
+ *
+ * @param fp File pointer.
+ * @return File inode or -1 on error.
+ */
+wino_t get_fp_inode(FILE * fp);
+
+
+#ifdef WIN32
+/**
+ * @brief Get the file information of the specified file pointer.
+ *
+ * @param fp File pointer.
+ * @param fileInfo Pointer to file information.
+ * @return 0 in case of error, not 0 in success.
+ */
+int get_fp_file_information(FILE * fp, LPBY_HANDLE_FILE_INFORMATION fileInfo);
+#endif
+
+
+/**
+ * @brief Get the size of the specified file.
+ *
+ * @param path File name.
+ * @return File size or -1 on error.
+ */
+off_t FileSize(const char * path);
+
+
+/**
+ * @brief Get the size of a folder.
+ *
+ * @param path Folder path
+ *
+ * @return Size of folder in bytes
+ */
+float DirSize(const char *path);
+
+
+/**
+ * @brief Get the size of the specified file pointer.
+ *
+ * @param fp File pointer.
+ * @return File size or -1 on error.
+ */
+long get_fp_size(FILE * fp);
+
+
+/**
+ * @brief Check if the specified file is a directory or a symbolic link to a directory.
+ *
+ * @param file File path.
+ * @return 0 if it is a directory, -1 otherwise.
+ */
+int IsDir(const char *file) __attribute__((nonnull));
+
+
+/**
+ * @brief Check if the specified file is a regular file or a symbolic link to a regular file.
+ *
+ * @param file File path.
+ * @return 0 if it is a regular file, -1 otherwise.
+ */
+int IsFile(const char *file) __attribute__((nonnull));
+
+
+/**
+ * @brief Check if the specified file is a socket.
+ *
+ * @param file File path.
+ * @return 0 if it is a socket, -1 otherwise.
+ */
+int IsSocket(const char * file) __attribute__((nonnull));
+
+
+/**
+ * @brief Get the type of the specified file.
+ *
+ * @param dir File path.
+ * @return 1 if it is a file, 2 if it is a directory, 0 otherwise.
+ */
+int check_path_type(const char *dir) __attribute__((nonnull));
+
+
+#ifndef WIN32
+/**
+ * @brief Check if the specified file is a link.
+ *
+ * @param file File path.
+ * @return 0 if it is a link, -1 otherwise.
+ */
+int IsLink(const char * file) __attribute__((nonnull));
+
+/**
+ * Check if a program is available in the system PATH.
+ *
+ * @param program The name of the program to check.
+ * @return true if the program is available, false otherwise.
+ */
+bool is_program_available(const char *program);
+
+#endif
+
+
+/**
+ * @brief Get random data from `/dev/urandom`.
+ *
+ * @return Pointer to random data array.
+ */
+char *GetRandomNoise();
+
+
+/**
+ * @brief Creates a PID file for the specified service name.
+ *
+ * @param name Service name.
+ * @param pid Service PID.
+ * @return 0 if the file was created, -1 on error.
+ */
+int CreatePID(const char *name, int pid) __attribute__((nonnull));
+
+
+/**
+ * @brief Deletes the PID file for the specified service name.
+ *
+ * @param name Service name.
+ * @return 0 if the file was deleted, -1 on error.
+ */
+int DeletePID(const char *name) __attribute__((nonnull));
+
+
+/**
+ * @brief Deletes the service state file.
+ *        The state file is defined by the __local_name value.
+ *
+ */
+void DeleteState();
+
+
+/**
+ * @brief Merge files recursively into one single file.
+ *
+ * @param finalfp Handler of the file.
+ * @param files Files to be merged.
+ * @param path_offset Offset for recursion.
+ * @return 1 if the merged file was created, 0 on error.
+ */
+int MergeAppendFile(FILE *finalfp, const char *files, int path_offset) __attribute__((nonnull(1, 2)));
+
+
+/* UnmergeFiles() results */
+#define UNMERGE_FAILED          0   /* An entry could not be written, or the merged file could not be read */
+#define UNMERGE_COMPLETE        1   /* Every entry was unmerged */
+#define UNMERGE_NAMES_SKIPPED   2   /* Entries with invalid names were skipped, every other one was unmerged */
+
+/**
+ * @brief Unmerge file.
+ *
+ * @param finalpath Path of the merged file.
+ * @param optdir Path of the folder to unmerge the files. If not specified, the files will be unmerged in the current working directory.
+ * @param mode Indicates if the merged file must be readed as a binary file  or not. Use `#OS_TEXT`, `#OS_BINARY`.
+ * @param unmerged_files Optional list to which successfully extracted names are appended, including on error.
+ * @return `#UNMERGE_COMPLETE`, `#UNMERGE_NAMES_SKIPPED` or `#UNMERGE_FAILED`. Successful entries are retained.
+ */
+int UnmergeFiles(const char *finalpath, const char *optdir, int mode, char ***unmerged_files) __attribute__((nonnull(1)));
+
+
+/**
+ * @brief Check if the merged file is valid.
+ *
+ * @param finalpath Path of the merged file.
+ * @param mode Indicates if the merged file must be readed as a binary file  or not. Use `#OS_TEXT`, `#OS_BINARY`.
+ * @return 1 if the merged file is valid, 0 if not.
+ */
+int TestUnmergeFiles(const char *finalpath, int mode) __attribute__((nonnull(1)));
+
+
+/**
+ * @brief Daemonize a process.
+ *
+ */
+void goDaemon(void);
+
+
+/**
+ * @brief Daemonize a process without closing stdin/stdout/stderr.
+ *
+ */
+void goDaemonLight(void);
+
+
+/**
+ * @brief Get the OS information.
+ *
+ * @return OS uname.
+ */
+const char *getuname(void);
+
+
+/**
+ * @brief Get the basename of a path.
+ *
+ * @bug There is a bug in the `basename()` function.
+ *      In the glibc implementation, the POSIX versions of these functions
+ *      modify the path argument, and segfault when called with a static
+ *      string such as "/usr/".
+ * @return Pointer to the path basename.
+ */
+char *basename_ex(char *path) __attribute__((nonnull));
+
+
+/**
+ * @brief Rename file or directory.
+ *
+ * @param source Path of the file/folder to be renamed.
+ * @param destination Path of the renamed file/folder.
+ * @return 0 on success and -1 on error.
+ */
+int rename_ex(const char *source, const char *destination) __attribute__((nonnull));
+
+
+/**
+ * @brief Create temporary file.
+ *
+ * @param tmp_path Temporary file path.
+ * @return 0 on success and -1 on error.
+ */
+int mkstemp_ex(char *tmp_path) __attribute__((nonnull));
+
+
+/**
+ * @brief Create temporary file.
+ *
+ * @param [out] file Pointer to File object.
+ * @param [in] source Source path.
+ * @param [in] copy Copy file.
+ * @return 0 on success and -1 on error.
+ */
+int TempFile(File *file, const char *source, int copy);
+
+
+/**
+ * @brief Move file.
+ *
+ * @param src Source path.
+ * @param dst Destination path.
+ * @return 0 on success and -1 on error.
+ */
+int OS_MoveFile(const char *src, const char *dst);
+
+
+/**
+ * @brief Moves @p src onto @p dst without following a link at either name.
+ *
+ * For a destination in a directory that an unprivileged account can write. It renames first. When
+ * the rename can't replace @p dst -- a single-file bind mount answers EBUSY, another filesystem
+ * EXDEV -- it copies @p src into @p dst instead, through descriptors w_openat_nofollow_vetted()
+ * opened, so a symlink or a hard link at either name is refused, never written through. @p src is
+ * removed once the copy is complete. OS_MoveFile()'s copy opens both names with fopen().
+ *
+ * On Windows it is MoveFileEx() replacing @p dst, without a copy fallback.
+ *
+ * @param src Source path.
+ * @param dst Destination path.
+ * @return 0 on success. -1 on failure, with @p src left in place and errno set (POSIX).
+ */
+int w_move_file_nofollow(const char *src, const char *dst);
+
+
+/**
+ * @brief Copy file.
+ *
+ * @param src Source path.
+ * @param dst Destination path.
+ * @param mode Mode: `a` to append (text), `w` to write (text), `b` to write in
+ * binary mode (exact byte copy -- required on Windows whenever the copied
+ * content's exact bytes matter downstream, e.g. a hash computed over it;
+ * text mode there silently rewrites `\n` as `\r\n`).
+ * @param message Write message to the destination file.
+ * @param silent Do not show errors.
+ * @return 0 on success and -1 on error.
+ */
+int w_copy_file(const char *src, const char *dst, char mode, char * message, int silent);
+
+
+/**
+ * @brief Delete directory recursively.
+ *
+ * @param path Path of the folder to be removed.
+ * @return 0 on success. On error, -1 is returned, and errno is set appropriately.
+ */
+int rmdir_ex(const char *path);
+
+
+/**
+ * @brief Delete directory content.
+ *
+ * @param name Path of the folder.
+ * @return 0 on success. On error, -1 is returned, and errno is set appropriately.
+ */
+int cldir_ex(const char *name);
+
+
+/**
+ * @brief Delete directory content while preserving specified paths
+ *
+ * Recursively removes all files and subdirectories within the specified directory,
+ * except for paths listed in the ignore array. The function supports both simple
+ * filenames and paths with subdirectories.
+ *
+ * The ignore list can contain:
+ * - Simple filenames (e.g., "file.txt") to preserve files in the root directory
+ * - Relative paths (e.g., "subfolder/file.txt") to preserve files in subdirectories
+ *
+ * Directories that contain preserved files are automatically kept. Empty directories
+ * are removed after processing their contents.
+ *
+ * @param name Path of the directory to clean
+ * @param ignore NULL-terminated array of relative paths to preserve (can be NULL to delete everything)
+ * @return 0 on success, -1 on error (errno is set appropriately)
+ *
+ * Example:
+ * @code
+ * const char *preserve[] = {"keep.txt", "subfolder/important.conf", NULL};
+ * cldir_ex_ignore("/etc/wazuh-manager/shared", preserve);
+ * // Preserves: /etc/wazuh-manager/shared/keep.txt
+ * //            /etc/wazuh-manager/shared/subfolder/important.conf
+ * //            /etc/wazuh-manager/shared/subfolder/ (directory kept because it has preserved file)
+ * // Deletes:   Everything else
+ * @endcode
+ */
+int cldir_ex_ignore(const char * name, const char ** ignore);
+
+
+/**
+ * @brief Create directory recursively.
+ *
+ * @param path Path of the folder.
+ * @return 0 on success, -1 on error.
+ */
+int mkdir_ex(const char * path);
+
+
+/**
+ * @brief Check the path for preventing directory transversal attacks.
+ *
+ * @param path Path to be checked.
+ * @return 0 if the path is safe, 1 otherwise.
+ */
+int w_ref_parent_folder(const char * path);
+
+
+/**
+ * @brief Check that a name is a bare file name, safe to join to a base directory.
+ *
+ * Rejects the empty string, "." and "..", any name referring to a parent folder, and any name
+ * containing a path separator, so that joining it to a base directory cannot escape that directory
+ * and so that it can be used as-is in a directory-relative open.
+ *
+ * @param filename Name to be checked.
+ * @return 1 if the name is a bare file name, 0 otherwise.
+ */
+int w_is_bare_filename(const char * filename);
+
+
+/**
+ * @brief Read directory and return an array of contained files and folders, sorted alphabetically.
+ *
+ * @param name Path of the directory.
+ * @return Array of filenames.
+ */
+char ** wreaddir(const char * name);
+
+
+/**
+ * @brief Wrapper over access() that rejects UNC or mapped-drive paths.
+ *
+ * @param path  Null-terminated path to test.
+ * @param mode  Standard access() mode flags (R_OK, W_OK, …).
+ * @return 0 on success, −1 on failure (sets errno and GetLastError()).
+ */
+int waccess(const char *path, int mode);
+
+
+#ifdef WIN32
+/**
+ * @brief Wrapper over CreateFile that blocks network paths.
+ *
+ * @param lpFileName             UTF-8 file name.
+ * @param dwDesiredAccess        Desired access flags.
+ * @param dwShareMode            Share mode flags.
+ * @param lpSecurityAttributes   Optional security descriptor.
+ * @param dwCreationDisposition  Creation action.
+ * @param dwFlagsAndAttributes   File attributes / flags.
+ * @param hTemplateFile          Template file handle (may be NULL).
+ * @return A valid HANDLE or INVALID_HANDLE_VALUE on error.
+ */
+HANDLE wCreateFile(LPCSTR  lpFileName,
+    DWORD   dwDesiredAccess,
+    DWORD   dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD   dwCreationDisposition,
+    DWORD   dwFlagsAndAttributes,
+    HANDLE  hTemplateFile);
+
+
+/**
+ * @brief Wrapper over _stat64() that blocks network paths.
+ *
+ * @param pathname Path to inspect.
+ * @param statbuf  Output structure to fill.
+ * @return 0 on success, −1 on error (sets errno).
+ */
+int w_stat64(const char * pathname,
+             struct _stat64 * statbuf);
+#endif
+
+
+/**
+ * @brief Wrapper over opendir() that refuses network directories.
+ *
+ * @param name Directory path.
+ * @return Pointer to DIR or NULL on error (sets errno).
+ */
+DIR * wopendir(const char *name);
+
+
+/**
+ * @brief Wrapper over w_stat() that blocks network paths.
+ *
+ * @param pathname Path to inspect.
+ * @param statbuf  Output structure to fill.
+ * @return 0 on success, −1 on error (sets errno).
+ */
+int w_stat(const char * pathname,
+           struct stat * statbuf);
+
+
+/**
+ * @brief Open file normally in Linux, allow read/write/delete in Windows.
+ *
+ * @param pathname Path of the file.
+ * @param mode Open mode.
+ * @return File pointer.
+ */
+FILE * wfopen(const char * pathname, const char * mode);
+
+/**
+ * @brief Open a file for reading only if it is a regular file.
+ *
+ * On POSIX the last component of the path must not be a symbolic link, and the type is checked on the
+ * opened descriptor, so it is the type of the file that will be read. The open does not wait for a
+ * writer when the path is a FIFO. On Windows this is wfopen().
+ *
+ * @param pathname Path of the file.
+ * @param mode Read mode, "r" or "rb".
+ * @return File pointer, or NULL on error.
+ */
+FILE * w_fopen_regular(const char * pathname, const char * mode);
+
+
+/**
+ * @brief Create, truncate or append to a file inside a base directory, without following symlinks.
+ *
+ * Intended for directories that only ever hold files written by Wazuh itself (var/incoming, the
+ * active-response log and friends): a symlink, hard link, FIFO, device or directory found at the target path is rejected
+ * instead of being written through. @p filename must be a bare file name; it is rejected if it is
+ * empty, "." or "..", if it refers to a parent folder, or if it contains a path separator, so the
+ * resulting open cannot escape @p basedir.
+ *
+ * On both platforms the file is opened without truncating, the descriptor is vetted, and only then is
+ * the file truncated (write modes only; append modes keep the content and write at its end):
+ * truncating at open time would destroy the target of a hard link before anything about it could be
+ * checked. On Linux/macOS the open is relative to a descriptor of @p basedir and uses O_NOFOLLOW;
+ * HP-UX, which has no openat(), opens the joined path with O_NOFOLLOW instead; AIX, which has neither,
+ * rejects a symlink found by lstat() and checks the opened file is the one lstat() saw, or creates a
+ * missing file with O_EXCL; on Windows it skips reparse-point processing. In all cases the descriptor
+ * must turn out to be a regular file with a link count of exactly 1.
+ *
+ * @param basedir Base directory holding the file. Not created by this function.
+ * @param filename Bare file name inside @p basedir.
+ * @param mode Open mode: "w" or "wb" to truncate, "a" or "ab" to append.
+ * @return File pointer on success, NULL on error (sets errno).
+ */
+FILE * w_fopen_nofollow(const char * basedir, const char * filename, const char * mode);
+
+
+/**
+ * @brief Open an existing file inside a base directory for update, without following symlinks and
+ *        without truncating it at any point.
+ *
+ * Update-mode sibling of w_fopen_nofollow(), for callers that must write over a file's existing
+ * allocation rather than replace its contents -- overwriting a credential before unlinking it, for
+ * one, where truncating would release the secret's bytes and write the replacement somewhere else.
+ * The same vetting applies: @p filename must be a bare file name, and the descriptor must turn out
+ * to be a regular file with a link count of exactly 1, so a symlink, hard link, FIFO, device or
+ * directory at the target path is rejected instead of written through.
+ *
+ * The file must already exist; it is never created. A caller overwriting "what is there" has
+ * nothing to do when nothing is there, and creating the file would turn a target that vanished
+ * mid-operation into a fresh empty one.
+ *
+ * @param basedir Base directory holding the file. Not created by this function.
+ * @param filename Bare file name inside @p basedir.
+ * @return File pointer opened "r+b" and positioned at offset 0, or NULL on error (sets errno).
+ */
+FILE * w_fopen_nofollow_update(const char * basedir, const char * filename);
+
+
+/**
+ * @brief Open a compressed file inside a base directory for reading, without following symlinks.
+ *
+ * Read-side counterpart of w_fopen_nofollow(): intended for directories that may contain files planted
+ * by another party (var/incoming and friends), where a symlink, hard link, FIFO, device or directory
+ * found at the target path must be rejected instead of read through. @p filename must be a bare file
+ * name; it is rejected if it is empty, "." or "..", if it refers to a parent folder, or if it contains a
+ * path separator, so the resulting open cannot escape @p basedir.
+ *
+ * On Linux/macOS the open is relative to a descriptor of @p basedir and uses O_NOFOLLOW; HP-UX, which
+ * has no openat(), opens the joined path with O_NOFOLLOW instead; AIX, which has neither, rejects a
+ * symlink found by lstat() and checks the opened file is the one lstat() saw; on Windows it skips
+ * reparse-point processing. In all cases the descriptor must turn out to be a regular file with a link
+ * count of exactly 1 before it is handed to zlib.
+ *
+ * @param basedir Base directory holding the file. Not created by this function.
+ * @param filename Bare file name inside @p basedir.
+ * @param mode Open mode, either "r" or "rb".
+ * @return Compressed file handle on success, NULL on error (sets errno).
+ */
+gzFile w_gzopen_nofollow(const char * basedir, const char * filename, const char * mode);
+
+
+#ifndef WIN32
+/**
+ * @brief Opens @p filename inside @p basedir without following symlinks, and vets the resulting descriptor
+ * as a lone regular file -- rejecting hard links, FIFOs, devices, and directories -- before handing it
+ * back. Shared by w_fopen_nofollow() and w_gzopen_nofollow() so a future hardening fix only has to be
+ * applied once instead of needing to be kept in sync across every caller.
+ *
+ * @param basedir Base directory holding the file.
+ * @param filename Bare file name inside @p basedir.
+ * @param oflags open()/openat() flags; must include O_CLOEXEC | O_NONBLOCK | O_NOCTTY (the last two so
+ *               a FIFO cannot block the open and a terminal cannot become the daemon's controlling tty)
+ *               on top of whichever of O_RDONLY/O_WRONLY/O_CREAT the caller needs.
+ *               O_NOFOLLOW is added here. Deliberately never includes O_TRUNC: truncating at open time
+ *               would destroy the target before anything about it can be checked, which is precisely how
+ *               a hard link slips through -- it is a regular file, so no file type test can tell it apart.
+ *               A caller that needs the file truncated must do so only after this returns a vetted
+ *               descriptor.
+ * @param mode Permission bits, used only when oflags includes O_CREAT.
+ * @return A vetted file descriptor, with O_NONBLOCK already cleared, on success; -1 on error (sets errno).
+ */
+int w_openat_nofollow_vetted(const char * basedir, const char * filename, int oflags, mode_t mode);
+
+/**
+ * @brief Whether @p path names the regular file open on @p fd, and only that: not through a symlink,
+ *        and with no second hard link.
+ *
+ * For a file staged under a name an unprivileged account can replace, checked right before the name
+ * is used.
+ *
+ * @param path Name to check.
+ * @param fd Descriptor of the file it should name.
+ * @return true if @p path names that file.
+ */
+bool w_path_names_fd(const char *path, int fd);
+#endif
+
+
+/**
+ * @brief Open a file for reading, following an admin-trusted symlink but rejecting an untrusted one.
+ *
+ * Intended for paths configured by an admin (such as logcollector's `<localfile>` entries and glob
+ * expansions) where following a symlink is an accepted, even intended, feature — unlike
+ * w_fopen_nofollow()/w_gzopen_nofollow(), which reject every symlink outright.
+ *
+ * On POSIX the path is resolved one component at a time, so every symlink on it, including one naming a
+ * directory, is inspected before it is followed. On Linux a symlink on procfs, such as /proc/<pid>/root,
+ * names an object rather than a path, so once inspected it is followed by the kernel. The final entry is
+ * opened non-blocking, so a FIFO cannot block the open. The file is then accepted only when:
+ * - it is a regular file, or a FIFO or character device owned by root or found in a directory owned by
+ *   root that only root can write to;
+ * - every symlink followed is owned by root, sits in a directory only root can write to, or is owned by
+ *   the file's owner;
+ * - if it, or any symlink followed, has more than one hard link, the directory holding it is owned by root
+ *   or by its owner and is not writable by group or others, since a hard link can be made by anyone who
+ *   can write there.
+ *
+ * A rejection sets errno to EINVAL (file type) or EPERM (trust), never ENOENT, so a caller that treats
+ * ENOENT as "file gone" is not misled by it. A path that keeps changing while it is checked, as a symlink
+ * re-pointed during rotation does, is retried a few times and then fails with EAGAIN: it was not rejected,
+ * and may be opened again later.
+ *
+ * Windows follows junctions and symlinks too, and accepts a path that traverses none without further
+ * checks. When it does, the path is resolved one component at a time, as on POSIX: each junction or
+ * symlink met is checked, then its target is read one level only and the walk continues from there, so the
+ * junctions and symlinks inside a link's destination are checked too. Each directory and link on the way
+ * is held open, without delete sharing, so it cannot be renamed, deleted or replaced until the file has
+ * been matched against it. Every junction or symlink met must be owned by SYSTEM, BUILTIN\Administrators,
+ * TrustedInstaller, a member of the local Administrators group or the owner of the file finally read, and
+ * no other principal may modify it, else the open fails with EPERM. The same rejection applies to a
+ * reparse point that redirects the path in a way that cannot be read one level at a time, a link to
+ * anything but a local volume, a chain of more than 40 junctions or symbolic links, and a file reached by
+ * more than one hard link. A component that changes, vanishes or is in a sharing violation while it is
+ * checked is retried and then fails with EAGAIN. The file must be on disk (EINVAL otherwise) and on a
+ * local volume (EPERM otherwise).
+ *
+ * Solaris 10 and HP-UX lack the *at() calls the component walk needs. There the path is followed as
+ * wfopen() would, still non-blocking, and the same rules are applied to the opened file, but only the
+ * path's last entry is checked as a symlink, so a symlink swapped in a directory higher up is not caught.
+ *
+ * @param path Path of the file. May be absolute or relative, and may contain symlinks.
+ * @param mode Open mode, either "r" or "rb".
+ * @return File pointer on success, NULL on error (sets errno).
+ */
+FILE * w_fopen_vetted_follow(const char * path, const char * mode);
+
+
+/**
+ * @brief Compress a file in GZIP.
+ *
+ * On POSIX the source is opened as w_fopen_vetted_follow() does, except a symlink as its last entry is not
+ * followed, and it must be a regular file.
+ *
+ * @param filesrc Source file.
+ * @param filedst Compressed file path.
+ * @return 0 on success, -2 if the source is skipped, -1 on error.
+ */
+int w_compress_gzfile(const char *filesrc, const char *filedst);
+
+
+/**
+ * @brief Uncompress GZIP file.
+ *
+ * @param gzfilesrc GZIP file path.
+ * @param gzfiledst Uncompressed file pah.
+ * @return 0 on success, -1 on error.
+ */
+int w_uncompress_gzfile(const char *gzfilesrc, const char *gzfiledst);
+
+
+/**
+ * @brief Check if a file is ASSCI or UTF8.
+ *
+ * @param file File to be checked.
+ * @param max_lines Max line to be processed.
+ * @param max_chars_utf8 Max number of UTF8 characters to be processed.
+ * @return 0 if the file is ASSCI or UTF8, 1 if not.
+ */
+int is_ascii_utf8(const char * file, unsigned int max_lines, unsigned int max_chars_utf8);
+
+
+/**
+ * @brief Check if a file is USC2.
+ *
+ * @param file File to be checked.
+ * @return 0 if the file is USC2, 1 if not.
+ */
+int is_usc2(const char * file);
+
+
+/**
+ * @brief Checks if the specified file is binary.
+ *
+ * @param f_name File to be checked.
+ * @return 0 if the file is binary, 1 if not.
+ */
+int checkBinaryFile(const char *f_name);
+
+
+/**
+ * @brief Returns the current file position of the given stream.
+ *        This is a wrapper for `ftell()` in UNIX and `_ftelli64()` in Windows.
+ *
+ * @param x File pointer.
+ * @return File position.
+ */
+int64_t w_ftell (FILE *x);
+
+/**
+ * @brief Set the current file position of the given stream.
+*        This is a wrapper for `fseek()` in UNIX and `_fseeki64()` in Windows.
+ * @param x File pointer.
+ * @param pos File position.
+ * @param mode Position used as reference for the offset: SEEK_SET, SEEK_CURRENT, SEEK_END
+ * @return  If successful, the function returns zero. Otherwise, it returns -1.
+ */
+int w_fseek(FILE *x, int64_t pos, int mode);
+
+/**
+ * @brief Prevent children processes from inheriting a file pointer.
+ *
+ * @param File pointer.
+ */
+void w_file_cloexec(FILE * fp);
+
+
+/**
+ * @brief Prevent children processes from inheriting a file descriptor.
+ *
+ * @param File descriptor.
+ */
+void w_descriptor_cloexec(int fd);
+
+
+#ifdef WIN32
+/**
+ * @brief Get the creation date object. (Windows)
+ *
+ * @param [in] dir Path of the file/folder.
+ * @param [out] utc Pointer to SYSTEMTIME object.
+ * @return 0 on success, 1 on error.
+ */
+int get_creation_date(char *dir, SYSTEMTIME *utc);
+
+
+/**
+ * @brief Get the modification date object. (Windows)
+ *
+ * @param file Path of the file.
+ * @return time_t date of modification format.
+ */
+time_t get_UTC_modification_time(const char *file);
+
+
+/**
+ * @brief Move to the directory where this executable lives in. (Windows)
+ *
+ */
+void w_ch_exec_dir();
+
+
+/**
+ * @brief Get the size of a file. (Windows)
+ *
+ * @param file Path of the file.
+ * @return File size or -1 on error.
+ */
+DWORD FileSizeWin(const char * file);
+
+/**
+ * @brief Open a file
+ *
+ * This mode of opening the file allows reading \r\n instead of \n.
+ *
+ * @param file pathfile to open
+ * @param[out] lpFileInformation  pointer to a BY_HANDLE_FILE_INFORMATION structure that receives the file information
+ * @return file descriptor on success, otherwise null.
+ */
+FILE * w_fopen_r(const char *file, const char * mode, BY_HANDLE_FILE_INFORMATION * lpFileInformation);
+
+/**
+ * @brief Expands wildcards for Windows (using FindFirstFile and FindNexFile)
+ *
+ * @param path Path containing the wildcards to expand.
+ * @return char** Vector with the expanded paths.
+ */
+char **expand_win32_wildcards(const char *path);
+
+/**
+ * @brief Checks if a given path is located on network storage.
+ *
+ * This function blocks all network paths to prevent security vulnerabilities
+ * such as NetNTLMv2 credential exposure and NTLM relay attacks.
+ *
+ * Detected network path types:
+ * - Standard UNC paths: \\\\server\\share\\...
+ * - Extended-length UNC paths: \\\\?\\UNC\\server\\share\\...
+ * - Device paths: \\\\.\\device
+ * - Extended-length paths: \\\\?\\C:\\...
+ * - Mapped network drives: Z:\\folder\\file.txt
+ *
+ * Any path starting with two separators is considered a network path, as there
+ * are no legitimate local file paths in Windows that begin with this prefix.
+ * Forward slashes are treated like backslashes, so forms such as //server/share
+ * or /\\server\\share are caught as well.
+ *
+ * @param path A null-terminated string containing the file path to check.
+ * @return true if the path points to a network location, false otherwise.
+ *
+ * @note This function addresses CVE-2025-30201 and GHSA-5g2v-99vr-3hgw.
+ * @see https://github.com/wazuh/wazuh/pull/30060
+ */
+bool is_network_path(const char *path);
+
+#endif // Windows
+
+/**
+ * @brief Add a trailing separator to a path string
+ *
+ * The trailing separator ('/' on UNIX, '\ ' on Windows) is only added if the source string does not end with such character.
+ *
+ * @param dest Destination string.
+ * @param src Source path string.
+ * @param n Size of the destination string.
+ * @return int number of bytes written in the string. If is greater or equal than n, the string remained truncated.
+ */
+int trail_path_separator(char * dest, const char * src, size_t n);
+
+
+/**
+ * @brief Check if a path is absolute
+ *
+ * A path on UNIX is absolute if it starts with /.
+ *
+ * A path on Windows is absolute if it starts with X:\ , being X any alphabetic character.
+ *
+ * @param path Input path.
+ * @return true if the path is absolute.
+ * @return false if the path is relative.
+ */
+bool isabspath(const char * path);
+
+
+/**
+ * @brief Unify path separators (slashes) for Windows paths
+ *
+ * Let all path separators be backslashes.
+ *
+ * @param path A string containing a path.
+ */
+void win_path_backslash(char * path);
+
+
+/**
+ * @brief Get an absolute path
+ *
+ * @param path Input path (absolute or relative).
+ * @param buffer Destination string.
+ * @param size Size of buffer.
+ * @return Pointer to buffer on success, or NULL on error.
+ */
+char * abspath(const char * path, char * buffer, size_t size);
+
+
+/**
+ * @brief Get the content of a given file
+ *
+ * @param path File location
+ * @param max_size Maximum allowed file size
+ * @return The content of the file
+ * @retval NULL The file doesn't exist or its size exceeds the maximum allowed
+ */
+char * w_get_file_content(const char * path, unsigned long max_size);
+
+
+/**
+ * @brief Get the pointer to a given file
+ *
+ * @param path File location
+ * @return The pointer to the file
+ * @retval NULL The file doesn't exist
+ */
+FILE * w_get_file_pointer(const char * path);
+
+/**
+ * @brief Check if a file is gzip compressed
+ *
+ * @param path File location
+ * @retval 0 The file is not gzip compressed
+ * @retval 1 The file is gzip compressed
+ */
+int w_is_compressed_gz_file(const char * path);
+
+/**
+ * @brief Check if a file is bzip2 compressed
+ *
+ * @param path File location
+ * @retval 0 The file is not bzip2 compressed
+ * @retval 1 The file is bzip2 compressed
+ */
+int w_is_compressed_bz2_file(const char * path);
+
+#ifndef CLIENT
+/**
+ * @brief Check if a file from a path is compressed in bunzip2 or gzip and uncompressed it
+ *
+ * @param path File location
+ * @retval -1 The file cannot be uncompressed
+ * @retval 0 The file has been uncompressed (.gz or .bz2)
+ */
+int w_uncompress_bz2_gz_file(const char * path, const char * dest);
+#endif /* CLIENT */
+
+/**
+ * @brief Get the Wazuh installation directory
+ *
+ * The target-specific env var (`WAZUH_MANAGER_HOME` or `WAZUH_AGENT_HOME`) wins
+ * if set; otherwise it is auto-detected from /proc, then argv[0].
+ *
+ * @param arg ARGV0 - Program name
+ * @return Pointer to the Wazuh installation path on success
+ */
+char *w_homedir(char *arg);
+#endif /* FILE_OP_H */

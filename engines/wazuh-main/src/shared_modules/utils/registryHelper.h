@@ -1,0 +1,580 @@
+/*
+ * Wazuh shared modules utils
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of either the GNU General Public License, version 2, or
+ * the GNU Affero General Public License, version 3 or (at your option) any
+ * later version, both as published by the Free Software Foundation.
+ *
+ * SPDX-License-Identifier: GPL-2.0-only OR AGPL-3.0-or-later
+ */
+
+#ifdef WIN32
+
+#ifndef _REGISTRY_HELPER_H
+#define _REGISTRY_HELPER_H
+
+#include <string>
+#include <winsock2.h>
+#include <windows.h>
+#include <winreg.h>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include "encodingWindowsHelper.h"
+#include "windowsHelper.h"
+#include "stringHelper.h"
+#include "globHelper.h"
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+
+namespace Utils
+{
+    class Registry final
+    {
+        public:
+            Registry(const HKEY key, const std::string& subKey = "", const REGSAM access = KEY_READ)
+                : m_registryKey{openRegistry(key, subKey, access)}
+            {}
+
+            Registry(const std::string& key, const std::string& subKey, const REGSAM access = KEY_READ)
+                : m_registryKey {openRegistry(stringToHKEY(key), subKey, access)}
+            {
+            }
+
+            ~Registry()
+            {
+                close();
+            }
+
+            void close()
+            {
+                if (m_registryKey)
+                {
+                    RegCloseKey(m_registryKey);
+                    m_registryKey = nullptr;
+                }
+            }
+
+            DWORD dword(const std::string& valueName) const
+            {
+                DWORD ret{};
+                DWORD size{sizeof(DWORD)};
+                const auto result
+                {
+                    RegQueryValueEx(m_registryKey, valueName.c_str(), nullptr, nullptr, reinterpret_cast<LPBYTE>(&ret), &size)
+                };
+
+                if (result != ERROR_SUCCESS)
+                {
+                    throw std::system_error
+                    {
+                        result,
+                        std::system_category(),
+                        "Error reading DWORD value of: " + valueName
+                    };
+                }
+
+                return ret;
+            }
+
+            bool dword(const std::string& valueName, DWORD& value) const
+            {
+                // The type has to be requested and checked: without it a REG_SZ short enough to
+                // fit the buffer is read as raw bytes and returned as a plausible number, so
+                // "123" comes back as 3355185. The read lands in a local so a rejected value
+                // never reaches the caller's variable, and the payload has to be a whole DWORD.
+                DWORD type{};
+                DWORD data{};
+                DWORD size{sizeof(DWORD)};
+                const auto result
+                {
+                    RegQueryValueEx(m_registryKey, valueName.c_str(), nullptr, &type, reinterpret_cast<LPBYTE>(&data), &size)
+                };
+
+                if (ERROR_SUCCESS != result || REG_DWORD != type || sizeof(DWORD) != size)
+                {
+                    return false;
+                }
+
+                value = data;
+                return true;
+            }
+
+            std::vector<std::string> enumerate() const
+            {
+                std::vector<std::string> ret;
+                constexpr auto MAX_KEY_NAME_SIZE{255};//https://docs.microsoft.com/en-us/windows/win32/sysinfo/registry-element-size-limits
+                char buff[MAX_KEY_NAME_SIZE] {};
+                DWORD size{MAX_KEY_NAME_SIZE};
+                DWORD index{0};
+                auto result{RegEnumKeyEx(m_registryKey, index, buff, &size, nullptr, nullptr, nullptr, nullptr)};
+
+                while (result == ERROR_SUCCESS)
+                {
+                    ret.push_back(buff);
+                    size = MAX_KEY_NAME_SIZE;
+                    ++index;
+                    result = RegEnumKeyEx(m_registryKey, index, buff, &size, nullptr, nullptr, nullptr, nullptr);
+                }
+
+                if (result != ERROR_NO_MORE_ITEMS)
+                {
+                    throw std::system_error
+                    {
+                        result,
+                        std::system_category(),
+                        "Error enumerating registry."
+                    };
+                }
+
+                return ret;
+            }
+
+            std::vector<std::string> enumerateValueKey() const
+            {
+                std::vector<std::string> ret;
+                constexpr auto MAX_KEY_NAME_VALUE {32767}; // https://docs.microsoft.com/en-us/windows/win32/sysinfo/registry-element-size-limits
+                char buffer[MAX_KEY_NAME_VALUE];
+                DWORD size {MAX_KEY_NAME_VALUE};
+                DWORD index {0};
+
+                auto result {RegEnumValue(m_registryKey, index, buffer, &size, nullptr,  nullptr, nullptr, nullptr)};
+
+                while (ERROR_SUCCESS == result)
+                {
+                    ret.push_back(buffer);
+                    size = MAX_KEY_NAME_VALUE;
+                    index++;
+                    result = RegEnumValue(m_registryKey, index, buffer, &size, nullptr,  nullptr, nullptr, nullptr);
+                }
+
+                if (ERROR_NO_MORE_ITEMS != result)
+                {
+                    throw std::system_error
+                    {
+                        result,
+                        std::system_category(),
+                        "Error enumerating Values in registry."
+                    };
+                }
+
+                return ret;
+            }
+
+            void enumerate(const std::function<void(const std::string&)>& callback) const
+            {
+                std::vector<std::string> ret;
+                constexpr auto MAX_KEY_NAME_SIZE{255};//https://docs.microsoft.com/en-us/windows/win32/sysinfo/registry-element-size-limits
+                char buff[MAX_KEY_NAME_SIZE] {};
+                DWORD size{MAX_KEY_NAME_SIZE};
+                DWORD index{0};
+                auto result{RegEnumKeyEx(m_registryKey, index, buff, &size, nullptr, nullptr, nullptr, nullptr)};
+
+                while (result == ERROR_SUCCESS)
+                {
+                    callback(buff);
+                    size = MAX_KEY_NAME_SIZE;
+                    ++index;
+                    result = RegEnumKeyEx(m_registryKey, index, buff, &size, nullptr, nullptr, nullptr, nullptr);
+                }
+
+                if (result != ERROR_NO_MORE_ITEMS)
+                {
+                    throw std::system_error
+                    {
+                        result,
+                        std::system_category(),
+                        "Error enumerating registry."
+                    };
+                }
+            }
+
+            bool enumerate(std::vector<std::string>& values) const
+            {
+                bool ret{true};
+
+                try
+                {
+                    values = this->enumerate();
+                }
+                catch (...)
+                {
+                    ret = false;
+                }
+
+                return ret;
+            }
+
+            bool enumerateValueKey(std::vector<std::string>& values) const
+            {
+                auto ret{true};
+
+                try
+                {
+                    values = this->enumerateValueKey();
+                }
+                catch (...)
+                {
+                    ret = false;
+                }
+
+                return ret;
+            }
+
+            std::string keyModificationDate() const
+            {
+                std::string ret;
+                FILETIME lastModificationTime { };
+                const auto result
+                {
+                    RegQueryInfoKey(m_registryKey, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &lastModificationTime)
+                };
+
+                if (ERROR_SUCCESS == result)
+                {
+                    ULARGE_INTEGER time { };
+
+                    time.LowPart = lastModificationTime.dwLowDateTime;
+                    time.HighPart = lastModificationTime.dwHighDateTime;
+
+                    // Use structure values to build 18-digit LDAP/FILETIME number
+                    ret = Utils::buildTimestamp(time.QuadPart);
+                }
+
+                return ret;
+            }
+
+            std::string string(const std::string& valueName) const
+            {
+                DWORD size{0};
+                auto result
+                {
+                    RegQueryValueEx(m_registryKey, valueName.c_str(), nullptr, nullptr, nullptr, &size)
+                };
+
+                if (result != ERROR_SUCCESS)
+                {
+                    throw std::system_error
+                    {
+                        result,
+                        std::system_category(),
+                        "Error reading the size of: " + valueName
+                    };
+                }
+
+                const auto spBuff{std::make_unique<BYTE[]>(size)};
+
+                if (!spBuff)
+                {
+                    throw std::runtime_error
+                    {
+                        "Error allocating memory to read String value of: " + valueName
+                    };
+                }
+
+                result = RegQueryValueEx(m_registryKey, valueName.c_str(), nullptr, nullptr, spBuff.get(), &size);
+
+                if (result != ERROR_SUCCESS)
+                {
+                    throw std::system_error
+                    {
+                        result,
+                        std::system_category(),
+                        "Error reading String value of: " + valueName
+                    };
+                }
+
+                return std::string{reinterpret_cast<const char*>(spBuff.get())};
+            }
+
+
+            bool qword(const std::string& valueName, ULONGLONG& value) const
+            {
+                ULONGLONG valueRegistry;
+                DWORD size {sizeof(ULONGLONG)};
+                DWORD type;
+                auto ret {false};
+
+                const auto result { RegQueryValueEx(m_registryKey, valueName.c_str(), nullptr, &type, reinterpret_cast<LPBYTE>(&valueRegistry), &size) };
+
+                if (ERROR_SUCCESS != result)
+                {
+                    throw std::system_error
+                    {
+                        result,
+                        std::system_category(),
+                        "Error reading the value of: " + valueName
+                    };
+                }
+
+                if (REG_QWORD == type)
+                {
+                    value = valueRegistry;
+                    ret = true;
+                }
+
+                return ret;
+            }
+
+            bool string(const std::string& valueName, std::string& value) const
+            {
+                bool ret{true};
+
+                try
+                {
+                    value = EncodingWindowsHelper::stringAnsiToStringUTF8(this->string(valueName));
+                }
+                catch (...)
+                {
+                    ret = false;
+                }
+
+                return ret;
+            }
+
+            std::string HandleRegMultiSZ(const BYTE* data, DWORD size) const
+            {
+                if (size == 0)
+                {
+                    return "";
+                }
+
+                std::string result;
+                const char* current = reinterpret_cast<const char*>(data);
+                const char* end = reinterpret_cast<const char*>(data + size);
+
+                while (current < end && *current != '\0')
+                {
+                    size_t remaining = end - current;
+                    size_t len = strnlen(current, remaining);
+
+                    result.append(current, len);
+                    current += len + 1;
+
+                    if (current < end && *current != '\0')
+                    {
+                        result += ' ';
+                    }
+                }
+
+                return result;
+            }
+
+            std::string getValue(const std::string& valueName) const
+            {
+                DWORD type = 0;
+                DWORD size = 0;
+                LONG result = RegQueryValueExA(m_registryKey, valueName.c_str(), nullptr, &type, nullptr, &size);
+
+                if (result != ERROR_SUCCESS)
+                {
+                    throw std::system_error {result, std::system_category(), "Error reading the size of: " + valueName};
+                }
+
+                auto spBuff = std::make_unique<BYTE[]>(size);
+                result = RegQueryValueExA(m_registryKey, valueName.c_str(), nullptr, &type, spBuff.get(), &size);
+
+                if (result != ERROR_SUCCESS)
+                {
+                    throw std::system_error {
+                        result, std::system_category(), "Error reading the value of: " + valueName};
+                }
+
+                switch (type)
+                {
+                    case REG_SZ:
+                    case REG_EXPAND_SZ: return std::string(reinterpret_cast<char*>(spBuff.get()));
+                    case REG_DWORD:
+                    {
+                        DWORD dwValue;
+                        std::memcpy(&dwValue, spBuff.get(), sizeof(DWORD));
+                        return std::to_string(dwValue);
+                    }
+                    case REG_QWORD:
+                    {
+                        ULONGLONG qwValue;
+                        std::memcpy(&qwValue, spBuff.get(), sizeof(ULONGLONG));
+                        return std::to_string(qwValue);
+                    }
+                    case REG_MULTI_SZ:
+                    {
+                        return HandleRegMultiSZ(spBuff.get(), size);
+                    }
+                    default: throw std::runtime_error("Unsupported registry value type for: " + valueName);
+                }
+            }
+
+            static HKEY stringToHKEY(const std::string& keyName)
+            {
+                if (keyName == "HKEY_CLASSES_ROOT" || keyName == "HKCR")
+                {
+                    return HKEY_CLASSES_ROOT;
+                }
+                if (keyName == "HKEY_CURRENT_USER" || keyName == "HKCU")
+                {
+                    return HKEY_CURRENT_USER;
+                }
+                if (keyName == "HKEY_LOCAL_MACHINE" || keyName == "HKLM")
+                {
+                    return HKEY_LOCAL_MACHINE;
+                }
+                if (keyName == "HKEY_USERS" || keyName == "HKU")
+                {
+                    return HKEY_USERS;
+                }
+                if (keyName == "HKEY_CURRENT_CONFIG" || keyName == "HKCC")
+                {
+                    return HKEY_CURRENT_CONFIG;
+                }
+                if (keyName == "HKEY_PERFORMANCE_DATA")
+                {
+                    return HKEY_PERFORMANCE_DATA;
+                }
+                if (keyName == "HKEY_PERFORMANCE_TEXT")
+                {
+                    return HKEY_PERFORMANCE_TEXT;
+                }
+                if (keyName == "HKEY_PERFORMANCE_NLSTEXT")
+                {
+                    return HKEY_PERFORMANCE_NLSTEXT;
+                }
+                if (keyName == "HKEY_DYN_DATA")
+                {
+                    return HKEY_DYN_DATA; // obsolete
+                }
+                throw std::invalid_argument("Unknown HKEY string: " + keyName);
+            }
+
+            static bool KeyExists(const std::string& key, const std::string& subKey)
+            {
+                HKEY hKey = nullptr;
+
+                LONG result = RegOpenKeyEx(stringToHKEY(key), subKey.c_str(), 0, KEY_READ, &hKey);
+
+                if (hKey != nullptr)
+                {
+                    RegCloseKey(hKey);
+                }
+
+                return (result == ERROR_SUCCESS);
+            }
+
+            HKEY openRegistry(const HKEY key, const std::string& subKey, const REGSAM access)
+            {
+                HKEY ret {nullptr};
+                const auto result {RegOpenKeyEx(key, subKey.c_str(), 0, access, &ret)};
+
+                if (result != ERROR_SUCCESS)
+                {
+                    throw std::system_error {result, std::system_category(), "Error opening registry: " + subKey};
+                }
+
+                return ret;
+            }
+
+        private:
+            HKEY m_registryKey {nullptr};
+    };
+
+    static void expandRegistryPath(const HKEY key, const std::string& subKey, std::vector<std::string>& registryKeys)
+    {
+        // Find the first * or ? from path.
+        const std::array<char, 2> wildcards {'*', '?'};
+        size_t wildcardPos = std::string::npos;
+
+        for (const auto& wildcard : wildcards)
+        {
+            // Find the first wildcard.
+            const auto pos = subKey.find_first_of(wildcard);
+
+            // If the wildcard is found and it is before the current wildcard, then update the wildcard
+            // position.
+            if (std::string::npos != pos && (std::string::npos == wildcardPos || pos < wildcardPos))
+            {
+                wildcardPos = pos;
+            }
+        }
+
+        if (std::string::npos != wildcardPos)
+        {
+            // The next directory is the part of the path after the first wildcard.
+            const auto nextDirectoryPos {subKey.find_first_of('\\', wildcardPos)};
+
+            // The parent directory is the part of the path before the first wildcard.
+            // If the wildcard is the first character, then the parent directory is the root directory.
+            const auto parentDirectoryPos {0 == wildcardPos ? 0 : subKey.find_last_of('\\', wildcardPos)};
+
+            // If the parent directory is not found, then the path is invalid.
+            if (std::string::npos == parentDirectoryPos)
+            {
+                throw std::runtime_error {"Invalid path: " + subKey};
+            }
+
+            // The base directory is the part of the path before the first wildcard.
+            // If there is no wildcard, then the base directory is the whole path.
+            // If the wildcard is the first character, then the base directory is the root directory.
+            std::string baseDir;
+
+            if (0 == wildcardPos)
+            {
+                baseDir = "";
+            }
+            else
+            {
+                baseDir = subKey.substr(0, parentDirectoryPos);
+            }
+
+            // The pattern is the part of the path after the first wildcard.
+            // If the wildcard is the last character, then the pattern is the rest of the string.
+            // If the wildcard is the first character, then the pattern is the rest of the string, minus the
+            // next '\'. If there is no next '\', then the pattern is the rest of the string.
+            const auto pattern {
+                subKey.substr(0 == parentDirectoryPos ? 0 : parentDirectoryPos + 1,
+                              std::string::npos == nextDirectoryPos
+                                  ? std::string::npos
+                                  : nextDirectoryPos - (0 == parentDirectoryPos ? 0 : parentDirectoryPos + 1))};
+
+            try
+            {
+                // Enumerate the registry keys and expand the path.
+                for (const auto& entry :
+                     Utils::Registry {key, baseDir, KEY_READ | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY}.enumerate())
+                {
+                    // If the base directory is empty, then the entry name is the entry.
+                    // Otherwise, the entry name is the base directory, followed by a '\', followed by the
+                    // entry.
+                    const auto entryName {baseDir.empty() ? entry : R"(\)" + entry};
+
+                    // If the entry name matches the pattern, then expand the path.
+                    if (std::string::npos == entry.find_first_of("*?") && Utils::patternMatch(entryName, pattern))
+                    {
+                        // If the next directory position is npos, then there is no next directory.
+                        // Otherwise, the next directory is the part of the path after the next '\'.
+                        Utils::expandRegistryPath(
+                            key,
+                            baseDir + entryName +
+                                (std::string::npos == nextDirectoryPos ? "" : subKey.substr(nextDirectoryPos)),
+                            registryKeys);
+                    }
+                }
+            }
+            catch (const std::exception& e)
+            {
+                (void)e;
+            }
+        }
+        else
+        {
+            registryKeys.push_back(subKey);
+        }
+    }
+}
+
+#pragma GCC diagnostic pop
+
+#endif // _REGISTRY_HELPER_H
+
+#endif //WIN32

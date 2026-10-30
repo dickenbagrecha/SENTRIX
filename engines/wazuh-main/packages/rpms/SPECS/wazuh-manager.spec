@@ -1,0 +1,1141 @@
+%if %{_isstage} == no
+  %define _rpmfilename %%{NAME}_%%{VERSION}-%%{RELEASE}_%%{ARCH}_%{_hashcommit}.rpm
+%else
+  %define _rpmfilename %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm
+%endif
+
+Summary:     Wazuh helps you to gain security visibility into your infrastructure by monitoring hosts at an operating system and application level. It provides the following capabilities: log analysis, file integrity monitoring, intrusions detection and policy and compliance monitoring
+Name:        wazuh-manager
+Version:     %{_version}
+Release:     %{_release}
+License:     GPL-2.0-only AND AGPL-3.0-or-later
+Group:       System Environment/Daemons
+Source0:     %{name}-%{version}.tar.gz
+URL:         https://www.wazuh.com/
+BuildRoot:   %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
+Vendor:      Wazuh <info@wazuh.com>
+Packager:    Wazuh <info@wazuh.com>
+Requires(pre):    /usr/sbin/groupadd /usr/sbin/useradd
+Requires(postun): /usr/sbin/groupdel /usr/sbin/userdel
+Conflicts:   ossec-hids ossec-hids-agent
+Obsoletes: wazuh-api < 4.0.0
+AutoReqProv: no
+
+# AutoReqProv is off above, so every dependency is stated rather than inferred, and each line below
+# names what still needs it.
+#
+#   coreutils  Every scriptlet and wazuh-manager-control (cp, mv, chown, chmod, mkdir, cat, head,
+#              od, tr, cut, date...). It also brings glibc, which the daemons and the bundled
+#              Python link and whose getent and ldconfig the scriptlets and the API call.
+#
+# Requires(pre)/(postun) above cover the account tools. Not declared, on purpose: systemctl and
+# service (the init system the host runs, called only when present), /sbin/nologin (the service
+# account's shell, a path never executed) and ldconfig (part of glibc, above). The credential
+# resolver is Python run by the bundled interpreter and calls no host tool; libstdc++ and libgcc_s
+# ship in lib/, and the interpreter's zlib and binascii modules take zlib from lib/libwazuhext.so.
+Requires: coreutils
+BuildRequires: coreutils glibc-devel automake autoconf libtool policycoreutils-python curl perl
+
+ExclusiveOS: linux
+
+%define _source_payload w9.xzdio
+%define _binary_payload w9.xzdio
+
+%description
+Wazuh helps you to gain security visibility into your infrastructure by monitoring
+hosts at an operating system and application level. It provides the following capabilities:
+log analysis, file integrity monitoring, intrusions detection and policy and compliance monitoring
+
+# Don't generate build_id links to prevent conflicts with other
+# packages.
+%global _build_id_links none
+# The rpm of the builder image is built with prefix /usr/local: pin the license directory
+# to /usr/share/licenses/<name>, where %license files belong.
+%global _defaultlicensedir /usr/share/licenses
+%global _docdir_fmt %%{NAME}
+
+# Build debuginfo package
+%package -n wazuh-manager-debuginfo
+Requires: wazuh-manager = %{_version}-%{_release}
+Summary: Debug information for package %{name}.
+%description -n wazuh-manager-debuginfo
+This package provides debug information for package %{name}.
+
+
+%prep
+%setup -q
+
+./src/init/gen_wazuh.sh conf manager centos %rhel %{_localstatedir} > etc/wazuh-manager.conf
+
+%build
+pushd src
+# Rebuild for manager
+make clean
+
+# Build Wazuh sources
+make deps TARGET=manager
+make -j%{_threads} TARGET=manager DEBUG=%{_debugenabled}
+
+popd
+
+%install
+# Clean BUILDROOT
+rm -fr %{buildroot}
+
+echo 'USER_LANGUAGE="en"' > ./etc/preloaded-vars.conf
+echo 'USER_INSTALL_TYPE="manager"' >> ./etc/preloaded-vars.conf
+echo 'USER_DIR="%{_localstatedir}"' >> ./etc/preloaded-vars.conf
+echo 'USER_DELETE_DIR="y"' >> ./etc/preloaded-vars.conf
+echo 'USER_UPDATE="n"' >> ./etc/preloaded-vars.conf
+echo 'USER_ENABLE_EMAIL="n"' >> ./etc/preloaded-vars.conf
+echo 'USER_ENABLE_AUTHD="y"' >> ./etc/preloaded-vars.conf
+echo 'USER_AUTO_START="n"' >> ./etc/preloaded-vars.conf
+# This is a staging install whose tree is copied into the package below. Resolving credentials here
+# would bake this build host's rbac.db, bootstrap CA private key and certificates into an artifact
+# every deployment installs. %post resolves them on the target host instead.
+echo 'USER_RESOLVE_CREDENTIALS="n"' >> ./etc/preloaded-vars.conf
+./install.sh || { echo "install.sh failed! Aborting." >&2; exit 1; }
+
+# Belt and braces for the line above: whatever produced them, credential material must never reach
+# a package. Dropped before the copy into BUILDROOT, so anything new that starts being generated at
+# build time is caught by rpm's own unpackaged-files check rather than shipped.
+rm -f  %{_localstatedir}/api/configuration/security/rbac.db
+rm -f  %{_sysconfdir}/wazuh-manager/certs/*.pem
+rm -rf %{_localstatedir}/queue/keystore/*
+
+# Create directories
+mkdir -p ${RPM_BUILD_ROOT}%{_initrddir}
+mkdir -p ${RPM_BUILD_ROOT}%{_localstatedir}
+mkdir -p ${RPM_BUILD_ROOT}%{_sysconfdir}/wazuh-manager
+
+# Copy the installed files into RPM_BUILD_ROOT directory: the installation directory and the
+# configuration directory, which lives outside it
+cp -pr %{_localstatedir}/* ${RPM_BUILD_ROOT}%{_localstatedir}/
+cp -pr %{_sysconfdir}/wazuh-manager/. ${RPM_BUILD_ROOT}%{_sysconfdir}/wazuh-manager/
+sed -i "s:WAZUH_HOME_TMP:%{_localstatedir}:g" src/init/templates/wazuh-manager-rh.init
+install -m 0755 src/init/templates/wazuh-manager-rh.init ${RPM_BUILD_ROOT}%{_initrddir}/wazuh-manager
+mkdir -p ${RPM_BUILD_ROOT}/usr/lib/systemd/system/
+sed -i "s:WAZUH_HOME_TMP:%{_localstatedir}:g" src/init/templates/wazuh-manager.service
+install -m 0644 src/init/templates/wazuh-manager.service ${RPM_BUILD_ROOT}/usr/lib/systemd/system/
+
+# Add configuration scripts
+mkdir -p ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/
+
+# Templates for initscript
+mkdir -p ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/src/init
+mkdir -p ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/generic
+mkdir -p ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/centos
+mkdir -p ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/rhel
+
+# Add SUSE initscript
+sed -i "s:WAZUH_HOME_TMP:%{_localstatedir}:g" src/init/templates/wazuh-manager-suse.init
+cp -rp src/init/templates/wazuh-manager-suse.init ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/src/init/
+
+# Copy scap templates
+cp -rp  etc/templates/config/generic/* ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/generic
+cp -rp  etc/templates/config/centos/* ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/centos
+cp -rp  etc/templates/config/rhel/* ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/rhel
+
+install -m 0440 VERSION.json ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/
+install -m 0640 src/init/*.sh ${RPM_BUILD_ROOT}%{_localstatedir}/packages_files/manager_installation_scripts/src/init
+
+%{_rpmconfigdir}/find-debuginfo.sh
+
+exit 0
+
+%pre
+
+# Every shell percent sign in these scriptlets is doubled: rpm's macro pass halves each pair, so the
+# shell receives the parameter expansions and format strings as written for it.
+
+# The configuration directory is fixed, outside the installation directory.
+CONF_DIR="%{_sysconfdir}/wazuh-manager"
+
+print_unsupported_manager_upgrade() {
+  DETECTED_VERSION="${1:-unknown}"
+  cat <<EOF >&2
+==============================================================
+ERROR: Upgrade from Wazuh manager versions prior to 5.x is not supported.
+
+Detected installed version: ${DETECTED_VERSION#v}
+
+A clean installation of Wazuh manager 5.x is required.
+Refer to the 5.x migration guide for more information.
+==============================================================
+EOF
+}
+
+# major_of VERSION: the major number of a version such as v4.14.0 or 4.14.0-1.
+major_of() {
+  MAJOR_OF="${1#v}"
+  echo "${MAJOR_OF%%%%.*}"
+}
+
+# json_version FILE: the value of "version" in a VERSION.json.
+json_version() {
+  while IFS= read -r JSON_LINE || [ -n "${JSON_LINE}" ]; do
+    case "${JSON_LINE}" in
+      *'"version"'*)
+        JSON_LINE="${JSON_LINE#*\"version\"}"
+        JSON_LINE="${JSON_LINE#*\"}"
+        echo "${JSON_LINE%%%%\"*}"
+        return 0
+        ;;
+    esac
+  done < "$1"
+  return 1
+}
+
+# is_pre5 VERSION: true when VERSION names a major before 5.
+is_pre5() {
+  PRE5_MAJOR=$(major_of "$1")
+  case "${PRE5_MAJOR}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${PRE5_MAJOR}" -le 4 ]
+}
+
+# The pids of every running wazuh-manager-authd, from /proc (no procps).
+authd_pids() {
+  for PROC_DIR in /proc/[0-9]*; do
+    [ -r "${PROC_DIR}/cmdline" ] || continue
+    IFS= read -r PROC_CMD < "${PROC_DIR}/cmdline" 2>/dev/null || [ -n "${PROC_CMD}" ] || continue
+    case "${PROC_CMD}" in
+      *wazuh-manager-authd*) echo "${PROC_DIR#/proc/}" ;;
+    esac
+    PROC_CMD=""
+  done
+}
+
+# running TEXT: true when a status text says the service is running.
+running() {
+  case "$1" in
+    *"is running"*) return 0 ;;
+  esac
+  return 1
+}
+
+# ============================================================
+# HARD BLOCK: no 4.x manager may be replaced or sit beside this one, on an upgrade or on a fresh
+# install: its init file, or the version file of a /var/ossec install that reports itself a server.
+# ============================================================
+OLD_VERSION=""
+# Only a 4.x manager (TYPE server or local) blocks this one: a 4.x agent beside it is allowed.
+if [ -f %{_sysconfdir}/ossec-init.conf ]; then
+  OLD_TYPE=$(set +e; . %{_sysconfdir}/ossec-init.conf > /dev/null 2>&1; echo "${TYPE}") || OLD_TYPE=""
+  case "${OLD_TYPE}" in
+    server|local)
+      OLD_VERSION=$(set +e; . %{_sysconfdir}/ossec-init.conf > /dev/null 2>&1; echo "${VERSION}") || OLD_VERSION=""
+      ;;
+  esac
+fi
+if ! is_pre5 "${OLD_VERSION}" && [ -f /var/ossec/VERSION.json ] && [ -x /var/ossec/bin/wazuh-control ] \
+    && [ "$(/var/ossec/bin/wazuh-control info -t 2>/dev/null)" = "server" ]; then
+  OLD_VERSION=$(json_version /var/ossec/VERSION.json 2>/dev/null) || OLD_VERSION=""
+fi
+if is_pre5 "${OLD_VERSION}"; then
+  print_unsupported_manager_upgrade "${OLD_VERSION}"
+  exit 1
+fi
+
+# Create the wazuh-manager group and user if they don't exist
+if ! getent group wazuh-manager > /dev/null 2>&1; then
+  groupadd -r wazuh-manager
+fi
+if ! getent passwd wazuh-manager > /dev/null 2>&1; then
+  useradd -r -g wazuh-manager -d %{_localstatedir} -M -s /sbin/nologin wazuh-manager
+fi
+
+# Validate upgrade constraints for Manager (only during upgrade)
+if [ "$1" -eq 2 ]; then
+  # Get version information
+  OLD_VERSION=""
+  if [ -f "%{_localstatedir}/bin/wazuh-manager-control" ]; then
+    OLD_VERSION=$(%{_localstatedir}/bin/wazuh-manager-control info -v 2>/dev/null) || OLD_VERSION=""
+  elif [ -f %{_localstatedir}/VERSION.json ]; then
+    OLD_VERSION=$(json_version %{_localstatedir}/VERSION.json 2>/dev/null) || OLD_VERSION=""
+  fi
+  MAJOR=$(major_of "${OLD_VERSION}")
+
+  # Determine if upgrade should be blocked
+  case "${MAJOR}" in
+    ''|*[!0-9]*)
+      print_unsupported_manager_upgrade "${OLD_VERSION}"
+      exit 1
+      ;;
+  esac
+  if [ "${MAJOR}" -lt 5 ]; then
+    print_unsupported_manager_upgrade "${OLD_VERSION}"
+    exit 1
+  fi
+fi
+
+# Stop the services to upgrade the package
+if [ "$1" -eq 2 ]; then
+  UPGRADE_PRESERVE_DIR="%{_localstatedir}/tmp/manager_upgrade_preserve"
+  # Refused, and the directory taken, while the manager is still running: a failed upgrade keeps
+  # this directory on purpose, so once one has failed every later attempt finds it, and refusing
+  # after the stop below would take the manager down and leave it down, since the wazuh.restart
+  # marker is only honoured by a %%posttrans that never runs after a failed %%pre. tmp/ is writable
+  # by wazuh-manager: a plain mkdir fails on anything already at that path, a link included, and
+  # once it has succeeded nothing can be planted there before the snapshot copies into it.
+  if [ -e "${UPGRADE_PRESERVE_DIR}" ]; then
+    echo "ERROR: Existing manager upgrade preserve backup found at ${UPGRADE_PRESERVE_DIR}." >&2
+    echo "ERROR: Recover or move this directory before retrying the upgrade." >&2
+    exit 1
+  fi
+  if ! mkdir -m 0700 "${UPGRADE_PRESERVE_DIR}"; then
+    echo "ERROR: Could not create the manager upgrade preserve backup at ${UPGRADE_PRESERVE_DIR}." >&2
+    exit 1
+  fi
+
+  # tmp/ is writable by wazuh-manager and touch follows a link planted there, creating its target.
+  # The marker is created with noclobber (O_EXCL), which fails on any link instead of following it.
+  rm -f %{_localstatedir}/tmp/wazuh.restart
+  RESTART_WITH=""
+  if command -v systemctl > /dev/null 2>&1 && systemctl > /dev/null 2>&1 && systemctl is-active --quiet wazuh-manager > /dev/null 2>&1; then
+    systemctl stop wazuh-manager.service > /dev/null 2>&1
+    ( set -C; : > %{_localstatedir}/tmp/wazuh.restart ) 2> /dev/null || true
+    RESTART_WITH="systemctl"
+  # Check for SysV
+  elif command -v service > /dev/null 2>&1 && running "$(service wazuh-manager status 2>/dev/null)"; then
+    service wazuh-manager stop > /dev/null 2>&1
+    ( set -C; : > %{_localstatedir}/tmp/wazuh.restart ) 2> /dev/null || true
+    RESTART_WITH="service"
+  elif running "$(%{_localstatedir}/bin/wazuh-manager-control status 2>/dev/null)"; then
+    ( set -C; : > %{_localstatedir}/tmp/wazuh.restart ) 2> /dev/null || true
+    RESTART_WITH="control"
+  fi
+  if [ -x %{_localstatedir}/bin/wazuh-manager-control ]; then
+    %{_localstatedir}/bin/wazuh-manager-control stop > /dev/null 2>&1
+  fi
+  AUTHD_PIDS=$(authd_pids)
+  if [ -n "${AUTHD_PIDS}" ]; then
+    kill -15 ${AUTHD_PIDS} > /dev/null 2>&1 || true
+  fi
+
+  # A subshell on its own, not the left side of an || list: the shell ignores set -e inside a
+  # command whose failure is tested, so written that way a failed mkdir or cp would not stop the
+  # snapshot and its status would be whatever the last command returned.
+  (
+    set -e
+    if [ -d "${CONF_DIR}" ]; then
+      mkdir "${UPGRADE_PRESERVE_DIR}/etc"
+      cp -a "${CONF_DIR}/." "${UPGRADE_PRESERVE_DIR}/etc/"
+    fi
+
+    if [ -d "%{_localstatedir}/data" ]; then
+      mkdir "${UPGRADE_PRESERVE_DIR}/data"
+      for DATA_ENTRY in "%{_localstatedir}/data/"* "%{_localstatedir}/data/."[!.]* "%{_localstatedir}/data/"..?*; do
+        [ -e "${DATA_ENTRY}" ] || continue
+        [ "${DATA_ENTRY##*/}" = "tzdb" ] && continue
+        cp -a "${DATA_ENTRY}" "${UPGRADE_PRESERVE_DIR}/data/"
+      done
+    fi
+  )
+  if [ $? -ne 0 ]; then
+    echo "ERROR: Could not prepare manager upgrade preserve backup at ${UPGRADE_PRESERVE_DIR}." >&2
+    # Undone here: the directory this run reserved goes (its content is a partial copy of files
+    # still in place), and the manager is started again, through the same tool that found it
+    # running, if the stop above did. The marker goes too, since %%posttrans will not run after
+    # this %%pre fails.
+    rm -rf "${UPGRADE_PRESERVE_DIR}"
+    if [ -f %{_localstatedir}/tmp/wazuh.restart ]; then
+      rm -f %{_localstatedir}/tmp/wazuh.restart
+      case "${RESTART_WITH}" in
+        systemctl) systemctl start wazuh-manager.service > /dev/null 2>&1 ;;
+        service) service wazuh-manager start > /dev/null 2>&1 ;;
+        *) %{_localstatedir}/bin/wazuh-manager-control start > /dev/null 2>&1 ;;
+      esac || echo "WARNING: the manager could not be started again after the failed upgrade; start it by hand." >&2
+    fi
+    exit 1
+  fi
+fi
+
+# Nothing is cleaned out of var/db/ here: it holds mitre.db and nothing else in
+# 5.x, and %pre refuses an upgrade from an earlier major, so no other file can
+# reach it. Anything left at the old paths is ignored.
+
+# logs/ and queue/db/ are writable by wazuh-manager, so anything in them may be a link the service
+# account planted, and chmod has no -h. Nothing here changes a mode there as root: a file
+# wazuh-manager owns gets chown -h and then a chmod run as wazuh-manager, which fails on anything
+# else. chroot --userspec (coreutils) switches user; the command then re-enters the working directory
+# in_dir() verified (by path: --skip-chdir needs coreutils 8.23, and EL7 ships 8.22; a swapped path
+# could only aim wazuh-manager at its own files). in_dir DIR COMMAND... runs COMMAND with DIR as its
+# working directory, only when no link leads there, so a name relative to it cannot be redirected by
+# swapping a directory above.
+as_service_user() {
+  chroot --userspec=wazuh-manager:wazuh-manager / sh -c 'cd -- "$1" && shift && exec "$@"' as_service_user "$(pwd -P)" "$@"
+}
+REAL_DIR=$(cd -P %{_localstatedir} 2> /dev/null && pwd -P) || REAL_DIR=""
+in_dir() {
+  [ -n "${REAL_DIR}" ] || return 1
+  (cd -P -- "$1" 2> /dev/null && [ "$(pwd -P)" = "${REAL_DIR}${1#"%{_localstatedir}"}" ] && shift && "$@")
+}
+
+fix_global_db() {
+  for DB_FILE in global.db*; do
+    if [ -f "${DB_FILE}" ] && [ ! -L "${DB_FILE}" ]; then
+      chown -h wazuh-manager:wazuh-manager "${DB_FILE}"
+      as_service_user chmod 660 "${DB_FILE}" || true
+    fi
+  done
+}
+in_dir %{_localstatedir}/queue/db fix_global_db || true
+
+# Remove Vuln-detector database
+rm -f %{_localstatedir}/queue/vulnerabilities/cve.db || true
+
+# Remove plain-text agent information if exists
+if [ -d %{_localstatedir}/queue/agent-info ]; then
+  rm -rf %{_localstatedir}/queue/agent-info/* > /dev/null 2>&1
+fi
+
+# Delete old API backups
+if [ "$1" -eq 2 ]; then
+  if [ -d %{_localstatedir}/~api ]; then
+    rm -rf %{_localstatedir}/~api
+  fi
+fi
+
+%post
+
+# The configuration directory is fixed, outside the installation directory.
+CONF_DIR="%{_sysconfdir}/wazuh-manager"
+
+# The configuration directory, logs/ and queue/db/ are writable by wazuh-manager, so anything in
+# them may be a link the service account planted, and chmod has no -h. Nothing here changes a mode
+# there as root: a file root creates is built in a root-only directory and renamed into place
+# (rename replaces a link, never follows it); a file wazuh-manager owns gets chown -h and then a
+# chmod run as wazuh-manager, which fails on anything else. chroot --userspec (coreutils) switches
+# user; the command then re-enters the working directory in_dir() verified (by path: --skip-chdir
+# needs coreutils 8.23, and EL7 ships 8.22; a swapped path could only aim wazuh-manager at its own
+# files). in_dir DIR COMMAND... runs COMMAND
+# with DIR as its working directory, only when no link leads there, so a name relative to it
+# cannot be redirected by swapping a directory above; in_conf_dir does the same under CONF_DIR.
+as_service_user() {
+  chroot --userspec=wazuh-manager:wazuh-manager / sh -c 'cd -- "$1" && shift && exec "$@"' as_service_user "$(pwd -P)" "$@"
+}
+REAL_DIR=$(cd -P %{_localstatedir} 2> /dev/null && pwd -P) || REAL_DIR=""
+in_dir() {
+  [ -n "${REAL_DIR}" ] || return 1
+  (cd -P -- "$1" 2> /dev/null && [ "$(pwd -P)" = "${REAL_DIR}${1#"%{_localstatedir}"}" ] && shift && "$@")
+}
+REAL_CONF_DIR=$(cd -P ${CONF_DIR} 2> /dev/null && pwd -P) || REAL_CONF_DIR=""
+in_conf_dir() {
+  [ -n "${REAL_CONF_DIR}" ] || return 1
+  (cd -P -- "$1" 2> /dev/null && [ "$(pwd -P)" = "${REAL_CONF_DIR}${1#"${CONF_DIR}"}" ] && shift && "$@")
+}
+
+# Fresh install code block
+if [ "$1" -eq 1 ]; then
+
+  . %{_localstatedir}/packages_files/manager_installation_scripts/src/init/dist-detect.sh
+
+  # Generating wazuh-manager.conf file, in packages_files/ (root only), and moving it into place
+  # once it validates (file existence is not checked: the certificates it references are
+  # generated later).
+  CONF_STAGE=%{_localstatedir}/packages_files/wazuh-manager.conf
+  if ! %{_localstatedir}/packages_files/manager_installation_scripts/src/init/gen_wazuh.sh conf manager ${DIST_NAME} ${DIST_VER}.${DIST_SUBVER} %{_localstatedir} > ${CONF_STAGE}; then
+    rm -f ${CONF_STAGE}
+    echo "ERROR: could not generate ${CONF_DIR}/wazuh-manager.conf." >&2
+    exit 1
+  fi
+  if ! %{_localstatedir}/bin/wazuh-manager-conf --skip-file-checks validate -f ${CONF_STAGE}; then
+    rm -f ${CONF_STAGE}
+    echo "ERROR: the generated ${CONF_DIR}/wazuh-manager.conf is not a valid manager configuration." >&2
+    exit 1
+  fi
+  if ! { chmod 0660 ${CONF_STAGE} && chown root:wazuh-manager ${CONF_STAGE} && mv -fT ${CONF_STAGE} ${CONF_DIR}/wazuh-manager.conf; }; then
+    rm -f ${CONF_STAGE}
+    echo "ERROR: could not install ${CONF_DIR}/wazuh-manager.conf." >&2
+    exit 1
+  fi
+
+  # A link in logs/ is never a log file. The files are created by wazuh-manager itself.
+  for LOG_FILE in wazuh-manager.log wazuh-manager.json; do
+    if [ -L "%{_localstatedir}/logs/${LOG_FILE}" ]; then
+      rm -f "%{_localstatedir}/logs/${LOG_FILE}"
+    fi
+    if [ -f "%{_localstatedir}/logs/${LOG_FILE}" ]; then
+      chown -h wazuh-manager:wazuh-manager %{_localstatedir}/logs/${LOG_FILE}
+    fi
+    as_service_user touch %{_localstatedir}/logs/${LOG_FILE} || true
+    as_service_user chmod 0660 %{_localstatedir}/logs/${LOG_FILE} || true
+  done
+fi
+
+if [ -d /run/systemd/system ]; then
+  rm -f %{_initrddir}/wazuh-manager
+fi
+
+# No install-time certificate check any more. The credential resolver invoked at the end of this
+# scriptlet issues the pair when it can, and when it cannot the answer may well have changed by the
+# time the operator starts the service -- so the check belongs at start, where it is made. Warning
+# here about a state that no longer exists is what trains operators to ignore installer output.
+
+# The certificates' ownership is set by %files and the resolver, and re-applied in %posttrans after
+# the upgrade-preserve restore.
+
+rm -f ${CONF_DIR}/shared/merged.mg  >/dev/null 2>&1
+
+# Resolve every credential the manager owns or consumes: seed rbac.db with generated or supplied
+# Server API passwords, store the indexer password in the keystore, import the indexer's CA and
+# client pair from /etc/wazuh-indexer/export when it is installed here, and -- on a fresh install
+# only -- mint the manager's CA and issue its two server pairs.
+#
+# $1 is 1 on a fresh install and >= 2 on an upgrade. That distinction is the whole reason the two
+# modes exist: --upgrade completes the passwords, the keystore and the indexer trust (each a no-op
+# once in place) and only validates the manager's CA and server pairs: it never mints a CA or
+# issues a pair. An operator who replaced them with their own PKI must not find them reissued by a
+# package upgrade.
+#
+# Neither mode may abort this scriptlet, so both always exit 0 and simply leave unresolved whatever
+# they could not resolve. The service refuses to start and names what is missing; that is where the
+# check belongs, because the answer changes between these two moments and only the answer at start
+# matters.
+#
+# Its standard error is relayed as is, after its progress lines, and kept: every problem is one
+# `MISSING|INVALID|UNSAFE <subject>: <reason>` line there (the contract wazuh-manager-control reads
+# too), and an unsafe entry stops the run before anything is written. The next-steps block below
+# must not claim what the resolver did not do, so it reads the outcome from that output and from
+# the files, never from the mode alone.
+CRED_STATUS=0
+CRED_ERR=""
+CRED_INCOMPLETE="no"
+if [ -x %{_localstatedir}/bin/wazuh-manager-resolve-credentials ]; then
+  if [ "$1" -eq 1 ]; then
+    CRED_MODE="--install"
+  else
+    CRED_MODE="--upgrade"
+  fi
+  { CRED_ERR=$(%{_localstatedir}/bin/wazuh-manager-resolve-credentials ${CRED_MODE} -H %{_localstatedir} 2>&1 1>&3) || CRED_STATUS=$?; } 3>&1
+  if [ -n "${CRED_ERR}" ]; then
+    printf '%%s\n' "${CRED_ERR}" >&2
+  fi
+  if [ "${CRED_STATUS}" -ne 0 ] || printf '%%s\n' "${CRED_ERR}" | grep -q -E '^(MISSING|INVALID|UNSAFE) '; then
+    CRED_INCOMPLETE="yes"
+  fi
+fi
+
+# Delete the installation files used to configure the manager
+rm -rf %{_localstatedir}/packages_files
+
+# Next steps, last thing a fresh install prints (the indexer and the dashboard end the same way): the
+# package neither starts nor enables the service, and nothing else says where the Server API passwords
+# went. Only on a fresh install ($1 = 1): an upgrade or a reinstall finds the passwords already set.
+# install.sh prints its own start hint, so this lives in the package only.
+#
+# The password hint is printed only when the resolver published the file: a worker publishes nothing
+# (the Server API runs on the master), and a run stopped by an unsafe or invalid entry writes nothing
+# at all. When the resolver reported a problem, the manager refuses to start until it is fixed, and
+# only --install issues what the install could not, so that is the command to repeat.
+if [ "$1" -eq 1 ]; then
+  if [ -f "${CONF_DIR}/export/credentials.env" ]; then
+    echo "Server API passwords saved in ${CONF_DIR}/export/credentials.env (readable by root only)."
+  fi
+  if [ "${CRED_INCOMPLETE}" = "yes" ]; then
+    echo "Credential resolution is incomplete: the manager does not start until every MISSING, INVALID or UNSAFE entry reported above is resolved."
+    echo "Fix them, then run: %{_localstatedir}/bin/wazuh-manager-resolve-credentials --install -H %{_localstatedir}"
+  fi
+  if command -v systemctl > /dev/null 2>&1 && systemctl > /dev/null 2>&1; then
+    echo "Start the manager and enable it at boot: systemctl enable --now wazuh-manager"
+  else
+    echo "Start the manager: service wazuh-manager start"
+  fi
+fi
+
+%preun
+
+if [ $1 = 0 ]; then
+
+  # Stop the services before uninstall the package
+  # Check for systemd
+  if command -v systemctl > /dev/null 2>&1 && systemctl > /dev/null 2>&1 && systemctl is-active --quiet wazuh-manager > /dev/null 2>&1; then
+    systemctl stop wazuh-manager.service > /dev/null 2>&1
+  # Check for SysV
+  elif command -v service > /dev/null 2>&1; then
+    case "$(service wazuh-manager status 2>/dev/null)" in
+      *"is running"*) service wazuh-manager stop > /dev/null 2>&1 ;;
+    esac
+  fi
+  %{_localstatedir}/bin/wazuh-manager-control stop > /dev/null 2>&1
+
+fi
+
+%postun
+
+# The configuration directory is fixed, outside the installation directory.
+CONF_DIR="%{_sysconfdir}/wazuh-manager"
+
+# save_conf MODE DIR: the *.save pass over the kept configuration, without find, in the two passes
+# the two find commands it replaces made. MODE "drop" deletes the *.save left by an earlier erase;
+# MODE "rename" then renames every other regular file in DIR and below to *.save. Two passes, never
+# one: a single loop would rename client.keys onto client.keys.save and then reach that name and
+# delete it. *rpmsave files and anything whose name contains "shared" keep their names. Links are
+# neither followed nor renamed.
+save_conf() {
+  for SAVE_ENTRY in "$2"/* "$2"/.[!.]* "$2"/..?*; do
+    if [ -L "${SAVE_ENTRY}" ]; then
+      continue
+    elif [ -d "${SAVE_ENTRY}" ]; then
+      save_conf "$1" "${SAVE_ENTRY}"
+    elif [ -f "${SAVE_ENTRY}" ]; then
+      case "$1:${SAVE_ENTRY##*/}" in
+        *:*rpmsave) ;;
+        drop:*save) rm -f "${SAVE_ENTRY}" ;;
+        rename:*save|rename:*shared*) ;;
+        rename:*) mv -f "${SAVE_ENTRY}" "${SAVE_ENTRY}.save" ;;
+      esac
+    fi
+  done
+}
+
+# If the package is been uninstalled
+if [ $1 = 0 ];then
+  # Remove the wazuh-manager user if it exists
+  if getent passwd wazuh-manager > /dev/null 2>&1; then
+    userdel wazuh-manager >/dev/null 2>&1
+  fi
+  # Remove the wazuh-manager group if it exists
+  if getent group wazuh-manager > /dev/null 2>&1; then
+    groupdel wazuh-manager >/dev/null 2>&1
+  fi
+
+  # Backup agents centralized configuration (shared/)
+  if [ -d ${CONF_DIR}/shared ] && [ ! -L ${CONF_DIR} ]; then
+    save_conf drop ${CONF_DIR}
+    save_conf rename ${CONF_DIR}
+  fi
+
+  # Remove lingering folders and files
+  rm -rf %{_localstatedir}/queue/
+  rm -rf %{_localstatedir}/framework/
+  rm -rf %{_localstatedir}/api/
+  rm -rf %{_localstatedir}/stats/
+  rm -rf %{_localstatedir}/var/
+  rm -rf %{_localstatedir}/bin/
+  rm -rf %{_localstatedir}/logs/
+  rm -rf %{_localstatedir}/tmp
+  rm -rf %{_localstatedir}/data
+
+  # What is kept (the saved configuration, backups) is an archive of a removed installation: it
+  # goes to root, private to root. Part of it belonged to the removed account, whose numeric IDs
+  # the next system account created would inherit. chmod -R skips the links it meets and
+  # chown -R -h changes them without following, so a link planted by the account cannot aim
+  # this at another file.
+  for KEPT_DIR in ${CONF_DIR} %{_localstatedir}; do
+    if [ -d "${KEPT_DIR}" ] && [ ! -L "${KEPT_DIR}" ]; then
+      chmod -R go-rwx "${KEPT_DIR}" 2>/dev/null || true
+      chown -R -h root:root "${KEPT_DIR}" 2>/dev/null || true
+    fi
+  done
+fi
+
+# posttrans code is the last thing executed in a install/upgrade
+%posttrans
+
+# The configuration directory is fixed, outside the installation directory.
+CONF_DIR="%{_sysconfdir}/wazuh-manager"
+
+UPGRADE_PRESERVE_DIR="%{_localstatedir}/tmp/manager_upgrade_preserve"
+
+if [ -d "${UPGRADE_PRESERVE_DIR}" ]; then
+  # The configuration directory and data/ are writable by wazuh-manager: --remove-destination
+  # replaces a link planted at a destination instead of writing (and chowning, with -a) through it.
+  # A subshell on its own, not the left side of an || list: the shell ignores set -e inside a
+  # command whose failure is tested, and a failed copy would otherwise go unnoticed and the
+  # snapshot be deleted below.
+  (
+    set -e
+    if [ -d "${UPGRADE_PRESERVE_DIR}/etc" ]; then
+      mkdir -p "${CONF_DIR}"
+      cp -a --remove-destination "${UPGRADE_PRESERVE_DIR}/etc/." "${CONF_DIR}/"
+    fi
+
+    if [ -d "${UPGRADE_PRESERVE_DIR}/data" ]; then
+      mkdir -p "%{_localstatedir}/data"
+
+      for DATA_ENTRY in "${UPGRADE_PRESERVE_DIR}/data/"* "${UPGRADE_PRESERVE_DIR}/data/."[!.]* "${UPGRADE_PRESERVE_DIR}/data/"..?*; do
+        [ -e "${DATA_ENTRY}" ] || continue
+        cp -a --remove-destination "${DATA_ENTRY}" "%{_localstatedir}/data/"
+      done
+    fi
+  )
+  if [ $? -ne 0 ]; then
+    echo "ERROR: Could not restore manager upgrade preserve backup; contents left at ${UPGRADE_PRESERVE_DIR}." >&2
+    exit 1
+  fi
+  rm -rf "${UPGRADE_PRESERVE_DIR}"
+fi
+
+# The engine (wazuh-manager-analysisd) now drops privileges to wazuh-manager:
+# runtime data created by root in previous versions must be reassigned. This
+# must run after the upgrade-preserve restore above, which keeps the old
+# ownership (cp -a), and before the service restart below.
+chown -R wazuh-manager:wazuh-manager %{_localstatedir}/data/ruleset > /dev/null 2>&1 || true
+chown -R wazuh-manager:wazuh-manager %{_localstatedir}/data/kvdb-ioc > /dev/null 2>&1 || true
+for year_dir in %{_localstatedir}/logs/[0-9][0-9][0-9][0-9]; do
+  if [ -d "$year_dir" ]; then
+    chown -R wazuh-manager:wazuh-manager "$year_dir" > /dev/null 2>&1 || true
+  fi
+done
+
+# Every certificate and key is root's and readable through wazuh-manager, re-applied after the
+# restore above (cp -a keeps the preserved ownership). The configuration directory is writable by
+# wazuh-manager, so the account could put its own directory (or a link to one) in place of certs/:
+# the link check and pwd -P refuse a link, and the owner check refuses a directory that is not
+# root's. Inside a root-owned 0750 directory nobody else can swap an entry, so the chown and chmod
+# below run as root.
+fix_certs() {
+  [ "$(stat -c %%u .)" = 0 ] || return 1
+  chmod 0750 .
+  for CERT_FILE in *.pem; do
+    if [ -f "${CERT_FILE}" ] && [ ! -L "${CERT_FILE}" ]; then
+      chown -h root:wazuh-manager "${CERT_FILE}" > /dev/null 2>&1 || true
+      chmod 0640 "${CERT_FILE}" > /dev/null 2>&1 || true
+    fi
+  done
+}
+REAL_CONF_DIR=$(cd -P ${CONF_DIR} 2> /dev/null && pwd -P) || REAL_CONF_DIR=""
+if [ -n "${REAL_CONF_DIR}" ] && [ ! -L ${CONF_DIR}/certs ]; then
+  (cd -P -- ${CONF_DIR}/certs 2> /dev/null && [ "$(pwd -P)" = "${REAL_CONF_DIR}/certs" ] && fix_certs) || true
+fi
+
+if [ -f %{_sysconfdir}/systemd/system/wazuh-manager.service ]; then
+  rm -rf %{_sysconfdir}/systemd/system/wazuh-manager.service
+  systemctl daemon-reload > /dev/null 2>&1
+fi
+
+# Load the unit this package ships whatever the service state: a stopped one would otherwise
+# start next with the previous unit definition.
+if command -v systemctl > /dev/null 2>&1 && systemctl > /dev/null 2>&1 ; then
+  systemctl daemon-reload > /dev/null 2>&1
+fi
+
+if [ -f %{_localstatedir}/tmp/wazuh.restart ]; then
+  rm -f %{_localstatedir}/tmp/wazuh.restart
+  if command -v systemctl > /dev/null 2>&1 && systemctl > /dev/null 2>&1 ; then
+    systemctl restart wazuh-manager.service > /dev/null 2>&1
+  elif command -v service > /dev/null 2>&1 ; then
+    service wazuh-manager restart > /dev/null 2>&1
+  else
+    %{_localstatedir}/bin/wazuh-manager-control restart > /dev/null 2>&1
+  fi
+fi
+
+%clean
+rm -fr %{buildroot}
+
+%files
+%defattr(-,root,wazuh-manager)
+%license LICENSE src/engine/LICENSE-engine src/engine/COPYING-engine THIRD-PARTY-NOTICES
+%config(missingok) %{_initrddir}/wazuh-manager
+/usr/lib/systemd/system/wazuh-manager.service
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}
+%attr(440, root, wazuh-manager) %{_localstatedir}/VERSION.json
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/api
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/api/configuration
+%attr(660, root, wazuh-manager) %config(noreplace) %{_localstatedir}/api/configuration/api.yaml
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/api/configuration/security
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/api/scripts
+%attr(640, root, wazuh-manager) %{_localstatedir}/api/scripts/*.py
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/backup
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/backup/db
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/bin
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/agent_groups
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/agent_upgrade
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/cluster_control
+%attr(750, root, root) %{_localstatedir}/bin/wazuh-manager-analysisd
+%attr(750, root, root) %{_localstatedir}/bin/wazuh-manager-authd
+%attr(750, root, root) %{_localstatedir}/bin/wazuh-manager-control
+%attr(750, root, root) %{_localstatedir}/bin/wazuh-manager-remoted
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/verify-agent-conf
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/wazuh-manager-certs
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/wazuh-manager-conf
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/wazuh-manager-apid
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/wazuh-manager-clusterd
+%attr(4750, root, wazuh-manager) %{_localstatedir}/bin/wazuh-manager-service-control
+%attr(750, root, root) %{_localstatedir}/bin/wazuh-manager-db
+%attr(750, root, root) %{_localstatedir}/bin/wazuh-manager-modulesd
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/rbac_control
+%attr(750, root, root) %{_localstatedir}/bin/wazuh-manager-keystore
+%attr(750, root, wazuh-manager) %{_localstatedir}/bin/wazuh-manager-resolve-credentials
+%dir %attr(770, root, wazuh-manager) %{_sysconfdir}/wazuh-manager
+%attr(660, root, wazuh-manager) %ghost %{_sysconfdir}/wazuh-manager/wazuh-manager.conf
+%dir %attr(750, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/certs
+%attr(660, wazuh-manager, wazuh-manager) %{_sysconfdir}/wazuh-manager/client.keys
+%attr(640, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/wazuh-manager-internal-options.conf
+%attr(640, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/wazuh-manager.schema.json
+%dir %attr(770, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/shared
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_sysconfdir}/wazuh-manager/shared/default
+%attr(660, wazuh-manager, wazuh-manager) %{_sysconfdir}/wazuh-manager/shared/agent-template.conf
+%attr(660, wazuh-manager, wazuh-manager) %{_sysconfdir}/wazuh-manager/shared/default/*
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_sysconfdir}/wazuh-manager/outputs
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_sysconfdir}/wazuh-manager/outputs/default
+%attr(640, wazuh-manager, wazuh-manager) %{_sysconfdir}/wazuh-manager/outputs/default/*.yml
+%dir %attr(750, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/indexer-plugins
+%attr(640, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/indexer-plugins/metrics-agents.json
+%attr(640, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/indexer-plugins/metrics-comms.json
+%attr(640, root, wazuh-manager) %{_sysconfdir}/wazuh-manager/indexer-plugins/metrics-normalization.json
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/framework
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/framework/python
+%{_localstatedir}/framework/python/*
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/framework/scripts
+%attr(640, root, wazuh-manager) %{_localstatedir}/framework/scripts/*.py
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/framework/wazuh
+%attr(640, root, wazuh-manager) %{_localstatedir}/framework/wazuh/*.py
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/framework/wazuh/core
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/framework/wazuh/core/cluster
+%attr(640, root, wazuh-manager) %{_localstatedir}/framework/wazuh/core/cluster/*.py
+%attr(640, root, wazuh-manager) %{_localstatedir}/framework/wazuh/core/cluster/*.json
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/framework/wazuh/core/cluster/dapi
+%attr(640, root, wazuh-manager) %{_localstatedir}/framework/wazuh/core/cluster/dapi/*.py
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/lib
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libwazuhext.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libschema_validator.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libjemalloc.so.2
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libstdc++.so.6
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libgcc_s.so.1
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libcontent_manager.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libindexer_connector.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libinventory_sync_server.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libkeystore_server.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libtask_manager.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libvulnerability_scanner.so
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/librocksdb.so.8
+%attr(750, root, wazuh-manager) %{_localstatedir}/lib/libremoted_module.so
+%{_localstatedir}/lib/libpython3.12.so.1.0
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/logs
+%attr(660, wazuh-manager, wazuh-manager) %ghost %{_localstatedir}/logs/api.log
+%attr(660, wazuh-manager, wazuh-manager) %ghost %{_localstatedir}/logs/api.json
+%attr(660, wazuh-manager, wazuh-manager) %ghost %{_localstatedir}/logs/cluster.log
+%attr(660, wazuh-manager, wazuh-manager) %ghost %{_localstatedir}/logs/wazuh-manager.log
+%attr(660, wazuh-manager, wazuh-manager) %ghost %{_localstatedir}/logs/wazuh-manager.json
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/logs/api
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/logs/cluster
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/logs/wazuh
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts
+%attr(440, wazuh-manager, wazuh-manager) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/VERSION.json
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/src/
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/src/init/
+%attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/src/init/*
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/generic
+%attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/generic/*
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/centos
+%attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/centos/*
+%dir %attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/rhel
+%attr(750, root, root) %config(missingok) %{_localstatedir}/packages_files/manager_installation_scripts/etc/templates/config/rhel/*
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/queue
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/agents-timestamp
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/cluster
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/db
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/rids
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/tasks
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/sockets
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/vd
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/indexer
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/authd
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/queue/keystore
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/data
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/data/kvdb-ioc
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/data/mmdb
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/data/ruleset
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/enrichment
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/enrichment/geo
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/enrichment/ioc
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/geo
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/data/store/geo/mmdb
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/schema
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/schema/allowed-fields
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/schema/engine-schema
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/schema/wazuh-logpar-overrides
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/data/tzdb
+%dir %attr(750, wazuh-manager, wazuh-manager) %{_localstatedir}/data/tzdb/iana
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/mmdb/GeoLite2-ASN.mmdb
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/mmdb/GeoLite2-City.mmdb
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/enrichment/geo/0
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/enrichment/ioc/0
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/geo/mmdb/0
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/schema/allowed-fields/0
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/schema/engine-schema/0
+%attr(660, wazuh-manager, wazuh-manager) %{_localstatedir}/data/store/schema/wazuh-logpar-overrides/0
+%attr(640, wazuh-manager, wazuh-manager) %{_localstatedir}/data/tzdb/iana/*
+%dir %attr(1770, root, wazuh-manager) %{_localstatedir}/tmp
+%dir %attr(750, root, wazuh-manager) %{_localstatedir}/var
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/var/db
+%attr(660, root, wazuh-manager) %{_localstatedir}/var/db/mitre.db
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/var/download
+%dir %attr(770, wazuh-manager, wazuh-manager) %{_localstatedir}/var/multigroups
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/var/run
+%dir %attr(770, root, wazuh-manager) %{_localstatedir}/var/upgrade
+
+%files -n wazuh-manager-debuginfo -f debugfiles.list
+
+%changelog
+* Wed Sep 30 2026 support <info@wazuh.com> - 5.1.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-5-1-0.html
+* Thu May 14 2026 support <info@wazuh.com> - 4.14.6
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-6.html
+* Thu Apr 23 2026 support <info@wazuh.com> - 4.14.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-5.html
+* Tue Mar 17 2026 support <info@wazuh.com> - 4.14.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-4.html
+* Wed Feb 11 2026 support <info@wazuh.com> - 4.14.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-3.html
+* Wed Jan 14 2026 support <info@wazuh.com> - 4.14.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-2.html
+* Wed Nov 12 2025 support <info@wazuh.com> - 4.14.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-1.html
+* Wed Oct 22 2025 support <info@wazuh.com> - 4.14.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-14-0.html
+* Wed Sep 24 2025 support <info@wazuh.com> - 4.13.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-13-1.html
+* Thu Sep 18 2025 support <info@wazuh.com> - 4.13.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-13-0.html
+* Wed May 07 2025 support <info@wazuh.com> - 4.12.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-12-0.html
+* Tue Apr 01 2025 support <info@wazuh.com> - 4.11.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-11-2.html
+* Wed Mar 12 2025 support <info@wazuh.com> - 4.11.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-11-1.html
+* Wed Feb 19 2025 support <info@wazuh.com> - 4.11.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-11-0.html
+* Thu Jan 16 2025 support <info@wazuh.com> - 4.10.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-10-1.html
+* Thu Jan 09 2025 support <info@wazuh.com> - 4.10.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-10-0.html
+* Wed Oct 30 2024 support <info@wazuh.com> - 4.9.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-9-2.html
+* Thu Oct 17 2024 support <info@wazuh.com> - 4.9.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-9-1.html
+* Thu Sep 05 2024 support <info@wazuh.com> - 4.9.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-9-0.html
+* Wed Jul 10 2024 support <info@wazuh.com> - 4.8.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-8-1.html
+* Wed Jun 12 2024 support <info@wazuh.com> - 4.8.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-8-0.html
+* Thu May 30 2024 support <info@wazuh.com> - 4.7.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-7-5.html
+* Thu Apr 25 2024 support <info@wazuh.com> - 4.7.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-7-4.html
+* Tue Feb 27 2024 support <info@wazuh.com> - 4.7.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-7-3.html
+* Tue Jan 09 2024 support <info@wazuh.com> - 4.7.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-7-2.html
+* Wed Dec 13 2023 support <info@wazuh.com> - 4.7.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-7-1.html
+* Tue Nov 21 2023 support <info@wazuh.com> - 4.7.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-7-0.html
+* Tue Oct 31 2023 support <info@wazuh.com> - 4.6.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-6-0.html
+* Tue Oct 24 2023 support <info@wazuh.com> - 4.5.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-5-4.html
+* Tue Oct 10 2023 support <info@wazuh.com> - 4.5.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-5-3.html
+* Thu Aug 31 2023 support <info@wazuh.com> - 4.5.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-5-2.html
+* Thu Aug 24 2023 support <info@wazuh.com> - 4.5.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-5.1.html
+* Thu Aug 10 2023 support <info@wazuh.com> - 4.5.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-5-0.html
+* Mon Jul 10 2023 support <info@wazuh.com> - 4.4.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-4-5.html
+* Tue Jun 13 2023 support <info@wazuh.com> - 4.4.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-4-4.html
+* Thu May 25 2023 support <info@wazuh.com> - 4.4.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-4-3.html
+* Mon May 08 2023 support <info@wazuh.com> - 4.4.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-4-2.html
+* Mon Apr 24 2023 support <info@wazuh.com> - 4.3.11
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3.11.html
+* Mon Apr 17 2023 support <info@wazuh.com> - 4.4.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-4-1.html
+* Wed Jan 18 2023 support <info@wazuh.com> - 4.4.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-4-0.html
+* Thu Nov 10 2022 support <info@wazuh.com> - 4.3.10
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-10.html
+* Mon Oct 03 2022 support <info@wazuh.com> - 4.3.9
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-9.html
+* Wed Sep 21 2022 support <info@wazuh.com> - 3.13.6
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-13-6.html
+* Mon Sep 19 2022 support <info@wazuh.com> - 4.3.8
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-8.html
+* Wed Aug 24 2022 support <info@wazuh.com> - 3.13.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-13-5.html
+* Mon Aug 08 2022 support <info@wazuh.com> - 4.3.7
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-7.html
+* Thu Jul 07 2022 support <info@wazuh.com> - 4.3.6
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-6.html
+* Wed Jun 29 2022 support <info@wazuh.com> - 4.3.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-5.html
+* Tue Jun 07 2022 support <info@wazuh.com> - 4.3.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-4.html
+* Tue May 31 2022 support <info@wazuh.com> - 4.3.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-3.html
+* Mon May 30 2022 support <info@wazuh.com> - 4.3.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-2.html
+* Mon May 30 2022 support <info@wazuh.com> - 3.13.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-13-4.html
+* Sun May 29 2022 support <info@wazuh.com> - 4.2.7
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-7.html
+* Wed May 18 2022 support <info@wazuh.com> - 4.3.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-1.html
+* Thu May 05 2022 support <info@wazuh.com> - 4.3.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-3-0.html
+* Fri Mar 25 2022 support <info@wazuh.com> - 4.2.6
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-6.html
+* Mon Nov 15 2021 support <info@wazuh.com> - 4.2.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-5.html
+* Thu Oct 21 2021 support <info@wazuh.com> - 4.2.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-4.html
+* Wed Oct 06 2021 support <info@wazuh.com> - 4.2.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-3.html
+* Tue Sep 28 2021 support <info@wazuh.com> - 4.2.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-2.html
+* Sat Sep 25 2021 support <info@wazuh.com> - 4.2.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-1.html
+* Mon Apr 26 2021 support <info@wazuh.com> - 4.2.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-2-0.html
+* Sat Apr 24 2021 support <info@wazuh.com> - 3.13.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-13-3.html
+* Thu Apr 22 2021 support <info@wazuh.com> - 4.1.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-1-5.html
+* Mon Mar 29 2021 support <info@wazuh.com> - 4.1.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-1-4.html
+* Sat Mar 20 2021 support <info@wazuh.com> - 4.1.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-1-3.html
+* Mon Mar 08 2021 support <info@wazuh.com> - 4.1.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-1-2.html
+* Fri Mar 05 2021 support <info@wazuh.com> - 4.1.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-1-1.html
+* Tue Jan 19 2021 support <info@wazuh.com> - 4.1.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-1-0.html
+* Mon Nov 30 2020 support <info@wazuh.com> - 4.0.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-0-3.html
+* Mon Nov 23 2020 support <info@wazuh.com> - 4.0.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-0-2.html
+* Sat Oct 31 2020 support <info@wazuh.com> - 4.0.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-0-1.html
+* Mon Oct 19 2020 support <info@wazuh.com> - 4.0.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-4-0-0.html
+* Fri Aug 21 2020 support <info@wazuh.com> - 3.13.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-13-2.html
+* Tue Jul 14 2020 support <info@wazuh.com> - 3.13.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-13-1.html
+* Mon Jun 29 2020 support <info@wazuh.com> - 3.13.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-13-0.html
+* Wed May 13 2020 support <info@wazuh.com> - 3.12.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-12-3.html
+* Thu Apr 9 2020 support <info@wazuh.com> - 3.12.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-12-2.html
+* Wed Apr 8 2020 support <info@wazuh.com> - 3.12.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-12-1.html
+* Wed Mar 25 2020 support <info@wazuh.com> - 3.12.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-12-0.html
+* Mon Feb 24 2020 support <info@wazuh.com> - 3.11.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-11-4.html
+* Wed Jan 22 2020 support <info@wazuh.com> - 3.11.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-11-3.html
+* Tue Jan 7 2020 support <info@wazuh.com> - 3.11.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-11-2.html
+* Thu Dec 26 2019 support <info@wazuh.com> - 3.11.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-11-1.html
+* Mon Oct 7 2019 support <info@wazuh.com> - 3.11.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-11-0.html
+* Mon Sep 23 2019 support <support@wazuh.com> - 3.10.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-10-2.html
+* Thu Sep 19 2019 support <support@wazuh.com> - 3.10.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-10-1.html
+* Mon Aug 26 2019 support <support@wazuh.com> - 3.10.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-10-0.html
+* Thu Aug 8 2019 support <support@wazuh.com> - 3.9.5
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-9-5.html
+* Fri Jul 12 2019 support <support@wazuh.com> - 3.9.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-9-4.html
+* Tue Jul 02 2019 support <support@wazuh.com> - 3.9.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-9-3.html
+* Tue Jun 11 2019 support <support@wazuh.com> - 3.9.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-9-2.html
+* Sat Jun 01 2019 support <support@wazuh.com> - 3.9.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-9-1.html
+* Mon Feb 25 2019 support <support@wazuh.com> - 3.9.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-9-0.html
+* Wed Jan 30 2019 support <support@wazuh.com> - 3.8.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-8-2.html
+* Thu Jan 24 2019 support <support@wazuh.com> - 3.8.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-8-1.html
+* Fri Jan 18 2019 support <support@wazuh.com> - 3.8.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-8-0.html
+* Wed Nov 7 2018 support <support@wazuh.com> - 3.7.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-7-0.html
+* Mon Sep 10 2018 support <info@wazuh.com> - 3.6.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-6-1.html
+* Fri Sep 7 2018 support <support@wazuh.com> - 3.6.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-6-0.html
+* Wed Jul 25 2018 support <support@wazuh.com> - 3.5.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-5-0.html
+* Wed Jul 11 2018 support <support@wazuh.com> - 3.4.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-4-0.html
+* Mon Jun 18 2018 support <support@wazuh.com> - 3.3.1
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-3-1.html
+* Mon Jun 11 2018 support <support@wazuh.com> - 3.3.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-3-0.html
+* Wed May 30 2018 support <support@wazuh.com> - 3.2.4
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-2-4.html
+* Thu May 10 2018 support <support@wazuh.com> - 3.2.3
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-2-3.html
+* Mon Apr 09 2018 support <support@wazuh.com> - 3.2.2
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-2-2.html
+* Wed Feb 21 2018 support <support@wazuh.com> - 3.2.1
+- More info: https://documentation.wazuh.com/current/release-notes/rerlease-3-2-1.html
+* Wed Feb 07 2018 support <support@wazuh.com> - 3.2.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-2-0.html
+* Thu Dec 21 2017 support <support@wazuh.com> - 3.1.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-1-0.html
+* Mon Nov 06 2017 support <support@wazuh.com> - 3.0.0
+- More info: https://documentation.wazuh.com/current/release-notes/release-3-0-0.html
+* Tue Jun 06 2017 support <support@wazuh.com> - 2.0.1
+- Changed random data generator for a secure OS-provided generator.
+- Changed Windows installer file name (depending on version).
+- Linux distro detection using standard os-release file.
+- Changed some URLs to documentation.
+- Disable synchronization with SQLite databases for Syscheck by default.
+- Minor changes at Rootcheck formatter for JSON alerts.
+- Added debugging messages to Integrator logs.
+- Show agent ID when possible on logs about incorrectly formatted messages.
+- Use default maximum inotify event queue size.
+- Show remote IP on encoding format errors when unencrypting messages.
+- Fix permissions in agent-info folder
+- Fix permissions in rids folder.
+* Fri Apr 21 2017 Jose Luis Ruiz <jose@wazuh.com> - 2.0
+- Changed random data generator for a secure OS-provided generator.
+- Changed Windows installer file name (depending on version).
+- Linux distro detection using standard os-release file.
+- Changed some URLs to documentation.
+- Disable synchronization with SQLite databases for Syscheck by default.
+- Minor changes at Rootcheck formatter for JSON alerts.
+- Added debugging messages to Integrator logs.
+- Show agent ID when possible on logs about incorrectly formatted messages.
+- Use default maximum inotify event queue size.
+- Show remote IP on encoding format errors when unencrypting messages.
+- Fixed resource leaks at rules configuration parsing.
+- Fixed memory leaks at rules parser.
+- Fixed memory leaks at XML decoders parser.
+- Fixed TOCTOU condition when removing directories recursively.
+- Fixed insecure temporary file creation for old POSIX specifications.
+- Fixed missing agentless devices identification at JSON alerts.
+- Fixed FIM timestamp and file name issue at SQLite database.
+- Fixed cryptographic context acquirement on Windows agents.
+- Fixed debug mode for Analysisd.
+- Fixed bad exclusion of BTRFS filesystem by Rootcheck.
+- Fixed compile errors on macOS.
+- Fixed option -V for Integrator.
+- Exclude symbolic links to directories when sending FIM diffs (by Stephan Joerrens).
+- Fixed daemon list for service reloading at ossec-control.
+- Fixed socket waiting issue on Windows agents.
+- Fixed PCI_DSS definitions grouping issue at Rootcheck controls.

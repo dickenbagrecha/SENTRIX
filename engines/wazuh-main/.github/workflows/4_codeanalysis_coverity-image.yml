@@ -1,0 +1,30 @@
+name: 4.X - Coverity Docker image - Create and publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_image_tag:
+        description: |
+          Tag name of the Docker image to be uploaded.
+          Use only '-', '_', '.' and alphanumeric characters.
+          Default is '4.x'.
+        required: false
+        default: "4.x"
+  # On this (5.x) branch this file is a deprecated stub; 5_codeanalysis_coverity-image.yml owns the
+  # same path here. Scoped to the 4.x release branches so a 5.x push no longer runs it.
+  push:
+    branches:
+      - '[0-4].[0-9]+.[0-9]+'
+    paths:
+      - "tools/testing/coverity/**"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: wazuh/coverity-scan
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

@@ -1,0 +1,76 @@
+run-name: Build ${{ inputs.system }} filebeat on ${{ inputs.architecture }} ${{ inputs.is_stage && '- is stage' || '' }} ${{ inputs.checksum && '- checksum' || '' }} ${{ inputs.id }}
+name: 4.X - Build Filebeat
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: |
+          Architecture of the package [amd64, arm64]
+        required: true
+        type: choice
+        options:
+          - amd64
+          - x86_64
+          - aarch64
+          - arm64
+      system:
+        description: |
+          Package format [deb, rpm]
+        required: true
+        type: choice
+        options:
+          - deb
+          - rpm
+      revision:
+        description: |
+          Set the value to "1" for packages in release format.
+          You can also add other values, such as issue numbers.
+          By default, it is set to "0" for development.
+        default: "0"
+        type: string
+        required: false
+      is_stage:
+        description: |
+          Build package with release format.
+          By default: false
+        type: boolean
+        required: false
+      checksum:
+        description: Generate package checksum.
+        type: boolean
+        required: false
+      id:
+        type: string
+        description: |
+          ID used to identify the workflow uniquely.
+        required: false
+
+  workflow_call:
+    inputs:
+      architecture:
+        type: string
+        required: true
+      system:
+        type: string
+        required: true
+      revision:
+        default: "0"
+        type: string
+        required: false
+      is_stage:
+        type: boolean
+        required: false
+      checksum:
+        type: boolean
+        required: false
+      id:
+        type: string
+        required: false
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

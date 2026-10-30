@@ -1,0 +1,303 @@
+"""
+Copyright (C) Wazuh Inc.
+Created by Wazuh, Inc. <info@wazuh.com>.
+This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+"""
+
+import os
+from time import sleep
+import distro
+import pytest
+import subprocess
+import sys
+
+if sys.platform == "win32":
+    import win32con
+
+from typing import Any
+from pathlib import Path
+
+from wazuh_testing.constants.paths.databases import FIM_DB_PATH, FIM_SYNC_DB_DIR, FIM_SYNC_DB_FILES
+from wazuh_testing.constants.paths.logs import WAZUH_LOG_PATH
+from wazuh_testing.constants.platforms import WINDOWS, MACOS, LINUX, CENTOS, UBUNTU, DEBIAN
+from wazuh_testing.logger import logger
+from wazuh_testing.modules.fim.patterns import MONITORING_PATH, FIM_SCAN_END, REALTIME_WHODATA_ENGINE_STARTED
+from wazuh_testing.modules.fim.utils import create_registry, delete_registry
+from wazuh_testing.tools.monitors.file_monitor import FileMonitor
+from wazuh_testing.utils import file, services
+from wazuh_testing.utils.callbacks import generate_callback
+
+@pytest.fixture()
+def file_to_monitor(test_metadata: dict) -> Any:
+    path = test_metadata.get("file_to_monitor")
+    path = os.path.abspath(path)
+    data = test_metadata.setdefault("content", "")
+    isBinary = test_metadata.setdefault("binary_content", False)
+
+    if isBinary:
+        data = data.encode("utf-8")
+
+    file.write_file(path, data)
+
+    yield path
+
+    if sys.platform == WINDOWS:
+        max_retries = 15
+        retry_delay = 1
+        for attempt in range(max_retries):
+            try:
+                file.remove_file(path)
+                break
+            except OSError as exception:
+                if attempt == max_retries - 1:
+                    raise
+                logger.debug(f"Retrying deletion of {path}: {exception}")
+                sleep(retry_delay)
+    else:
+        file.remove_file(path)
+
+
+@pytest.fixture()
+def folder_to_monitor(test_metadata: dict) -> None:
+    # test_files/test_report_changes/test_large_changes.py depends on this fixture too, so the
+    # retry below also covers its intermittent Windows teardown failure reported in #38675 --
+    # that failure's traceback was never captured, but it shares this same teardown call.
+    path = test_metadata.get("folder_to_monitor")
+    path = os.path.abspath(path)
+
+    file.recursive_directory_creation(path)
+
+    yield path
+
+    if sys.platform == WINDOWS:
+        max_retries = 15
+        retry_delay = 1
+        for attempt in range(max_retries):
+            try:
+                file.delete_path_recursively(path)
+                break
+            except OSError as exception:
+                if attempt == max_retries - 1:
+                    raise
+                logger.debug(f"Retrying deletion of {path}: {exception}")
+                sleep(retry_delay)
+    else:
+        file.delete_path_recursively(path)
+
+
+@pytest.fixture()
+def fill_folder_to_monitor(test_metadata: dict) -> None:
+    path = test_metadata.get("folder_to_monitor")
+    amount = test_metadata.get("files_amount")
+    amount = 2 if not amount else amount
+
+    if not file.exists(path):
+        file.recursive_directory_creation(path)
+
+    [file.write_file(Path(path, f"test{i}.log"), "content") for i in range(amount)]
+
+    yield
+
+    for i in range(amount):
+        target = Path(path, f"test{i}.log")
+        if sys.platform == WINDOWS:
+            max_retries = 15
+            retry_delay = 1
+            for attempt in range(max_retries):
+                try:
+                    file.remove_file(target)
+                    break
+                except OSError as exception:
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.debug(f"Retrying deletion of {target}: {exception}")
+                    sleep(retry_delay)
+        else:
+            file.remove_file(target)
+
+
+@pytest.fixture()
+def start_monitoring() -> None:
+    FileMonitor(WAZUH_LOG_PATH).start(generate_callback(MONITORING_PATH))
+    FileMonitor(WAZUH_LOG_PATH).start(generate_callback(FIM_SCAN_END), timeout=60)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def set_agent_config(request: pytest.FixtureRequest):
+    if not hasattr(request.module, "test_configuration"):
+        return
+
+    configurations = getattr(request.module, "test_configuration")
+    # <agent> is the 5.x name for what 4.x spelled <client> (#38103). <endpoint> carries the
+    # whole target -- host, port and path (#38624) -- which is why <address> and <port> are no
+    # longer written here: they are the deprecated spelling and are ignored outright whenever
+    # <endpoint> is present.
+    agent_conf = {
+        "section": "agent",
+        "elements": [
+            {
+                "manager": {
+                    "elements": [
+                        {"endpoint": {"value": "127.0.0.1:1517"}},
+                    ]
+                }
+            },
+            {
+                # The agent's default verification_mode is now 'system', which
+                # RemotedSimulator's self-signed cert fails -- opt out explicitly since this
+                # suite is not testing TLS trust.
+                "ssl": {
+                    "elements": [
+                        {"verification_mode": {"value": "none"}},
+                    ]
+                }
+            },
+        ],
+    }
+
+    for index, _ in enumerate(configurations):
+        configurations[index]["sections"].append(agent_conf)
+
+    request.module.test_configuration = configurations
+
+
+@pytest.fixture(scope="session", autouse=True)
+def install_audit():
+    """Automatically install auditd before test session on linux distros."""
+    if sys.platform == WINDOWS or sys.platform == MACOS:
+        return
+
+    # Check distro
+    linux_distro = distro.id()
+
+    if linux_distro == CENTOS:
+        package_management = "yum"
+        audit = "audit"
+        option = "--assumeyes"
+    elif linux_distro == UBUNTU or linux_distro == DEBIAN:
+        package_management = "apt-get"
+        audit = "auditd"
+        option = "--yes"
+    else:
+        raise ValueError(
+            f"Linux distro ({linux_distro}) not supported for install audit"
+        )
+
+    subprocess.run([package_management, "install", audit, option], check=True)
+    subprocess.run(["service", "auditd", "start"], check=True)
+
+
+@pytest.fixture()
+def create_links_to_file(
+    folder_to_monitor: str, file_to_monitor: str, test_metadata: dict
+) -> None:
+    hardlink_amount = test_metadata.get("hardlink_amount", 0)
+    symlink_amount = test_metadata.get("symlink_amount", 0)
+
+    def hardlink(i: int):
+        Path(folder_to_monitor, f"test_h{i}").hardlink_to(file_to_monitor)
+
+    def symlink(i: int):
+        Path(folder_to_monitor, f"test_s{i}").symlink_to(file_to_monitor)
+
+    [hardlink(i) for i in range(hardlink_amount)]
+    [symlink(i) for i in range(symlink_amount)]
+
+    yield
+
+    [file.remove_file(f"test_h{i}") for i in range(hardlink_amount)]
+    [file.remove_file(f"test_s{i}") for i in range(symlink_amount)]
+
+
+@pytest.fixture()
+def create_registry_key(test_metadata: dict) -> None:
+    key = win32con.HKEY_LOCAL_MACHINE
+    sub_key = test_metadata.get("sub_key")
+    arch = (
+        win32con.KEY_WOW64_64KEY
+        if test_metadata.get("arch") == "x64"
+        else win32con.KEY_WOW64_32KEY
+    )
+
+    create_registry(key, sub_key, arch)
+
+    yield
+
+    delete_registry(key, sub_key, arch)
+
+
+@pytest.fixture()
+def detect_end_scan(test_metadata: dict) -> None:
+    wazuh_log_monitor = FileMonitor(WAZUH_LOG_PATH)
+    wazuh_log_monitor.start(timeout=60, callback=generate_callback(FIM_SCAN_END))
+    assert wazuh_log_monitor.callback_result
+
+    # Linux whodata (audit) only sees changes once its engine is up, after the baseline scan.
+    if sys.platform == LINUX and test_metadata.get('fim_mode') == 'whodata':
+        wazuh_log_monitor.start(timeout=60, callback=generate_callback(REALTIME_WHODATA_ENGINE_STARTED))
+        assert wazuh_log_monitor.callback_result
+
+
+@pytest.fixture()
+def create_paths_files(test_metadata: dict) -> str:
+    to_edit = test_metadata.get("path_or_files_to_create")
+
+    if not isinstance(to_edit, list):
+        raise TypeError(f"`files` should be a 'list', not a '{type(to_edit)}'")
+
+    created_files = []
+    for item in to_edit:
+        item_path = Path(item)
+        if item_path.exists():
+            raise FileExistsError(f"`{item_path}` already exists.")
+
+        # If file does not have suffixes, consider it a directory
+        if item_path.suffixes == []:
+            # Add a dummy file to the target directory to create the directory
+            created_files.extend(
+                file.create_parent_directories(Path(item_path).joinpath("dummy.file"))
+            )
+        else:
+            created_files.extend(file.create_parent_directories(item_path))
+
+            file.write_file(file_path=item_path, data="")
+            created_files.append(item_path)
+
+    yield to_edit
+
+    for item in to_edit:
+        item_path = Path(item)
+        file.delete_path_recursively(item_path)
+
+
+@pytest.fixture()
+def clean_fim_db():
+    """
+    Fixture to delete the persistent FIM DB file (fim.db) before each test.
+    Works on both Linux and Windows agents.
+    """
+    try:
+        if os.path.exists(FIM_DB_PATH):
+            os.remove(FIM_DB_PATH)
+    except Exception as e:
+        pytest.fail(f"Failed to delete FIM DB file at {FIM_DB_PATH}: {e}")
+
+@pytest.fixture()
+def clean_fim_sync_db():
+    """
+    Fixture to delete the FIM synchronization DB files (fim_sync)
+    before each test.
+    Works on both Linux and Windows agents.
+    """
+
+    # Stop wazuh-service and ensure all daemons are stopped
+    services.control_service('stop')
+    services.wait_expected_daemon_status(running_condition=False, timeout=180)
+
+    for filename in FIM_SYNC_DB_FILES:
+        file_path = os.path.join(FIM_SYNC_DB_DIR, filename)
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            pytest.fail(f"Failed to delete FIM SYNC DB file at {file_path}: {e}")

@@ -1,0 +1,86 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: 'Calculator demo for browser automation'
+
+prompts:
+  - 'Calculate {{num1}} {{operation}} {{num2}}'
+
+providers:
+  - id: browser
+    config:
+      headless: true # Set to false to see the browser in action
+      steps:
+        # Navigate to the demo
+        - action: navigate
+          args:
+            url: 'http://localhost:7860'
+
+        # Wait for initial page load
+        - action: wait
+          args:
+            ms: 3000
+
+        # Navigate to calculator tab
+        - action: click
+          args:
+            selector: 'button[role="tab"]:nth-child(2)'
+
+        # Wait for tab to load
+        - action: wait
+          args:
+            ms: 2000
+
+        # Enter numbers and perform calculation
+        - action: type
+          args:
+            selector: '#num1 input'
+            text: '{{num1}}'
+
+        - action: type
+          args:
+            selector: '#num2 input'
+            text: '{{num2}}'
+
+        # Select operation
+        - action: click
+          args:
+            selector: '{{operationSelector}}'
+
+        # Perform calculation
+        - action: click
+          args:
+            selector: '#calculate'
+
+        # Wait for calculation
+        - action: wait
+          args:
+            ms: 2000
+
+        # Read the textbox value, rather than its static Result label
+        - action: extract
+          args:
+            script: return document.querySelector('#result textarea')?.value ?? '';
+          name: result
+
+      transformResponse: 'extracted.result'
+
+# Simple demo tests
+tests:
+  - vars:
+      num1: '10'
+      num2: '5'
+      operation: Add
+      operationSelector: '#operation label:nth-child(1)'
+      expected: 15
+    assert:
+      - type: javascript
+        value: output.trim() !== '' && Number(output) === context.vars.expected
+
+  - vars:
+      num1: '20'
+      num2: '4'
+      operation: Multiply
+      operationSelector: '#operation label:nth-child(3)'
+      expected: 80
+    assert:
+      - type: javascript
+        value: output.trim() !== '' && Number(output) === context.vars.expected

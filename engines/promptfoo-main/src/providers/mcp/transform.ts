@@ -1,0 +1,226 @@
+import { type McpConfigParsed, McpConfigSchema } from '../../contracts/providerConfig/mcp';
+import { sanitizeSchemaForGemini } from '../google/util';
+import {
+  applyQueryParams,
+  getAuthHeaders,
+  getAuthQueryParams,
+  getOAuthTokenWithExpiry,
+  renderAuthVars,
+} from './util';
+import type { McpServerConfig as ClaudeCodeMcpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import type Anthropic from '@anthropic-ai/sdk';
+
+import type {
+  FunctionDeclaration as GoogleFunctionDeclaration,
+  Schema as GoogleSchema,
+  Tool as GoogleTool,
+} from '../google/types';
+import type { OpenAiTool } from '../openai/util';
+import type {
+  MCPOAuthClientCredentialsAuth,
+  MCPOAuthPasswordAuth,
+  MCPServerConfig,
+  MCPTool,
+  MCPToolInputSchema,
+} from './types';
+
+export function transformMCPToolsToOpenAi(tools: MCPTool[]): OpenAiTool[] {
+  return tools.map((tool) => {
+    const schema: MCPToolInputSchema = tool.inputSchema;
+    // Default to empty properties for missing or invalid schemas.
+    // Also handle schemas that don't have a properties field.
+    // This shouldn't normally happen with MCP SDK, but handle it gracefully.
+    let properties: Record<string, any> = {};
+    let required: string[] | undefined = undefined;
+    let additionalProperties: boolean | Record<string, any> | undefined = undefined;
+
+    if (schema && typeof schema === 'object' && 'properties' in schema) {
+      // Extract properties and required fields from the schema
+      properties = schema.properties ?? {};
+      required = schema.required;
+
+      // Preserve additionalProperties if it exists
+      if ('additionalProperties' in schema) {
+        additionalProperties = schema.additionalProperties;
+      }
+    }
+
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: {
+          type: 'object',
+          properties,
+          ...(required && required.length > 0 ? { required } : {}),
+          ...(additionalProperties === undefined ? {} : { additionalProperties }),
+        },
+      },
+    };
+  });
+}
+
+export function transformMCPToolsToAnthropic(tools: MCPTool[]): Anthropic.Tool[] {
+  return tools.map((tool) => {
+    // Remove $schema field if present to prevent provider errors
+    const { $schema: _$schema, ...cleanSchema } = tool.inputSchema;
+    return {
+      name: tool.name,
+      description: tool.description,
+      input_schema: {
+        type: 'object',
+        ...cleanSchema,
+      },
+    };
+  });
+}
+
+export function transformMCPToolsToGoogle(tools: MCPTool[]): GoogleTool[] {
+  const functionDeclarations: GoogleFunctionDeclaration[] = tools.map((tool) => {
+    const schema: MCPToolInputSchema = tool.inputSchema;
+    let parameters: GoogleSchema;
+
+    if (schema && typeof schema === 'object') {
+      // Sanitize schema for Gemini compatibility:
+      // - Removes unsupported properties (additionalProperties, $schema, default, etc.)
+      // - Converts types to uppercase (string → STRING)
+      // - Recursively processes nested schemas
+      parameters = sanitizeSchemaForGemini(schema) as GoogleSchema;
+
+      // Ensure type is OBJECT at root level for function parameters
+      if (!parameters.type) {
+        parameters.type = 'OBJECT';
+      }
+
+      // Ensure properties exists
+      if (!parameters.properties) {
+        parameters.properties = {};
+      }
+    } else {
+      parameters = { type: 'OBJECT', properties: {} };
+    }
+
+    return {
+      name: tool.name,
+      description: tool.description,
+      parameters,
+    };
+  });
+  return [{ functionDeclarations }];
+}
+
+export async function transformMCPConfigToClaudeCode(
+  input: unknown,
+): Promise<Record<string, ClaudeCodeMcpServerConfig>> {
+  const config = validateMCPConfigForClaudeCode(input);
+
+  if (config.enabled === false) {
+    return {};
+  }
+
+  const serverConfigs = getServerConfigs(config);
+  const servers = await Promise.all(
+    serverConfigs.map((server) => transformMCPServerConfigToClaudeCode(server)),
+  );
+  return Object.fromEntries(
+    servers.map((server, index) => [getClaudeCodeServerName(serverConfigs[index]), server]),
+  );
+}
+
+function getServerConfigs(config: McpConfigParsed): MCPServerConfig[] {
+  return [...(config.servers ?? []), ...(config.server ? [config.server] : [])];
+}
+
+// Preserve legacy names so existing tool allow and deny rules keep matching.
+function getClaudeCodeServerName({ name, url, command }: MCPServerConfig): string {
+  return name ?? url ?? command ?? 'default';
+}
+
+export function validateMCPConfigForClaudeCode(input: unknown): McpConfigParsed {
+  const result = McpConfigSchema.safeParse(input);
+  if (!result.success) {
+    throw new Error(`Claude Agent SDK MCP configuration is malformed: ${result.error.message}`);
+  }
+  const config = result.data;
+  if (!config.enabled) {
+    return config;
+  }
+
+  if (config.tools !== undefined || config.exclude_tools?.length) {
+    throw new Error(
+      'Claude Agent SDK MCP integration does not support MCP tool allowlists or non-empty exclusions; remove `tools`/`exclude_tools` or disable MCP for this provider.',
+    );
+  }
+
+  const namespaces = new Map<string, number>();
+  for (const [index, server] of getServerConfigs(config).entries()) {
+    const name = getClaudeCodeServerName(server);
+    // Match the SDK's tool-name normalization without renaming the configured servers.
+    let namespace = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (name.startsWith('claude.ai ')) {
+      namespace = namespace.replace(/_+/g, '_').replace(/^_|_$/g, '');
+    }
+    const previous = namespaces.get(namespace);
+    if (previous !== undefined) {
+      // Names can be credential-bearing URLs; identify the entries without echoing them.
+      throw new Error(
+        `Claude Agent SDK MCP servers ${previous + 1} and ${index + 1} have colliding tool names; give each server a unique \`name\` using letters, numbers, hyphens, or underscores.`,
+      );
+    }
+    namespaces.set(namespace, index);
+  }
+  return config;
+}
+
+async function transformMCPServerConfigToClaudeCode(
+  config: MCPServerConfig,
+): Promise<ClaudeCodeMcpServerConfig> {
+  let out: ClaudeCodeMcpServerConfig;
+
+  if (config.url) {
+    // Render environment variables in auth config
+    const renderedConfig = renderAuthVars(config);
+
+    // The Claude Agent SDK takes static headers, so fetch one OAuth token up front
+    const oauthToken =
+      renderedConfig.auth?.type === 'oauth'
+        ? (
+            await getOAuthTokenWithExpiry(
+              renderedConfig.auth as MCPOAuthClientCredentialsAuth | MCPOAuthPasswordAuth,
+              config.url,
+            )
+          ).accessToken
+        : undefined;
+
+    // Apply query params for api_key with query placement
+    const queryParams = getAuthQueryParams(renderedConfig);
+    const serverUrl = applyQueryParams(config.url, queryParams);
+
+    out = {
+      type: 'http',
+      url: serverUrl,
+      headers: { ...(config.headers ?? {}), ...getAuthHeaders(renderedConfig, oauthToken) },
+    };
+  } else if (config.command) {
+    out = {
+      type: 'stdio',
+      command: config.command,
+      args: config.args ?? [],
+      ...(config.env && { env: config.env }),
+    };
+  } else if (config.path) {
+    const isPy = config.path.endsWith('.py');
+    const command = isPy ? (process.platform === 'win32' ? 'python' : 'python3') : process.execPath;
+    out = {
+      type: 'stdio',
+      command,
+      args: [config.path],
+      ...(config.env && { env: config.env }),
+    };
+  } else {
+    throw new Error('MCP configuration cannot be converted to Claude Agent SDK MCP server config');
+  }
+
+  return out;
+}

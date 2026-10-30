@@ -1,0 +1,18 @@
+name: 4.X - wazuh-template for Elasticsearch test
+
+# if the file wazuh/extensions/elasticsearch/7.x/wazuh-template.json is modified launch the test or is a part of
+# a pull request
+
+on:
+  push:
+    branches:
+      - "[0-4].[0-9]+.[0-9]+"
+    paths:
+      - "extensions/elasticsearch/7.x/**"
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

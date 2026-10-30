@@ -1,0 +1,21 @@
+name: 4.X - Wodles - Unit tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      generate_report:
+        description: "Generate test report"
+        required: false
+        type: boolean
+        default: false
+      qa_branch:
+        description: "QA repository branch"
+        required: false
+        default: "main"
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

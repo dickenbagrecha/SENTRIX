@@ -1,0 +1,1921 @@
+import { type ChildProcess, spawn } from 'child_process';
+
+import { getEnvString, getProcessEnv } from '../../envars';
+import logger from '../../logger';
+import { validatePythonPath } from '../../python/pythonUtils';
+import { fetchWithProxy } from '../../util/fetch/index';
+import { maybeLoadToolsFromExternalFile } from '../../util/index';
+import { resolveProviderApiKey } from '../credentials';
+import { loadProviderCallbackFromFileUrl } from '../functionCallbackUtils';
+import { withGenAIToolSpan } from '../tracing';
+import { GOOGLE_MODELS } from './shared';
+import {
+  calculateGoogleCost,
+  geminiFormatAndSystemInstructions,
+  getGoogleAccessToken,
+  loadCredentials,
+  mergeGoogleCompletionOptions,
+  normalizeTools,
+  removeGoogleFunctionDeclarations,
+  resolveGoogleToolConfig,
+  stripExecutableToolFileReferences,
+  validateFunctionCall,
+} from './util';
+import type WebSocket from 'ws';
+
+import type {
+  ApiProvider,
+  CallApiContextParams,
+  ProviderOptions,
+  ProviderResponse,
+} from '../../types/index';
+import type {
+  CompletionOptions,
+  FunctionCall,
+  FunctionDeclaration,
+  GoogleProviderConfig,
+  Tool,
+} from './types';
+import type { GeminiFormat } from './util';
+
+const GEMINI_LIVE_TRANSLATE_MODEL = 'gemini-3.5-live-translate-preview';
+const ROBOTICS_TEXT_MODALITY_ERROR =
+  'Gemini Robotics ER 2 Streaming only supports TEXT response modality. Omit generationConfig.response_modalities/responseModalities to use the TEXT default, or set it to ["TEXT"].';
+const LIVE_TRANSLATE_AUDIO_MODALITY_ERROR =
+  'Gemini 3.5 Live Translate only supports AUDIO response modality. Omit generationConfig.response_modalities/responseModalities to use the AUDIO default, or set it to ["AUDIO"].';
+const ROBOTICS_CODE_EXECUTION_ERROR =
+  'Gemini Robotics ER 2 Streaming does not support code execution. Use function calling or Google Search instead.';
+const ROBOTICS_FILE_SEARCH_OR_COMPUTER_USE_ERROR =
+  'Gemini Robotics ER 2 Streaming does not support file search or computer use.';
+const ROBOTICS_GROUNDING_ERROR =
+  'Gemini Robotics ER 2 Streaming does not support Google Maps or URL context grounding. Use Google Search instead.';
+const ROBOTICS_STRUCTURED_OUTPUT_ERROR =
+  'Gemini Robotics ER 2 Streaming does not support structured output. Remove responseSchema and generationConfig response schema/MIME type options.';
+const LIVE_TRANSLATE_STRUCTURED_OUTPUT_ERROR =
+  'Gemini 3.5 Live Translate does not support structured output. Remove responseSchema and generationConfig response schema/MIME type options.';
+const ROBOTICS_UNSUPPORTED_TOOL_ERROR =
+  'Gemini Robotics ER 2 Streaming only supports function declarations and Google Search tools.';
+const ROBOTICS_API_VERSION_ERROR =
+  'Gemini Robotics ER 2 Streaming requires apiVersion v1beta; remove the override or set apiVersion to v1beta.';
+const ROBOTICS_SUPPORTED_TOOL_FIELDS = new Set(['functionDeclarations', 'googleSearch']);
+const LIVE_TRANSLATE_SILENCE_PEAK_THRESHOLD = 32;
+
+function hasStructuredOutputConfiguration(config: CompletionOptions): boolean {
+  const generationConfig = config.generationConfig as
+    | (NonNullable<CompletionOptions['generationConfig']> & {
+        responseSchema?: unknown;
+        responseMimeType?: unknown;
+      })
+    | undefined;
+  return (
+    config.responseSchema !== undefined ||
+    generationConfig?.response_schema !== undefined ||
+    generationConfig?.response_mime_type !== undefined ||
+    generationConfig?.responseSchema !== undefined ||
+    generationConfig?.responseMimeType !== undefined
+  );
+}
+
+function hasCodeExecutionTool(tools: Tool[]): boolean {
+  return tools.some(
+    (tool) =>
+      tool.codeExecution !== undefined ||
+      (tool as Tool & { code_execution?: unknown }).code_execution !== undefined,
+  );
+}
+
+function hasUnsupportedRoboticsGroundingTool(tools: Tool[]): boolean {
+  return tools.some((tool) => {
+    const groundingTool = tool as Tool & {
+      googleMaps?: unknown;
+      google_maps?: unknown;
+      urlContext?: unknown;
+      url_context?: unknown;
+    };
+    return (
+      groundingTool.googleMaps !== undefined ||
+      groundingTool.google_maps !== undefined ||
+      groundingTool.urlContext !== undefined ||
+      groundingTool.url_context !== undefined
+    );
+  });
+}
+
+function hasUnsupportedRoboticsFileSearchOrComputerUseTool(tools: Tool[]): boolean {
+  return tools.some((tool) => {
+    const unsupportedTool = tool as Tool & {
+      computerUse?: unknown;
+      computer_use?: unknown;
+      fileSearch?: unknown;
+      file_search?: unknown;
+    };
+    return (
+      unsupportedTool.computerUse !== undefined ||
+      unsupportedTool.computer_use !== undefined ||
+      unsupportedTool.fileSearch !== undefined ||
+      unsupportedTool.file_search !== undefined
+    );
+  });
+}
+
+function hasUnsupportedRoboticsTool(tools: Tool[]): boolean {
+  return tools.some((tool) => {
+    const fields = Object.keys(tool);
+    return (
+      fields.length === 0 || fields.some((field) => !ROBOTICS_SUPPORTED_TOOL_FIELDS.has(field))
+    );
+  });
+}
+
+function getRoboticsConfigError(
+  isRoboticsStreamingModel: boolean,
+  config: CompletionOptions,
+  responseModalities: string[] | undefined,
+  tools: Tool[],
+): string | undefined {
+  if (!isRoboticsStreamingModel) {
+    return undefined;
+  }
+  if (
+    responseModalities !== undefined &&
+    (responseModalities.length !== 1 || responseModalities[0] !== 'TEXT')
+  ) {
+    return ROBOTICS_TEXT_MODALITY_ERROR;
+  }
+  if (hasStructuredOutputConfiguration(config)) {
+    return ROBOTICS_STRUCTURED_OUTPUT_ERROR;
+  }
+  if (hasCodeExecutionTool(tools)) {
+    return ROBOTICS_CODE_EXECUTION_ERROR;
+  }
+  if (hasUnsupportedRoboticsFileSearchOrComputerUseTool(tools)) {
+    return ROBOTICS_FILE_SEARCH_OR_COMPUTER_USE_ERROR;
+  }
+  if (hasUnsupportedRoboticsGroundingTool(tools)) {
+    return ROBOTICS_GROUNDING_ERROR;
+  }
+  return hasUnsupportedRoboticsTool(tools) ? ROBOTICS_UNSUPPORTED_TOOL_ERROR : undefined;
+}
+
+function hasUnsupportedLiveTranslateToolsOrInstructions(
+  config: CompletionOptions,
+  systemInstruction: unknown,
+): boolean {
+  const hasTools = Array.isArray(config.tools) ? config.tools.length > 0 : Boolean(config.tools);
+  return (
+    hasTools ||
+    config.tool_choice !== undefined ||
+    config.toolConfig !== undefined ||
+    config.tool_config !== undefined ||
+    config.mcp?.enabled ||
+    Boolean(config.functionToolStatefulApi?.file) ||
+    Boolean(systemInstruction)
+  );
+}
+
+function hasUnsupportedLiveTranslateThinkingConfig(config: CompletionOptions): boolean {
+  const generationConfig = config.generationConfig as
+    | (NonNullable<CompletionOptions['generationConfig']> & { thinking_config?: unknown })
+    | undefined;
+  return (
+    generationConfig?.thinkingConfig !== undefined ||
+    generationConfig?.thinking_config !== undefined
+  );
+}
+
+function getEffectiveLiveTranslateServiceTier(
+  mergedConfig: CompletionOptions,
+  promptConfig?: Partial<CompletionOptions>,
+): unknown {
+  const providerPassthrough = mergedConfig.passthrough as
+    | { service_tier?: unknown; serviceTier?: unknown }
+    | undefined;
+  const promptPassthrough = promptConfig?.passthrough as
+    | { service_tier?: unknown; serviceTier?: unknown }
+    | undefined;
+  const providerServiceTier =
+    providerPassthrough?.service_tier ??
+    providerPassthrough?.serviceTier ??
+    mergedConfig.service_tier;
+  const promptServiceTier =
+    promptPassthrough?.service_tier ?? promptPassthrough?.serviceTier ?? promptConfig?.service_tier;
+  return promptServiceTier ?? providerServiceTier;
+}
+
+function hasMeaningfulPcm(audio: Buffer): boolean {
+  // Live Translate returns signed 16-bit little-endian PCM. A small noise floor
+  // prevents near-zero trailing samples from keeping a finite request alive.
+  for (let offset = 0; offset + 1 < audio.length; offset += 2) {
+    if (Math.abs(audio.readInt16LE(offset)) > LIVE_TRANSLATE_SILENCE_PEAK_THRESHOLD) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getUnsupportedLiveTranslateConfigurationError(
+  config: CompletionOptions,
+  systemInstruction: unknown,
+  responseModalities: string[] | undefined,
+  serviceTier: unknown,
+): string | undefined {
+  if (
+    responseModalities !== undefined &&
+    (responseModalities.length !== 1 || responseModalities[0] !== 'AUDIO')
+  ) {
+    return LIVE_TRANSLATE_AUDIO_MODALITY_ERROR;
+  }
+  return (
+    (hasUnsupportedLiveTranslateToolsOrInstructions(config, systemInstruction)
+      ? 'Gemini 3.5 Live Translate does not support tools or instructions.'
+      : undefined) ??
+    (hasStructuredOutputConfiguration(config)
+      ? LIVE_TRANSLATE_STRUCTURED_OUTPUT_ERROR
+      : undefined) ??
+    (serviceTier !== undefined && serviceTier !== 'standard'
+      ? 'Gemini 3.5 Live Translate does not support flex, priority, batch, or other non-standard inference tiers; remove service_tier/serviceTier or set it to standard.'
+      : undefined)
+  );
+}
+
+const formatContentMessages = (
+  contents: GeminiFormat,
+  contentIndex: number,
+  useRealtimeTextInput = false,
+  useManualAudioActivity = false,
+  useClientContentText = false,
+) => {
+  if (contents[contentIndex].role !== 'user') {
+    throw new Error('Can only take user role inputs.');
+  }
+  const parts = contents[contentIndex].parts;
+
+  // Vertex 2.5 accepts clientContent text turns. Realtime text is a contextual
+  // hint there and can produce an empty turn instead of an answer; 3.8 requires
+  // realtimeInput.text, so keep its protocol separate.
+  if (useClientContentText && parts.every((part) => typeof part.text === 'string')) {
+    return [{ clientContent: { turns: [{ role: 'user', parts }], turnComplete: true } }];
+  }
+
+  if (useRealtimeTextInput) {
+    const mappedMessages = parts.map((part) => {
+      const userPart = part as {
+        text?: string;
+        inlineData?: { mimeType: string; data: string };
+        inline_data?: { mime_type: string; data: string };
+      };
+      if (userPart.text !== undefined) {
+        return { realtimeInput: { text: userPart.text } };
+      }
+      const inlineData = userPart.inlineData ?? userPart.inline_data;
+      if (inlineData) {
+        const mimeType = 'mimeType' in inlineData ? inlineData.mimeType : inlineData.mime_type;
+        if (mimeType.startsWith('video/')) {
+          throw new Error(
+            'Google Live video input must be sent as individual image/jpeg or image/png frames (maximum 1 frame per second).',
+          );
+        }
+        if (mimeType.startsWith('audio/') && !mimeType.startsWith('audio/pcm')) {
+          throw new Error(
+            `Unsupported Google Live realtime input MIME type: ${mimeType}. Audio input must be raw 16-bit PCM (for example, audio/pcm;rate=16000).`,
+          );
+        }
+        if (
+          !mimeType.startsWith('audio/') &&
+          mimeType !== 'image/jpeg' &&
+          mimeType !== 'image/png'
+        ) {
+          throw new Error(`Unsupported Google Live realtime input MIME type: ${mimeType}`);
+        }
+        const mediaType = mimeType.startsWith('audio/') ? 'audio' : 'video';
+        return {
+          realtimeInput: {
+            [mediaType]: { mimeType, data: inlineData.data },
+          },
+        };
+      }
+      throw new Error('Unsupported part in Google Live realtime input.');
+    });
+    const textMessages = mappedMessages.filter((message) => 'text' in message.realtimeInput);
+    const contentMessages = mappedMessages.filter((message) => !('text' in message.realtimeInput));
+    if (useClientContentText && textMessages.length > 0) {
+      const text = textMessages.map((message) => message.realtimeInput.text).join('\n');
+      const hasAudio = contentMessages.some((message) => 'audio' in message.realtimeInput);
+      const clientContent = {
+        clientContent: { turns: [{ role: 'user', parts: [{ text }] }], turnComplete: !hasAudio },
+      };
+      if (hasAudio) {
+        // Supply text as context before the recording. Sending realtimeInput.text
+        // during an audio activity can interrupt it on Vertex 2.5.
+        return [
+          clientContent,
+          { realtimeInput: { activityStart: {} } },
+          ...contentMessages,
+          { realtimeInput: { activityEnd: {} } },
+        ];
+      }
+      return [...contentMessages, clientContent];
+    }
+    if (textMessages.length > 0) {
+      contentMessages.push({
+        realtimeInput: {
+          text: textMessages.map((message) => message.realtimeInput.text).join('\n'),
+        },
+      } as any);
+    }
+    if (contentMessages.some((message) => 'audio' in message.realtimeInput)) {
+      if (useManualAudioActivity) {
+        return [
+          { realtimeInput: { activityStart: {} } },
+          ...contentMessages,
+          { realtimeInput: { activityEnd: {} } },
+        ];
+      }
+      contentMessages.push({ realtimeInput: { audioStreamEnd: true } } as any);
+    } else if (
+      contentMessages.some((message) => 'video' in message.realtimeInput) &&
+      textMessages.length === 0
+    ) {
+      contentMessages.push({ clientContent: { turnComplete: true } } as any);
+    }
+    return contentMessages;
+  }
+
+  if (parts.length !== 1) {
+    throw new Error('Unexpected number of parts in user input.');
+  }
+  const userMessage = parts[0].text;
+
+  const contentMessage = {
+    client_content: {
+      turns: [
+        {
+          role: 'user',
+          parts: [{ text: userMessage }],
+        },
+      ],
+      turn_complete: true,
+    },
+  };
+  return [contentMessage];
+};
+
+const getModalityTokenCount = (details: unknown, modality: string): number => {
+  if (!Array.isArray(details)) {
+    return 0;
+  }
+  return details.reduce((total, detail) => {
+    const count = detail?.tokenCount ?? detail?.token_count;
+    return detail?.modality === modality && typeof count === 'number' && Number.isFinite(count)
+      ? total + Math.max(count, 0)
+      : total;
+  }, 0);
+};
+
+const getTokenCount = (...values: unknown[]): number => {
+  const value = values.find((entry) => typeof entry === 'number' && Number.isFinite(entry));
+  return typeof value === 'number' ? Math.max(value, 0) : 0;
+};
+
+const getGemini38ConfigError = (
+  generationConfig: CompletionOptions['generationConfig'],
+  extendedThinking: boolean,
+): string | undefined => {
+  const thinking = generationConfig?.thinkingConfig;
+  if (!extendedThinking && thinking) {
+    return 'gemini-3.8-live does not support thinkingConfig. Use gemini-3.8-live-extended-thinking instead.';
+  }
+  if (thinking?.thinkingBudget !== undefined) {
+    return 'gemini-3.8-live-extended-thinking does not support thinkingBudget. Use thinkingLevel LOW, MEDIUM, or HIGH.';
+  }
+  if (
+    thinking?.thinkingLevel !== undefined &&
+    !['LOW', 'MEDIUM', 'HIGH'].includes(thinking.thinkingLevel)
+  ) {
+    return 'gemini-3.8-live-extended-thinking supports thinkingLevel LOW, MEDIUM, or HIGH.';
+  }
+  if (generationConfig?.enableAffectiveDialog !== undefined) {
+    return 'Gemini 3.8 Live does not support enableAffectiveDialog.';
+  }
+  if (generationConfig?.proactivity?.proactiveAudio === false) {
+    return 'Gemini 3.8 Live has permanently enabled proactive audio; proactivity.proactiveAudio cannot be false.';
+  }
+  return undefined;
+};
+
+/**
+ * Helper function to fetch JSON with error handling
+ */
+export const fetchJson = async <T = unknown>(url: string, options?: RequestInit): Promise<T> => {
+  const response = await fetchWithProxy(url, options);
+  if (!response.ok) {
+    throw new Error(`HTTP error - status: ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+};
+
+/**
+ * Helper function to try GET with query params, fallback to POST with JSON body
+ */
+export const tryGetThenPost = async <T = unknown>(url: string, data?: unknown): Promise<T> => {
+  try {
+    // Try GET first with query params
+    const urlWithParams = new URL(url);
+    if (data) {
+      const params = (typeof data === 'string' ? JSON.parse(data) : data) as Record<
+        string,
+        unknown
+      >;
+      Object.entries(params).forEach(([key, value]) => {
+        urlWithParams.searchParams.append(key, String(value));
+      });
+    }
+    return await fetchJson<T>(urlWithParams.href);
+  } catch {
+    // Fall back to POST
+    return fetchJson<T>(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: data ? JSON.stringify(typeof data === 'string' ? JSON.parse(data) : data) : null,
+    });
+  }
+};
+
+export class GoogleLiveProvider implements ApiProvider {
+  config: GoogleProviderConfig;
+  modelName: string;
+  readonly env?: ProviderOptions['env'];
+  protected readonly isVertex: boolean = false;
+  private loadedFunctionCallbacks: Record<string, Function> = {};
+
+  constructor(modelName: string, options: ProviderOptions) {
+    this.modelName = modelName;
+    this.config = options.config || {};
+    this.env = options.env;
+  }
+
+  validateFunctionToolCall(output: string | object, vars?: CallApiContextParams['vars']): void {
+    validateFunctionCall(output, this.config.tools, vars);
+  }
+
+  id(): string {
+    return `google:live:${this.modelName}`;
+  }
+
+  toString(): string {
+    return `[Google Live Provider ${this.modelName}]`;
+  }
+
+  private convertPcmToWav(pcmBuffer: Buffer): string {
+    const wavBuffer = this.createWavHeader(pcmBuffer.length, 24000, 16, 1);
+    const wavData = Buffer.concat([wavBuffer, pcmBuffer]);
+    return wavData.toString('base64');
+  }
+
+  private createWavHeader(
+    dataLength: number,
+    sampleRate: number,
+    bitsPerSample: number,
+    channels: number,
+  ): Buffer {
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + dataLength, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(channels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE((sampleRate * channels * bitsPerSample) / 8, 28);
+    header.writeUInt16LE((channels * bitsPerSample) / 8, 32);
+    header.writeUInt16LE(bitsPerSample, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(dataLength, 40);
+    return header;
+  }
+
+  getApiKey(): string | undefined {
+    // Priority aligned with Python SDK: GOOGLE_API_KEY > GEMINI_API_KEY
+    return resolveProviderApiKey({ apiKey: this.config.apiKey }, this.env, [
+      'GOOGLE_API_KEY',
+      'GEMINI_API_KEY',
+    ]);
+  }
+
+  private async getAccessToken(config: CompletionOptions): Promise<string | undefined> {
+    const credentials = loadCredentials(config.credentials);
+    return getGoogleAccessToken(credentials);
+  }
+
+  protected async getConnection(config: CompletionOptions): Promise<{
+    url: string;
+    model: string;
+    apiVersion: string;
+    headers?: Record<string, string>;
+  }> {
+    // Cloud ADC often lacks Gemini API scopes. Do not let an incidental gcloud
+    // login override an API key; explicit OAuth credentials still take priority
+    // over environment API keys. Vertex overrides this method and uses only OAuth.
+    const apiKey = config.apiKey || (config.credentials ? undefined : this.getApiKey());
+    const accessToken = apiKey ? undefined : await this.getAccessToken(config);
+    if (!accessToken && !apiKey) {
+      throw new Error(
+        'Google authentication is not configured. For the Live API, set apiKey in the provider ' +
+          'config, GOOGLE_API_KEY, or GEMINI_API_KEY. Alternatively, configure OAuth2 credentials; ' +
+          'see https://ai.google.dev/gemini-api/docs/oauth.',
+      );
+    }
+    const prefersV1beta =
+      this.modelName === GEMINI_LIVE_TRANSLATE_MODEL ||
+      this.modelName.startsWith('gemini-robotics-er-2-streaming-') ||
+      this.modelName.startsWith('gemini-3.1-flash-live') ||
+      this.modelName.startsWith('gemini-2.5-flash-native-audio-') ||
+      this.modelName.startsWith('gemini-live-2.5-flash-preview-native-audio-');
+    const apiVersion = config.apiVersion || (prefersV1beta ? 'v1beta' : 'v1alpha');
+    const auth = accessToken ? `access_token=${accessToken}` : `key=${apiKey}`;
+    return {
+      url: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.${apiVersion}.GenerativeService.BidiGenerateContent?${auth}`,
+      model: `models/${this.modelName}`,
+      apiVersion,
+    };
+  }
+
+  async callApi(prompt: string, context?: CallApiContextParams): Promise<ProviderResponse> {
+    const isGemini38Live =
+      this.modelName === 'gemini-3.8-live' ||
+      this.modelName === 'gemini-3.8-live-extended-thinking';
+    const usesInteractionStatus = this.modelName === 'gemini-3.8-live-extended-thinking';
+    const promptConfig = context?.prompt?.config as Partial<GoogleProviderConfig> | undefined;
+    const config = mergeGoogleCompletionOptions(this.config, promptConfig);
+    const promptBasePath = promptConfig?.basePath ?? this.config.basePath;
+    const supportsTextResponse = this.modelName.startsWith('gemini-robotics-er-2-streaming-');
+    const configuredResponseModalities = (
+      config.generationConfig?.response_modalities ?? config.generationConfig?.responseModalities
+    )?.map((modality) => modality.toUpperCase());
+    if (isGemini38Live) {
+      const error = getGemini38ConfigError(config.generationConfig, usesInteractionStatus);
+      if (error) {
+        return { error };
+      }
+    }
+
+    // Resolve authentication before starting tool processes or opening a socket.
+    const connection = await this.getConnection(config);
+    const usesRealtimeTextInput =
+      isGemini38Live || connection.apiVersion === 'v1beta' || this.isVertex;
+
+    const { toolConfig, toolsDisabled } = resolveGoogleToolConfig(config);
+
+    const { contents, systemInstruction } = geminiFormatAndSystemInstructions(
+      prompt,
+      context?.vars,
+      config.systemInstruction,
+      {
+        basePath:
+          promptConfig?.systemInstruction === undefined ? this.config.basePath : promptBasePath,
+        useAssistantRole: config.useAssistantRole,
+      },
+    );
+    // Eval audio inputs are finite recordings, so mark their boundaries explicitly
+    // instead of relying on voice activity detection to find trailing silence.
+    const useManualAudioActivity =
+      (isGemini38Live || this.isVertex) &&
+      contents.some((content) =>
+        content.parts.some((part) => {
+          const audioPart = part as {
+            inlineData?: { mimeType?: string };
+            inline_data?: { mime_type?: string };
+          };
+          return (audioPart.inlineData?.mimeType ?? audioPart.inline_data?.mime_type)?.startsWith(
+            'audio/',
+          );
+        }),
+      );
+    let contentIndex = 0;
+
+    if (this.modelName === GEMINI_LIVE_TRANSLATE_MODEL) {
+      const translationConfig = config.generationConfig?.translationConfig;
+      if (!translationConfig) {
+        return {
+          error:
+            'Gemini 3.5 Live Translate requires generationConfig.translationConfig (targetLanguageCode defaults to en).',
+        };
+      }
+      if (
+        translationConfig.targetLanguageCode !== undefined &&
+        (typeof translationConfig.targetLanguageCode !== 'string' ||
+          translationConfig.targetLanguageCode.trim().length === 0)
+      ) {
+        return {
+          error:
+            'Gemini 3.5 Live Translate requires a non-empty targetLanguageCode in generationConfig.translationConfig when provided.',
+        };
+      }
+      if (translationConfig.targetLanguageCode === undefined) {
+        config.generationConfig = {
+          ...config.generationConfig,
+          translationConfig: {
+            ...translationConfig,
+            targetLanguageCode: 'en',
+          },
+        };
+      }
+      if (hasUnsupportedLiveTranslateThinkingConfig(config)) {
+        return {
+          error:
+            'Gemini 3.5 Live Translate does not support generationConfig.thinkingConfig or generationConfig.thinking_config; remove the thinking configuration.',
+        };
+      }
+      if (!this.isVertex && config.apiVersion && config.apiVersion !== 'v1beta') {
+        return {
+          error:
+            'Gemini 3.5 Live Translate requires apiVersion v1beta; remove the override or set apiVersion to v1beta.',
+        };
+      }
+      const unsupportedConfigurationError = getUnsupportedLiveTranslateConfigurationError(
+        config,
+        systemInstruction,
+        configuredResponseModalities,
+        getEffectiveLiveTranslateServiceTier(config, promptConfig),
+      );
+      if (unsupportedConfigurationError) {
+        return { error: unsupportedConfigurationError };
+      }
+      const hasOnlySupportedPcmAudio =
+        contents.length > 0 &&
+        contents.every(
+          (content) =>
+            content.role === 'user' &&
+            content.parts.length > 0 &&
+            content.parts.every((part) => {
+              const inlineData =
+                (part as { inlineData?: { mimeType?: string; data?: string } }).inlineData ??
+                (part as { inline_data?: { mime_type?: string; data?: string } }).inline_data;
+              const mimeType =
+                (inlineData as { mimeType?: string } | undefined)?.mimeType ??
+                (inlineData as { mime_type?: string } | undefined)?.mime_type;
+              return (
+                mimeType?.toLowerCase() === 'audio/pcm;rate=16000' &&
+                typeof inlineData?.data === 'string' &&
+                inlineData.data.trim().length > 0
+              );
+            }),
+        );
+      if (!hasOnlySupportedPcmAudio) {
+        return {
+          error:
+            'Gemini 3.5 Live Translate only supports raw PCM audio input with MIME type audio/pcm;rate=16000 (16-bit mono) and non-empty base64 data; text, image, video, missing sample rates, and other sample rates are not supported.',
+        };
+      }
+    }
+
+    // Load and validate tools before starting the stateful worker or creating a WebSocket.
+    // Disabled mode removes executable Python/JS tool refs before loading so non-function
+    // tools stay available without executing user code.
+    const configTools = toolsDisabled
+      ? stripExecutableToolFileReferences(config.tools, context?.vars)
+      : config.tools;
+    const fileTools = configTools
+      ? await maybeLoadToolsFromExternalFile(configTools, context?.vars)
+      : [];
+    const normalizedTools = fileTools
+      ? normalizeTools(Array.isArray(fileTools) ? fileTools : [fileTools])
+      : [];
+    const requestTools = toolsDisabled
+      ? removeGoogleFunctionDeclarations(normalizedTools)
+      : normalizedTools;
+    if (
+      supportsTextResponse &&
+      !this.isVertex &&
+      config.apiVersion &&
+      config.apiVersion !== 'v1beta'
+    ) {
+      return { error: ROBOTICS_API_VERSION_ERROR };
+    }
+    const roboticsConfigError = getRoboticsConfigError(
+      supportsTextResponse,
+      config,
+      configuredResponseModalities,
+      requestTools,
+    );
+    if (roboticsConfigError) {
+      return { error: roboticsConfigError };
+    }
+
+    if (usesInteractionStatus) {
+      for (const tool of requestTools) {
+        if (
+          tool.functionDeclarations?.some(
+            (declaration: FunctionDeclaration) => declaration.behavior === 'BLOCKING',
+          )
+        ) {
+          return {
+            error: 'gemini-3.8-live-extended-thinking requires NON_BLOCKING function declarations.',
+          };
+        }
+        if (tool.functionDeclarations) {
+          tool.functionDeclarations = tool.functionDeclarations.map(
+            (declaration: FunctionDeclaration) => ({ ...declaration, behavior: 'NON_BLOCKING' }),
+          );
+        }
+      }
+    }
+
+    let statefulApi: ChildProcess | undefined;
+    if (!toolsDisabled && config.functionToolStatefulApi?.file) {
+      try {
+        // Use the validatePythonPath function to get the correct Python executable
+        const pythonPath = await validatePythonPath(
+          config.functionToolStatefulApi.pythonExecutable ||
+            getEnvString('PROMPTFOO_PYTHON') ||
+            'python3',
+          !!config.functionToolStatefulApi.pythonExecutable || !!getEnvString('PROMPTFOO_PYTHON'),
+        );
+        logger.debug(`Spawning API with Python executable: ${pythonPath}`);
+        statefulApi = spawn(pythonPath, [config.functionToolStatefulApi.file], {
+          env: getProcessEnv(),
+        });
+
+        // Add error handling for the Python process
+        statefulApi.on('error', (err) => {
+          logger.error(`Error spawning Python process: ${JSON.stringify(err)}`);
+        });
+
+        // Log output from the Python process for debugging
+        statefulApi.stdout?.on('data', (data) => {
+          logger.debug(`Python API stdout: ${data.toString()}`);
+        });
+        statefulApi.stderr?.on('data', (data) => {
+          logger.error(`Python API stderr: ${data.toString()}`);
+        });
+
+        // Give the Python API time to start up
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        logger.debug('Stateful API process started');
+      } catch (err) {
+        logger.error(`Failed to spawn Python API: ${JSON.stringify(err)}`);
+      }
+    }
+
+    // Lazy-load the `ws` implementation so merely importing this module stays cheap;
+    // the Live provider is itself dynamically imported by the Google provider family.
+    const WebSocketCtor = (await import('ws')).default;
+
+    return new Promise<ProviderResponse>((resolve) => {
+      const isNativeAudioModel = this.modelName.includes('native-audio');
+      let isResolved = false;
+      let liveTranslateCompletionTimeout: ReturnType<typeof setTimeout> | undefined;
+      let liveTranslateHardTimeout: ReturnType<typeof setTimeout> | undefined;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let cancelFinalStateRetrieval: ((reason: Error) => void) | undefined;
+      let statefulApiCleanupStarted = false;
+      let armLiveTranslateCompletion = () => {};
+      let armLiveTranslateHardTimeout = () => {};
+
+      const safeResolve = (response: ProviderResponse) => {
+        if (!isResolved) {
+          isResolved = true;
+          clearTimeout(timeout);
+          clearTimeout(liveTranslateCompletionTimeout);
+          clearTimeout(liveTranslateHardTimeout);
+          cancelFinalStateRetrieval?.(new Error('Final state retrieval cancelled'));
+          if (statefulApi && !statefulApiCleanupStarted) {
+            statefulApiCleanupStarted = true;
+            try {
+              statefulApi.kill('SIGTERM');
+            } catch (error) {
+              logger.error('Failed to terminate stateful API process', { error });
+            }
+          }
+          resolve(response);
+        }
+      };
+
+      const ws = connection.headers
+        ? new WebSocketCtor(connection.url, { headers: connection.headers })
+        : new WebSocketCtor(connection.url);
+
+      let response_text_total = '';
+      const responseAudioChunks: Buffer[] = [];
+      let response_audio_transcript = '';
+      let hasAudioContent = false;
+      const function_calls_total: FunctionCall[] = [];
+      let statefulApiState: unknown = undefined;
+      const usageMetadata: any[] = [];
+      let pendingUsageMetadata: any;
+      let completedGenerations = 0;
+      let completedTurns = 0;
+      let hasPendingToolFollowup = false;
+      let receivedMessageIndex = 0;
+      let lastToolResponseMessageIndex = 0;
+      let lastVideoFrameSentAt = 0;
+      let hasFinalized = false;
+      let liveTranslateInputEnded = false;
+
+      const requestedText = configuredResponseModalities?.includes('TEXT') ?? false;
+      const responseModalities =
+        usesRealtimeTextInput && !supportsTextResponse
+          ? configuredResponseModalities?.filter((modality) => modality !== 'TEXT')
+          : configuredResponseModalities;
+      const effectiveResponseModalities =
+        supportsTextResponse && responseModalities === undefined
+          ? ['TEXT']
+          : usesRealtimeTextInput && !supportsTextResponse && !responseModalities?.length
+            ? ['AUDIO']
+            : responseModalities;
+      if (requestedText && !effectiveResponseModalities?.includes('TEXT')) {
+        logger.warn(
+          `[Google Live] ${this.modelName} does not support TEXT response modality; requesting AUDIO with output transcription instead. Audio output is billed at audio rates.`,
+        );
+      }
+      const isTextExpected = effectiveResponseModalities?.includes('TEXT') ?? false;
+      const isAudioExpected = effectiveResponseModalities?.includes('AUDIO') ?? false;
+
+      let hasTextStreamEnded = !isTextExpected;
+      let hasAudioStreamEnded = !isAudioExpected;
+
+      const sendContentMessages = async (contentMessages: any[]) => {
+        if (this.modelName === GEMINI_LIVE_TRANSLATE_MODEL) {
+          liveTranslateInputEnded = false;
+          clearTimeout(liveTranslateHardTimeout);
+          liveTranslateHardTimeout = undefined;
+        }
+        for (const contentMessage of contentMessages) {
+          if (contentMessage.realtimeInput?.video) {
+            const delayMs = Math.max(lastVideoFrameSentAt + 1_000 - Date.now(), 0);
+            if (delayMs > 0) {
+              await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+            }
+            if (isResolved) {
+              return;
+            }
+            lastVideoFrameSentAt = Date.now();
+          }
+          ws.send(JSON.stringify(contentMessage));
+          if (
+            this.modelName === GEMINI_LIVE_TRANSLATE_MODEL &&
+            contentMessage.realtimeInput?.audioStreamEnd
+          ) {
+            liveTranslateInputEnded = true;
+            armLiveTranslateHardTimeout();
+          }
+        }
+      };
+
+      // Extract transcription config for use in message handler
+      const hasOutputTranscription =
+        !!config.generationConfig?.outputAudioTranscription ||
+        isGemini38Live ||
+        this.isVertex ||
+        (usesRealtimeTextInput && !supportsTextResponse && requestedText);
+
+      const videoFrameCount = contents.reduce(
+        (total, content) =>
+          total +
+          content.parts.filter((part) => {
+            const inlineData =
+              (part as { inlineData?: { mimeType?: string; mime_type?: string } }).inlineData ??
+              (part as { inline_data?: { mimeType?: string; mime_type?: string } }).inline_data;
+            const mimeType = inlineData?.mimeType ?? inlineData?.mime_type;
+            return mimeType === 'image/jpeg' || mimeType === 'image/png';
+          }).length,
+        0,
+      );
+      const framePacingAllowanceMs = Math.max(videoFrameCount - 1, 0) * 1_000;
+
+      // Idle guard rather than a hard deadline: it re-arms on every server message, so a
+      // long generation that keeps streaming output is never cut off mid-response, while a
+      // stream that stalls — before or after partial output — still errors out. The frame
+      // pacing allowance keeps the guard alive while outbound video frames are rate-limited.
+      const effectiveTimeoutMs = (config.timeoutMs || 30000) + framePacingAllowanceMs;
+      // Google's finite-input Live Translate sample allows four seconds for trailing output.
+      // Keep that grace below the caller's idle timeout so a partial translation can still win.
+      const liveTranslateCompletionGraceMs = Math.min(
+        4_000,
+        Math.max(1, Math.floor(effectiveTimeoutMs / 2)),
+      );
+      // The idle timeout can be extended indefinitely by incoming silent audio. Bound the whole
+      // finite-input translation while still leaving enough room for a response that begins near
+      // the idle limit to finish its trailing-output grace period.
+      const liveTranslateHardDeadlineMs = effectiveTimeoutMs + liveTranslateCompletionGraceMs;
+      const armIdleTimeout = () => {
+        clearTimeout(timeout);
+        if (isResolved || hasFinalized) {
+          return;
+        }
+        timeout = setTimeout(() => {
+          logger.error(
+            `WebSocket connection timed out after ${effectiveTimeoutMs}ms of inactivity`,
+          );
+          ws.close();
+          safeResolve({
+            error: `WebSocket request timed out after ${effectiveTimeoutMs}ms of inactivity`,
+          });
+        }, effectiveTimeoutMs);
+      };
+      armIdleTimeout();
+
+      armLiveTranslateHardTimeout = () => {
+        clearTimeout(liveTranslateHardTimeout);
+        liveTranslateHardTimeout = setTimeout(() => {
+          liveTranslateHardTimeout = undefined;
+          logger.error(
+            `WebSocket request timed out after ${liveTranslateHardDeadlineMs}ms waiting for Live Translate output`,
+          );
+          ws.close();
+          safeResolve({
+            error: `WebSocket request timed out after ${liveTranslateHardDeadlineMs}ms waiting for Live Translate output`,
+          });
+        }, liveTranslateHardDeadlineMs);
+      };
+
+      const sendNextContentMessages = async (isMultiTurn = false) => {
+        if (contentIndex >= contents.length) {
+          return;
+        }
+        clearTimeout(liveTranslateCompletionTimeout);
+        liveTranslateCompletionTimeout = undefined;
+        const contentMessages = formatContentMessages(
+          contents,
+          contentIndex,
+          usesRealtimeTextInput,
+          useManualAudioActivity,
+          this.isVertex && !isGemini38Live,
+        );
+        contentIndex += 1;
+        armIdleTimeout();
+        logger.debug(isMultiTurn ? 'WebSocket sent (multi-turn)' : 'WebSocket sent', {
+          messageCount: contentMessages.length,
+        });
+        await sendContentMessages(contentMessages);
+      };
+
+      const finalizeResponse = async () => {
+        // Prevent multiple calls to finalizeResponse
+        if (hasFinalized || isResolved) {
+          logger.debug('Response already finalized or resolved, skipping finalization');
+          return;
+        }
+        hasFinalized = true;
+        clearTimeout(liveTranslateCompletionTimeout);
+        clearTimeout(liveTranslateHardTimeout);
+
+        if (pendingUsageMetadata) {
+          usageMetadata.push(pendingUsageMetadata);
+          pendingUsageMetadata = undefined;
+        }
+
+        if (ws.readyState === WebSocketCtor.OPEN) {
+          ws.close();
+        }
+        clearTimeout(timeout);
+
+        // Retrieve final state from stateful API before shutting down. Skip
+        // if the request has already been resolved (e.g. by an early
+        // onclose/timeout) — the caller has moved on and won't read the
+        // result.
+        if (!isResolved && !toolsDisabled && config.functionToolStatefulApi) {
+          const controller = new AbortController();
+          const finalStateTimeoutMs = config.timeoutMs || 30_000;
+          let finalStateTimeout: ReturnType<typeof setTimeout> | undefined;
+          // Bound headers and JSON consumption, even if an aborted fetch wrapper settles late.
+          const cancelled = new Promise<never>((_, reject) => {
+            cancelFinalStateRetrieval = (reason) => {
+              clearTimeout(finalStateTimeout);
+              reject(reason);
+              controller.abort();
+            };
+            finalStateTimeout = setTimeout(() => {
+              cancelFinalStateRetrieval?.(
+                new Error(`Final state retrieval timed out after ${finalStateTimeoutMs}ms`),
+              );
+            }, finalStateTimeoutMs);
+          });
+          try {
+            const url = new URL('get_state', config.functionToolStatefulApi.url).href;
+            const state = await Promise.race([
+              fetchJson(url, { signal: controller.signal }),
+              cancelled,
+            ]);
+            if (isResolved) {
+              return;
+            }
+            statefulApiState = state;
+            logger.debug(`Stateful api state: ${JSON.stringify(statefulApiState)}`);
+          } catch (err) {
+            if (!isResolved) {
+              logger.error('Error retrieving final state of api', { error: err });
+            }
+          } finally {
+            clearTimeout(finalStateTimeout);
+            cancelFinalStateRetrieval = undefined;
+          }
+        }
+
+        if (isResolved) {
+          return;
+        }
+
+        // Determine final output text and thinking
+        let outputText = response_text_total;
+        let thinking = undefined;
+
+        // If we have audio content with transcript
+        if (hasAudioContent && response_audio_transcript) {
+          if (response_text_total) {
+            // Separate thinking from main output
+            thinking = response_text_total;
+            outputText = response_audio_transcript;
+          } else {
+            // Use transcript as the primary output text
+            outputText = response_audio_transcript;
+          }
+        }
+
+        const result: ProviderResponse = {
+          output: {
+            text: outputText,
+            toolCall: { functionCalls: function_calls_total },
+            statefulApiState,
+            ...(thinking && { thinking }),
+          },
+          metadata: {},
+        };
+
+        if (usageMetadata.length > 0) {
+          const promptTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getTokenCount(usage.promptTokenCount, usage.prompt_token_count) +
+              getTokenCount(usage.toolUsePromptTokenCount, usage.tool_use_prompt_token_count),
+            0,
+          );
+          const responseTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getTokenCount(
+                usage.responseTokenCount,
+                usage.candidatesTokenCount,
+                usage.response_token_count,
+                usage.candidates_token_count,
+              ),
+            0,
+          );
+          const thoughtTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total + getTokenCount(usage.thoughtsTokenCount, usage.thoughts_token_count),
+            0,
+          );
+          const billableCompletionTokens = usageMetadata.reduce((total, usage) => {
+            const promptTokenCount = getTokenCount(
+              usage.promptTokenCount,
+              usage.prompt_token_count,
+            );
+            const toolUsePromptTokenCount = getTokenCount(
+              usage.toolUsePromptTokenCount,
+              usage.tool_use_prompt_token_count,
+            );
+            const responseTokenCount = getTokenCount(
+              usage.responseTokenCount,
+              usage.candidatesTokenCount,
+              usage.response_token_count,
+              usage.candidates_token_count,
+            );
+            const totalTokenCount = getTokenCount(usage.totalTokenCount, usage.total_token_count);
+            const thoughtsTokenCount = getTokenCount(
+              usage.thoughtsTokenCount,
+              usage.thoughts_token_count,
+            );
+            const thoughtsIncluded =
+              totalTokenCount > 0 &&
+              (totalTokenCount === promptTokenCount + responseTokenCount ||
+                totalTokenCount ===
+                  promptTokenCount + toolUsePromptTokenCount + responseTokenCount);
+
+            return total + responseTokenCount + (thoughtsIncluded ? 0 : thoughtsTokenCount);
+          }, 0);
+          const audioPromptTokens = usageMetadata.reduce((total, usage) => {
+            const details = usage.promptTokensDetails ?? usage.prompt_tokens_details;
+            if (
+              this.modelName === GEMINI_LIVE_TRANSLATE_MODEL &&
+              (!Array.isArray(details) || details.length === 0)
+            ) {
+              return (
+                total +
+                getTokenCount(usage.promptTokenCount, usage.prompt_token_count) +
+                getTokenCount(usage.toolUsePromptTokenCount, usage.tool_use_prompt_token_count)
+              );
+            }
+            return (
+              total +
+              getModalityTokenCount(details, 'AUDIO') +
+              getModalityTokenCount(
+                usage.toolUsePromptTokensDetails ?? usage.tool_use_prompt_tokens_details,
+                'AUDIO',
+              )
+            );
+          }, 0);
+          const audioCompletionTokens = usageMetadata.reduce((total, usage) => {
+            const details =
+              usage.responseTokensDetails ??
+              usage.candidatesTokensDetails ??
+              usage.response_tokens_details ??
+              usage.candidates_tokens_details;
+            if (
+              this.modelName === GEMINI_LIVE_TRANSLATE_MODEL &&
+              (!Array.isArray(details) || details.length === 0)
+            ) {
+              return (
+                total +
+                getTokenCount(
+                  usage.responseTokenCount,
+                  usage.candidatesTokenCount,
+                  usage.response_token_count,
+                  usage.candidates_token_count,
+                )
+              );
+            }
+            return total + getModalityTokenCount(details, 'AUDIO');
+          }, 0);
+          const imagePromptTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getModalityTokenCount(
+                usage.promptTokensDetails ?? usage.prompt_tokens_details,
+                'IMAGE',
+              ) +
+              getModalityTokenCount(
+                usage.toolUsePromptTokensDetails ?? usage.tool_use_prompt_tokens_details,
+                'IMAGE',
+              ) +
+              getModalityTokenCount(
+                usage.promptTokensDetails ?? usage.prompt_tokens_details,
+                'DOCUMENT',
+              ) +
+              getModalityTokenCount(
+                usage.toolUsePromptTokensDetails ?? usage.tool_use_prompt_tokens_details,
+                'DOCUMENT',
+              ),
+            0,
+          );
+          const videoPromptTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getModalityTokenCount(
+                usage.promptTokensDetails ?? usage.prompt_tokens_details,
+                'VIDEO',
+              ) +
+              getModalityTokenCount(
+                usage.toolUsePromptTokensDetails ?? usage.tool_use_prompt_tokens_details,
+                'VIDEO',
+              ),
+            0,
+          );
+          const cachedPromptTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getTokenCount(usage.cachedContentTokenCount, usage.cached_content_token_count),
+            0,
+          );
+          const cachedAudioPromptTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getModalityTokenCount(
+                usage.cacheTokensDetails ?? usage.cache_tokens_details,
+                'AUDIO',
+              ),
+            0,
+          );
+          const cachedImagePromptTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getModalityTokenCount(
+                usage.cacheTokensDetails ?? usage.cache_tokens_details,
+                'IMAGE',
+              ) +
+              getModalityTokenCount(
+                usage.cacheTokensDetails ?? usage.cache_tokens_details,
+                'DOCUMENT',
+              ),
+            0,
+          );
+          const cachedVideoPromptTokens = usageMetadata.reduce(
+            (total, usage) =>
+              total +
+              getModalityTokenCount(
+                usage.cacheTokensDetails ?? usage.cache_tokens_details,
+                'VIDEO',
+              ),
+            0,
+          );
+          const videoInputPerSecond = GOOGLE_MODELS.find((model) => model.id === this.modelName)
+            ?.cost?.videoInputPerSecond;
+          const billVideoPerSecond =
+            videoFrameCount > 0 &&
+            videoInputPerSecond !== undefined &&
+            (videoPromptTokens > 0 || imagePromptTokens === 0);
+          const billableVideoFrameCount =
+            videoPromptTokens > 0
+              ? Math.min(videoFrameCount, Math.ceil(videoPromptTokens / 263))
+              : videoFrameCount;
+
+          result.tokenUsage = {
+            prompt: promptTokens,
+            completion: responseTokens,
+            total: usageMetadata.reduce(
+              (total, usage) =>
+                total + getTokenCount(usage.totalTokenCount, usage.total_token_count),
+              0,
+            ),
+            numRequests: usageMetadata.length,
+            ...(cachedPromptTokens > 0 ? { cached: cachedPromptTokens } : {}),
+            ...(thoughtTokens > 0 ? { completionDetails: { reasoning: thoughtTokens } } : {}),
+          };
+          // Live Translate is billed only for input and output audio tokens. Its
+          // usage payload may also include internal text context, which remains
+          // visible in tokenUsage but must not contribute to cost. Audio-only
+          // fallback is applied per turn when optional modality details are absent.
+          const costPromptTokens =
+            this.modelName === GEMINI_LIVE_TRANSLATE_MODEL
+              ? audioPromptTokens
+              : Math.max(promptTokens - (billVideoPerSecond ? videoPromptTokens : 0), 0);
+          const costCompletionTokens =
+            this.modelName === GEMINI_LIVE_TRANSLATE_MODEL
+              ? audioCompletionTokens
+              : billableCompletionTokens;
+          const tokenCost = calculateGoogleCost(
+            this.modelName,
+            config,
+            costPromptTokens,
+            costCompletionTokens,
+            this.isVertex,
+            audioPromptTokens,
+            audioCompletionTokens,
+            undefined,
+            imagePromptTokens + (billVideoPerSecond ? 0 : videoPromptTokens),
+            Math.max(cachedPromptTokens - (billVideoPerSecond ? cachedVideoPromptTokens : 0), 0),
+            cachedAudioPromptTokens,
+            cachedImagePromptTokens + (billVideoPerSecond ? 0 : cachedVideoPromptTokens),
+          );
+          result.cost =
+            tokenCost === undefined
+              ? undefined
+              : tokenCost +
+                (billVideoPerSecond ? billableVideoFrameCount * videoInputPerSecond : 0);
+        }
+
+        // `hasAudioContent` is also set when only a transcription arrives on an
+        // audio-expected stream, so gate the WAV on actual PCM bytes — otherwise
+        // convertPcmToWav emits a bare 44-byte header with no samples. The
+        // transcript is still preserved as the response output text above.
+        if (hasAudioContent && responseAudioChunks.length > 0) {
+          result.audio = {
+            data: this.convertPcmToWav(Buffer.concat(responseAudioChunks)),
+            format: 'wav',
+            transcript: response_audio_transcript || response_text_total || undefined,
+          };
+        }
+        safeResolve(result);
+      };
+
+      armLiveTranslateCompletion = () => {
+        if (
+          this.modelName !== GEMINI_LIVE_TRANSLATE_MODEL ||
+          !liveTranslateInputEnded ||
+          hasFinalized ||
+          isResolved
+        ) {
+          return;
+        }
+        // Once output has started, the inactivity timeout and trailing-output grace timer
+        // provide the bounds. Keeping the no-output deadline armed would cut off a healthy
+        // translation that streams longer than the initial response window.
+        clearTimeout(liveTranslateHardTimeout);
+        liveTranslateHardTimeout = undefined;
+        clearTimeout(liveTranslateCompletionTimeout);
+        liveTranslateCompletionTimeout = setTimeout(() => {
+          liveTranslateCompletionTimeout = undefined;
+          void (async () => {
+            if (contentIndex < contents.length) {
+              await sendNextContentMessages(true);
+              return;
+            }
+            await finalizeResponse();
+          })().catch((err) => {
+            logger.error(`Error advancing Live Translate response: ${err}`);
+            safeResolve({ error: `Error advancing Live Translate response: ${err}` });
+          });
+        }, liveTranslateCompletionGraceMs);
+      };
+
+      ws.onopen = () => {
+        logger.debug('WebSocket connection is opening...');
+        const {
+          speechConfig: generationSpeechConfig,
+          response_modalities: _responseModalities,
+          responseModalities: _camelResponseModalities,
+          outputAudioTranscription: configuredOutputAudioTranscription,
+          inputAudioTranscription,
+          enableAffectiveDialog,
+          proactivity,
+          ...restGenerationConfig
+        } = config.generationConfig || {};
+        const speechConfig = generationSpeechConfig ?? config.speechConfig;
+        const outputAudioTranscription =
+          configuredOutputAudioTranscription ??
+          (isGemini38Live ||
+          this.isVertex ||
+          (usesRealtimeTextInput && !supportsTextResponse && requestedText)
+            ? {}
+            : undefined);
+
+        let formattedSpeechConfig;
+        if (speechConfig) {
+          formattedSpeechConfig = {
+            ...(speechConfig.voiceConfig && {
+              [usesRealtimeTextInput ? 'voiceConfig' : 'voice_config']: {
+                [usesRealtimeTextInput ? 'prebuiltVoiceConfig' : 'prebuilt_voice_config']: {
+                  [usesRealtimeTextInput ? 'voiceName' : 'voice_name']:
+                    speechConfig.voiceConfig.prebuiltVoiceConfig?.voiceName,
+                },
+              },
+            }),
+            ...(speechConfig.languageCode && {
+              [usesRealtimeTextInput ? 'languageCode' : 'language_code']: speechConfig.languageCode,
+            }),
+          };
+        }
+
+        let formattedProactivity;
+        if (proactivity && !usesRealtimeTextInput) {
+          formattedProactivity = { proactive_audio: proactivity.proactiveAudio };
+        }
+
+        const setupMessage = {
+          setup: {
+            model: connection.model,
+            ...(useManualAudioActivity
+              ? { realtimeInputConfig: { automaticActivityDetection: { disabled: true } } }
+              : {}),
+            [usesRealtimeTextInput ? 'generationConfig' : 'generation_config']: {
+              context: config.context,
+              examples: config.examples,
+              stopSequences: config.stopSequences,
+              temperature: config.temperature,
+              maxOutputTokens: config.maxOutputTokens,
+              topP: config.topP,
+              topK: config.topK,
+              ...restGenerationConfig,
+              ...(usesInteractionStatus
+                ? {
+                    thinkingConfig: {
+                      thinkingLevel: 'LOW',
+                      ...restGenerationConfig.thinkingConfig,
+                    },
+                  }
+                : {}),
+              ...(effectiveResponseModalities
+                ? {
+                    [usesRealtimeTextInput ? 'responseModalities' : 'response_modalities']:
+                      effectiveResponseModalities,
+                  }
+                : {}),
+              ...(formattedSpeechConfig
+                ? {
+                    [usesRealtimeTextInput ? 'speechConfig' : 'speech_config']:
+                      formattedSpeechConfig,
+                  }
+                : {}),
+              ...(enableAffectiveDialog && !usesRealtimeTextInput
+                ? { enable_affective_dialog: enableAffectiveDialog }
+                : {}),
+              ...(formattedProactivity ? { proactivity: formattedProactivity } : {}),
+              ...(this.modelName === GEMINI_LIVE_TRANSLATE_MODEL && inputAudioTranscription
+                ? { inputAudioTranscription }
+                : {}),
+              ...(this.modelName === GEMINI_LIVE_TRANSLATE_MODEL && outputAudioTranscription
+                ? { outputAudioTranscription }
+                : {}),
+            },
+            ...(toolConfig ? { toolConfig } : {}),
+            ...(requestTools.length > 0 ? { tools: requestTools } : {}),
+            ...(systemInstruction ? { systemInstruction } : {}),
+            ...(this.modelName !== GEMINI_LIVE_TRANSLATE_MODEL && outputAudioTranscription
+              ? {
+                  [usesRealtimeTextInput
+                    ? 'outputAudioTranscription'
+                    : 'output_audio_transcription']: outputAudioTranscription,
+                }
+              : {}),
+            ...(this.modelName !== GEMINI_LIVE_TRANSLATE_MODEL && inputAudioTranscription
+              ? {
+                  [usesRealtimeTextInput ? 'inputAudioTranscription' : 'input_audio_transcription']:
+                    inputAudioTranscription,
+                }
+              : {}),
+          },
+        };
+
+        logger.debug('Sending setup message', {
+          model: this.modelName,
+          hasTools: requestTools.length > 0,
+          hasSystemInstruction: !!systemInstruction,
+        });
+        ws.send(JSON.stringify(setupMessage));
+      };
+
+      const processMessage = async (event: WebSocket.MessageEvent, messageIndex: number) => {
+        // Once the request has been resolved (e.g. by an early onclose or
+        // timeout), drop any in-flight messages so they don't trigger side
+        // effects like stateful-API fetches after the caller has moved on.
+        if (isResolved) {
+          return;
+        }
+        armIdleTimeout();
+        // Handle different data types from WebSocket
+        logger.debug('WebSocket message received');
+        let responseData: string;
+        if (event.data instanceof ArrayBuffer || event.data instanceof Buffer) {
+          const dataString = event.data.toString('utf-8');
+
+          try {
+            JSON.parse(dataString);
+            responseData = dataString;
+          } catch {
+            hasAudioContent = true;
+            const audioBuffer = Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data);
+            responseAudioChunks.push(audioBuffer);
+            hasPendingToolFollowup = false;
+            if (isAudioExpected) {
+              hasAudioStreamEnded = false;
+            }
+            if (hasMeaningfulPcm(audioBuffer)) {
+              armLiveTranslateCompletion();
+            }
+            return;
+          }
+        } else if (typeof event.data === 'string') {
+          responseData = event.data;
+        } else {
+          logger.warn(`Unexpected event.data type: ${typeof event.data}`);
+          ws.close();
+          safeResolve({ error: 'Unexpected response data format' });
+          return;
+        }
+
+        try {
+          const responseText = await new Response(responseData).text();
+          // Re-check after the await: the request may have been resolved by an
+          // onclose/timeout while we were parsing.
+          if (isResolved) {
+            return;
+          }
+          const response = JSON.parse(responseText);
+          // Gemini 3.8 may interleave empty frames with streamed audio. They do
+          // not signal completion and must not trigger the legacy fallback.
+          if ((isGemini38Live || this.isVertex) && Object.keys(response).length === 0) {
+            return;
+          }
+          const interactionStatus =
+            response.interactionStatus ??
+            response.interaction_status ??
+            response.serverContent?.interactionStatus ??
+            response.serverContent?.interaction_status;
+          const interactionComplete = usesInteractionStatus && interactionStatus === 'IDLE';
+
+          const frameUsageMetadata = response.usageMetadata ?? response.usage_metadata;
+          if (frameUsageMetadata) {
+            pendingUsageMetadata = frameUsageMetadata;
+          }
+          if (
+            (response.serverContent?.turnComplete || response.toolCall || interactionComplete) &&
+            pendingUsageMetadata
+          ) {
+            usageMetadata.push(pendingUsageMetadata);
+            pendingUsageMetadata = undefined;
+          }
+
+          if (response.error) {
+            logger.error(`Google Live API error: ${JSON.stringify(response.error)}`);
+            ws.close();
+            safeResolve({ error: `Google Live API error: ${JSON.stringify(response.error)}` });
+            return;
+          }
+
+          const messageType = response.setupComplete
+            ? 'setupComplete'
+            : response.serverContent?.modelTurn
+              ? 'modelTurn'
+              : response.serverContent?.generationComplete
+                ? 'generationComplete'
+                : response.serverContent?.turnComplete
+                  ? 'turnComplete'
+                  : response.toolCall
+                    ? 'toolCall'
+                    : response.streamingCustomOp
+                      ? 'streamingCustomOp'
+                      : 'unknown';
+          logger.debug(
+            `Message type: ${messageType}, hasAudioContent: ${hasAudioContent}, hasOutputTranscription: ${hasOutputTranscription}`,
+          );
+
+          if (response.setupComplete) {
+            await sendNextContentMessages();
+          } else if (response.serverContent || interactionComplete) {
+            const serverContent = response.serverContent ?? {};
+            let hasMeaningfulLiveTranslateOutput = false;
+            // Only IDLE ends an Extended Thinking input; an earlier queued IDLE may
+            // describe the state before the latest tool response.
+            const inputComplete = usesInteractionStatus
+              ? interactionComplete && messageIndex > lastToolResponseMessageIndex
+              : serverContent.turnComplete;
+            const hasModelOutput =
+              Boolean(serverContent.modelTurn?.parts?.length) ||
+              Boolean(serverContent.outputTranscription?.text) ||
+              (!isGemini38Live && !this.isVertex && Boolean(serverContent.generationComplete));
+            if (hasModelOutput) {
+              hasPendingToolFollowup = false;
+            } else if (
+              !usesInteractionStatus &&
+              serverContent.turnComplete &&
+              hasPendingToolFollowup
+            ) {
+              hasPendingToolFollowup = false;
+              logger.debug('Ignoring Gemini Live bookkeeping turnComplete after a tool response.');
+              return;
+            }
+
+            if (serverContent.modelTurn?.parts) {
+              for (const part of serverContent.modelTurn.parts) {
+                if (part.text) {
+                  response_text_total += part.text;
+                  hasMeaningfulLiveTranslateOutput = true;
+                }
+                if (part.inlineData?.mimeType?.includes('audio')) {
+                  hasAudioContent = true;
+                  const audioChunk = Buffer.from(part.inlineData.data, 'base64');
+                  responseAudioChunks.push(audioChunk);
+                  if (hasMeaningfulPcm(audioChunk)) {
+                    hasMeaningfulLiveTranslateOutput = true;
+                  }
+                  if (isAudioExpected) {
+                    hasAudioStreamEnded = false;
+                  }
+                }
+              }
+              if (serverContent.outputTranscription?.text) {
+                response_audio_transcript += serverContent.outputTranscription.text;
+                hasMeaningfulLiveTranslateOutput = true;
+                if (isAudioExpected) {
+                  hasAudioContent = true;
+                }
+              }
+            } else if (serverContent.outputTranscription?.text) {
+              // Handle transcription-only messages when transcription arrives separately.
+              response_audio_transcript += serverContent.outputTranscription.text;
+              hasMeaningfulLiveTranslateOutput = true;
+              if (isAudioExpected) {
+                hasAudioContent = true;
+              }
+            }
+
+            if (serverContent.generationComplete) {
+              completedGenerations += 1;
+              logger.debug(
+                `Generation complete received - text expected: ${isTextExpected}, audio expected: ${isAudioExpected}, has transcription: ${hasOutputTranscription}`,
+              );
+              if (isTextExpected && !hasTextStreamEnded) {
+                hasTextStreamEnded = true;
+              }
+              if (isAudioExpected && !hasAudioStreamEnded && hasOutputTranscription) {
+                hasAudioStreamEnded = true;
+              }
+            }
+
+            if (hasMeaningfulLiveTranslateOutput) {
+              armLiveTranslateCompletion();
+            }
+
+            if (inputComplete && contentIndex < contents.length) {
+              completedTurns += 1;
+              hasTextStreamEnded = !isTextExpected;
+              hasAudioStreamEnded = !isAudioExpected;
+              await sendNextContentMessages(true);
+              return;
+            }
+
+            if (inputComplete && contentIndex >= contents.length) {
+              completedTurns += 1;
+              logger.debug(
+                `Turn complete received - text expected: ${isTextExpected}, text ended: ${hasTextStreamEnded}, audio expected: ${isAudioExpected}, audio ended: ${hasAudioStreamEnded}, has audio: ${hasAudioContent}, has transcription: ${!!response_audio_transcript}`,
+              );
+              if (isTextExpected && !hasTextStreamEnded) {
+                hasTextStreamEnded = true;
+              }
+              if (isAudioExpected && !hasAudioStreamEnded) {
+                hasAudioStreamEnded = true;
+              }
+            }
+
+            if (
+              inputComplete &&
+              Math.max(completedGenerations, completedTurns) >= contents.length &&
+              hasTextStreamEnded &&
+              hasAudioStreamEnded &&
+              contentIndex >= contents.length
+            ) {
+              try {
+                await finalizeResponse();
+              } catch (err) {
+                logger.error(`Error in finalizeResponse: ${err}`);
+                safeResolve({ error: `Error finalizing response: ${err}` });
+              }
+            }
+            return;
+          } else if (response.toolCall?.functionCalls) {
+            // Skip tool execution and tool_response sends if the request is
+            // already resolved (e.g. via timeout/onclose).
+            if (isResolved) {
+              return;
+            }
+            hasPendingToolFollowup = response.toolCall.functionCalls.some(
+              (functionCall: { id?: string; name?: string }) =>
+                Boolean(functionCall?.id && functionCall.name),
+            );
+            if (toolsDisabled) {
+              // Reply with an error tool_response so the model can complete its turn
+              // instead of waiting for a response that will never come (which would
+              // otherwise stall the websocket until the 30s timeoutMs fires).
+              logger.warn('Ignoring function calls received while tools are disabled.');
+              for (const functionCall of response.toolCall.functionCalls) {
+                if (functionCall?.id && functionCall.name) {
+                  const functionResponse = {
+                    id: functionCall.id,
+                    name: functionCall.name,
+                    response: { error: 'Tool calls are disabled for this request.' },
+                  };
+                  const toolMessage = usesRealtimeTextInput
+                    ? { toolResponse: { functionResponses: [functionResponse] } }
+                    : { tool_response: { function_responses: functionResponse } };
+                  lastToolResponseMessageIndex = receivedMessageIndex;
+                  ws.send(JSON.stringify(toolMessage));
+                }
+              }
+            } else {
+              for (const functionCall of response.toolCall.functionCalls) {
+                function_calls_total.push(functionCall);
+                if (functionCall && functionCall.id && functionCall.name) {
+                  let callbackResponse: unknown = {};
+                  const functionName = functionCall.name;
+                  try {
+                    if (config.functionToolCallbacks?.[functionName]) {
+                      callbackResponse = await this.executeFunctionCallback(
+                        functionName,
+                        JSON.stringify(
+                          typeof functionCall.args === 'string'
+                            ? JSON.parse(functionCall.args)
+                            : functionCall.args,
+                        ),
+                        config.functionToolCallbacks,
+                        functionCall.id,
+                      );
+                    } else if (config.functionToolStatefulApi) {
+                      logger.warn(
+                        'functionToolStatefulApi configured but no HTTP client implemented for it after cleanup.',
+                      );
+                      const baseUrl = new URL(functionName, config.functionToolStatefulApi.url)
+                        .href;
+                      try {
+                        callbackResponse = await tryGetThenPost(baseUrl, functionCall.args);
+                        logger.debug(`Stateful api response: ${JSON.stringify(callbackResponse)}`);
+                      } catch (err) {
+                        callbackResponse = {
+                          error: `Error executing function ${functionName}: ${JSON.stringify(err)}`,
+                        };
+                        logger.error(
+                          `Error executing function ${functionName}: ${JSON.stringify(err)}`,
+                        );
+                      }
+                    }
+                  } catch (err) {
+                    callbackResponse = {
+                      error: `Error executing function ${functionName}: ${JSON.stringify(err)}`,
+                    };
+                    logger.error(
+                      `Error executing function ${functionName}: ${JSON.stringify(err)}`,
+                    );
+                  }
+                  // The callback above may have awaited; bail before sending
+                  // a tool_response if the request has since been resolved.
+                  if (isResolved) {
+                    return;
+                  }
+                  const functionResponse = {
+                    id: functionCall.id,
+                    name: functionName,
+                    response:
+                      callbackResponse !== null &&
+                      typeof callbackResponse === 'object' &&
+                      !Array.isArray(callbackResponse)
+                        ? callbackResponse
+                        : { result: callbackResponse },
+                  };
+                  const toolMessage = usesRealtimeTextInput
+                    ? { toolResponse: { functionResponses: [functionResponse] } }
+                    : { tool_response: { function_responses: functionResponse } };
+                  logger.debug(`WebSocket sent: ${JSON.stringify(toolMessage)}`);
+                  lastToolResponseMessageIndex = receivedMessageIndex;
+                  ws.send(JSON.stringify(toolMessage));
+                }
+              }
+            }
+          } else if (frameUsageMetadata) {
+            logger.debug('Usage metadata update received.');
+          } else if (response.sessionResumptionUpdate) {
+            logger.debug(
+              `Session resumption update received: ${JSON.stringify(response.sessionResumptionUpdate)}`,
+            );
+          } else if (response.realtimeInput?.mediaChunks) {
+            for (const chunk of response.realtimeInput.mediaChunks) {
+              if (chunk.mimeType?.includes('audio')) {
+                hasAudioContent = true;
+                responseAudioChunks.push(Buffer.from(chunk.data, 'base64'));
+                hasPendingToolFollowup = false;
+              }
+            }
+          } else if (response.candidates?.[0]?.content?.parts) {
+            for (const part of response.candidates[0].content.parts) {
+              if (part.inlineData?.mimeType?.includes('audio')) {
+                hasAudioContent = true;
+                responseAudioChunks.push(Buffer.from(part.inlineData.data, 'base64'));
+                hasPendingToolFollowup = false;
+              }
+            }
+          } else if (
+            response.streamingCustomOp?.[
+              'type.googleapis.com/google.ai.generativelanguage.v1alpha.StreamingCustomOpOutput'
+            ]?.audioCompletionSignal
+          ) {
+            hasAudioStreamEnded = true;
+          } else if (
+            !response.setupComplete &&
+            !response.serverContent &&
+            !response.toolCall &&
+            !interactionStatus &&
+            !response.realtimeInput &&
+            !response.candidates &&
+            !response.streamingCustomOp
+          ) {
+            logger.warn(
+              `Received unhandled WebSocket message structure: ${JSON.stringify(response).substring(0, 200)}`,
+            );
+            if (
+              hasOutputTranscription &&
+              !isGemini38Live &&
+              !this.isVertex &&
+              hasAudioContent &&
+              isAudioExpected &&
+              !hasAudioStreamEnded
+            ) {
+              logger.debug(
+                'Unknown message with transcription enabled - marking audio as complete',
+              );
+              hasAudioStreamEnded = true;
+              if (hasTextStreamEnded) {
+                try {
+                  await finalizeResponse();
+                } catch (err) {
+                  logger.error(`Error in finalizeResponse: ${err}`);
+                  safeResolve({ error: `Error finalizing response: ${err}` });
+                }
+              }
+            }
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.error(`Failed to process WebSocket response: ${message}`);
+          ws.close();
+          safeResolve({ error: `Failed to process WebSocket response: ${message}` });
+        }
+      };
+
+      // WebSocket does not await async handlers. Preserve processing order and
+      // receipt order so queued pre-tool-response IDLE frames remain stale.
+      let messageQueue = Promise.resolve();
+      ws.onmessage = (event) => {
+        if (isResolved) {
+          return;
+        }
+        const messageIndex = ++receivedMessageIndex;
+        if (!isGemini38Live && !this.isVertex) {
+          return processMessage(event, messageIndex);
+        }
+        armIdleTimeout();
+        messageQueue = messageQueue.then(() => processMessage(event, messageIndex));
+        return messageQueue;
+      };
+
+      ws.onerror = (err) => {
+        // ws error events can retain the socket and its authentication headers.
+        // Never serialize the event object into logs or exported eval errors.
+        const message = err.message || 'Connection failed';
+        logger.error('Google Live WebSocket error', { model: this.modelName, message });
+        if (isNativeAudioModel) {
+          logger.error(
+            `Native audio model ${this.modelName} may not be available or may require different configuration`,
+          );
+        }
+        clearTimeout(timeout);
+        ws.close();
+        safeResolve({
+          error: `WebSocket error for model ${this.modelName}: ${message}`,
+        });
+      };
+
+      ws.onclose = (event: WebSocket.CloseEvent) => {
+        logger.debug(
+          `WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}, Clean: ${event.wasClean}`,
+        );
+        // Finalization closes the socket before awaiting final state. That expected
+        // close must leave both the result and the stateful worker to the finalizer.
+        if (hasFinalized) {
+          return;
+        }
+        clearTimeout(timeout);
+        // If the promise hasn't been resolved yet and the closure was unexpected, resolve with error.
+        // This is a fallback; most paths should resolve the promise earlier.
+        if (!isResolved) {
+          safeResolve({
+            error: `WebSocket connection closed unexpectedly. Code: ${event.code}, Reason: ${event.reason}`,
+          });
+        }
+      };
+    });
+  }
+
+  /**
+   * Loads a function from an external file
+   * @param fileRef The file reference in the format 'file://path/to/file:functionName'
+   * @returns The loaded function
+   */
+  private loadExternalFunction(fileRef: string): Promise<Function> {
+    return loadProviderCallbackFromFileUrl(fileRef);
+  }
+
+  /**
+   * Executes a function callback with proper error handling
+   */
+  private async executeFunctionCallback(
+    functionName: string,
+    args: string,
+    callbacks = this.config.functionToolCallbacks,
+    callId?: string,
+  ): Promise<any> {
+    try {
+      const shouldUseSharedCache = callbacks === this.config.functionToolCallbacks;
+      // Check if we've already loaded this function
+      let callback = shouldUseSharedCache ? this.loadedFunctionCallbacks[functionName] : undefined;
+
+      // If not loaded yet, try to load it now
+      if (!callback) {
+        const callbackRef = callbacks?.[functionName];
+
+        if (callbackRef && typeof callbackRef === 'string') {
+          const callbackStr: string = callbackRef;
+          if (callbackStr.startsWith('file://')) {
+            callback = await this.loadExternalFunction(callbackStr);
+          } else {
+            callback = new Function('return ' + callbackStr)();
+          }
+
+          if (shouldUseSharedCache && callback) {
+            this.loadedFunctionCallbacks[functionName] = callback;
+          }
+        } else if (typeof callbackRef === 'function') {
+          callback = callbackRef;
+          if (shouldUseSharedCache) {
+            this.loadedFunctionCallbacks[functionName] = callback;
+          }
+        }
+      }
+
+      if (!callback) {
+        throw new Error(`No callback found for function '${functionName}'`);
+      }
+
+      // Execute the callback
+      logger.debug(`Executing function '${functionName}' with args: ${args}`);
+      const result = await withGenAIToolSpan({ name: functionName, arguments: args, callId }, () =>
+        callback(args),
+      );
+
+      return result;
+    } catch (error: any) {
+      logger.error(`Error executing function '${functionName}': ${error.message || String(error)}`);
+      throw error; // Re-throw so caller can handle fallback behavior
+    }
+  }
+}

@@ -1,0 +1,430 @@
+/*
+ * Wazuh Module Manager
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+// Required for pthread_timedjoin_np on Linux (GNU extension)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include "wmodules.h"
+#include <sys/types.h>
+#include "startup_gate_op.h"
+#ifdef CLIENT
+#include "agent_sync_protocol_c_interface.h"
+#include "client-config.h"
+#else
+#include "mconf-config.h"
+#endif
+
+static void wm_help();                  // Print help.
+static void wm_setup();                 // Setup function. Exits on error.
+static void wm_cleanup();               // Cleanup function, called on exiting.
+static void wm_handler(int signum);     // Action on signal.
+static void wm_signals_configure();     // Configure signal handling.
+#ifdef WAZUH_RUNTIME_USER
+static void wm_drop_privileges(const char *user); // Drop manager privileges permanently.
+#endif
+
+static int flag_foreground = 0;         // Running in foreground.
+
+static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Main function
+
+int main(int argc, char **argv)
+{
+    int c;
+    int wm_debug = 0;
+    int test_config = 0;
+#ifdef CLIENT
+#define WM_GETOPT_CONF ""
+#else
+#define WM_GETOPT_CONF "c:"   // -c <config>: manager configuration file (/etc/wazuh-manager/wazuh-manager.conf)
+#endif
+#ifdef WAZUH_RUNTIME_USER
+    const char *runtime_user = WAZUH_RUNTIME_USER;
+    const char *getopt_options = "dfhtu:" WM_GETOPT_CONF;
+#else
+    const char *getopt_options = "dfht" WM_GETOPT_CONF;
+#endif
+
+    /* Set the name */
+    OS_SetName(ARGV0);
+
+    // Define current working directory
+    char * home_path = w_homedir(argv[0]);
+    if (chdir(home_path) == -1) {
+        merror_exit(CHDIR_ERROR, home_path, errno, strerror(errno));
+    }
+
+    wmodule *cur_module;
+#ifdef CLIENT
+    wm_debug_level = getDefine_Int("wazuh_modules", "debug", 0, 2);
+#else
+    wm_debug_level = getDefine_Int_default("wazuh_modules", "debug", 0, 2, 0);
+#endif
+
+    // Get command line options
+
+    while ((c = getopt(argc, argv, getopt_options)) != -1) {
+        switch (c) {
+        case 'd':
+            nowDebug();
+            wm_debug = 1;
+            break;
+        case 'f':
+            flag_foreground = 1;
+            break;
+        case 'h':
+            wm_help();
+            break;
+        case 't':
+            test_config = 1;
+            flag_foreground = 1;
+            break;
+#ifndef CLIENT
+        case 'c':
+            if (!optarg) {
+                merror_exit("-c needs an argument");
+            }
+            wm_config_path = optarg;
+            break;
+#endif
+#ifdef WAZUH_RUNTIME_USER
+        case 'u':
+            runtime_user = optarg;
+            break;
+#endif
+        default:
+            print_out(" ");
+            wm_help();
+        }
+    }
+
+    // Get default debug level
+
+    if (wm_debug == 0) {
+        wm_debug = wm_debug_level;
+
+        while (wm_debug != 0) {
+            nowDebug();
+            wm_debug--;
+        }
+    }
+
+    mdebug1(WAZUH_HOMEDIR, home_path);
+    os_free(home_path);
+
+#ifdef CLIENT
+    const int nofile = getDefine_Int("wazuh_modules", "rlimit_nofile", 8192, 1048576);
+#else
+    const int nofile = getDefine_Int_default("wazuh_modules", "rlimit_nofile", 8192, 1048576, 65536);
+#endif
+    w_raise_nofile_limit(nofile, "wazuh_modules.rlimit_nofile");
+
+#ifdef WAZUH_RUNTIME_USER
+    wm_drop_privileges(runtime_user);
+#endif
+
+    // Setup daemon
+
+    wm_setup();
+
+    if (test_config) {
+#ifndef CLIENT
+        // -t also checks the files the configuration points to (certificates...), like the other
+        // manager daemons; the document itself was already loaded and read by wm_config().
+        if (w_mconf_validate(wm_config_path) < 0) {
+            exit(EXIT_FAILURE);
+        }
+#endif
+        exit(EXIT_SUCCESS);
+    }
+
+    minfo(STARTUP_MSG, (int)getpid());
+    mdebug1("Available processors: %d", get_nproc());
+
+    // Configure signal handling before startup gate wait so SIGTERM
+    // triggers graceful cleanup even when modules are blocked.
+    wm_signals_configure();
+
+    // wm_control provides the control socket used by agentd to trigger
+    // reloads that resolve the startup gate — start it before blocking.
+    for (cur_module = wmodules; cur_module; cur_module = cur_module->next) {
+        if (cur_module->tag && strcmp(cur_module->tag, "control") == 0) {
+            if (CreateThreadJoinable(&cur_module->thread, cur_module->context->start, cur_module->data) < 0) {
+                merror_exit("CreateThreadJoinable() for '%s': %s", cur_module->tag, strerror(errno));
+            }
+            mdebug2("Created new thread for the '%s' module.", cur_module->tag);
+            break;
+        }
+    }
+
+    if (startup_gate_wait_for_ready(ARGV0) != STARTUP_GATE_READY) {
+        mdebug1("'%s' shutdown requested while waiting for the startup gate; exiting without starting.", ARGV0);
+        exit(0);
+    }
+
+    // Run modules
+
+    for (cur_module = wmodules; cur_module; cur_module = cur_module->next) {
+        if (cur_module->tag && strcmp(cur_module->tag, "control") == 0) {
+            continue;  // already started above
+        }
+        if (CreateThreadJoinable(&cur_module->thread, cur_module->context->start, cur_module->data) < 0) {
+            merror_exit("CreateThreadJoinable() for '%s': %s", cur_module->tag, strerror(errno));
+        }
+        mdebug2("Created new thread for the '%s' module.", cur_module->tag);
+    }
+
+    // Start com request thread
+    w_create_thread(wmcom_main, NULL);
+
+    // Modules run until a shutdown signal arrives. The SIGTERM/SIGINT handler
+    // performs the orderly stop + timed-join + exit, so the main thread must NOT
+    // also join the module threads: two concurrent joins of the same thread
+    // return EINVAL/ESRCH, which were misreported as shutdown timeouts. Idle here
+    // until the handler exits the process.
+    for (;;) {
+        pause();
+    }
+
+    return EXIT_SUCCESS;
+}
+
+// Print help
+
+void wm_help()
+{
+    print_out("Wazuh Module Manager - %s\nWazuh Inc.", __wazuh_version);
+    print_out(" ");
+#ifdef CLIENT
+#define WM_HELP_CONF ""
+#else
+#define WM_HELP_CONF " [-c <config>]"
+#endif
+#ifdef WAZUH_RUNTIME_USER
+    print_out("Usage: %s -[d|f|h|t] [-u <user>]" WM_HELP_CONF, ARGV0);
+#else
+    print_out("Usage: %s -[d|f|h|t]" WM_HELP_CONF, ARGV0);
+#endif
+    print_out(" ");
+    print_out("    -d    Increase debug mode.");
+    print_out("    -f    Run in foreground.");
+    print_out("    -h    Print this help.");
+    print_out("    -t    Test configuration.");
+#ifndef CLIENT
+    print_out("    -c <config> Configuration file to use (default: %s).", WAZUHCONF);
+#endif
+#ifdef WAZUH_RUNTIME_USER
+    print_out("    -u <user> Run as user (default: %s).", WAZUH_RUNTIME_USER);
+#endif
+
+    exit(EXIT_FAILURE);
+}
+
+// Setup function. Exits on error.
+
+void wm_setup()
+{
+    // Read the configuration (/etc/wazuh-manager/wazuh-manager.conf on the manager, ossec.conf on the
+    // agent) and internal options
+
+    if (wm_config() < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+#ifdef CLIENT
+    // The sync protocol bounds one session by <agent><batch><size>, the same limit
+    // that bounds a /stateless request. The block belongs to the agent rather than
+    // to any module here, and the modules that build the protocol instances can
+    // read no configuration at all, so it is read once and handed down before
+    // wm_check() starts any of them.
+    agent_batch batch = { .size = 0, .interval = 0 };
+    w_read_agent_batch(WAZUHCONF, AGENTCONFIG, &batch);
+    asp_set_session_max_bytes((uint64_t)batch.size);
+
+    if (batch.size > 0) {
+        mdebug1("Sync sessions bounded to %lld bytes by <agent><batch><size>.", batch.size);
+    }
+
+    // agent.sync_max_blocks_per_cycle is handed down the same way: how many of those
+    // sessions one sync cycle may send before the rest waits for the next cycle.
+    const int sync_max_blocks = getDefine_Int_default("agent", "sync_max_blocks_per_cycle", 1, 1000, 0);
+    asp_set_max_blocks_per_sync((uint32_t)sync_max_blocks);
+
+    if (sync_max_blocks > 0) {
+        mdebug1("Sync cycles bounded to %d blocks by agent.sync_max_blocks_per_cycle.", sync_max_blocks);
+    }
+#endif
+
+    // Go daemon
+
+    if (!flag_foreground) {
+        goDaemon();
+        nowDaemon();
+    }
+
+#ifndef WAZUH_RUNTIME_USER
+    const gid_t gid = Privsep_GetGroup(GROUPGLOBAL);
+    if (gid == (gid_t) OS_INVALID) {
+        merror_exit(USER_ERROR, "", GROUPGLOBAL, strerror(errno), errno);
+    }
+
+    if (Privsep_SetGroup(gid) < 0) {
+        merror_exit(SETGID_ERROR, GROUPGLOBAL, errno, strerror(errno));
+    }
+
+    wm_setGroupID(gid);
+#endif
+
+    if (wm_check() < 0) {
+        mdebug1("No configuration defined. Exiting...");
+        exit(EXIT_SUCCESS);
+    }
+
+    // Register cleanup function before CreatePID to avoid dangling PID files
+    atexit(wm_cleanup);
+
+    // Create PID file
+
+    if (CreatePID(ARGV0, getpid()) < 0)
+        merror_exit("Couldn't create PID file: (%s)", strerror(errno));
+
+    // Initialize children pool
+    wm_children_pool_init();
+}
+
+#ifdef WAZUH_RUNTIME_USER
+static void wm_drop_privileges(const char *user)
+{
+    const uid_t uid = Privsep_GetUser(user);
+    const gid_t gid = Privsep_GetGroup(GROUPGLOBAL);
+
+    if (uid == (uid_t) OS_INVALID || gid == (gid_t) OS_INVALID) {
+        merror_exit(USER_ERROR, user, GROUPGLOBAL, strerror(errno), errno);
+    }
+
+    if (Privsep_SetGroup(gid) < 0) {
+        merror_exit(SETGID_ERROR, GROUPGLOBAL, errno, strerror(errno));
+    }
+
+    if (Privsep_SetUser(uid) < 0) {
+        merror_exit(SETUID_ERROR, user, errno, strerror(errno));
+    }
+
+    if (getuid() != uid || geteuid() != uid || getgid() != gid || getegid() != gid) {
+        merror_exit("Privilege drop to '%s:%s' could not be verified.", user, GROUPGLOBAL);
+    }
+
+    wm_setGroupID(gid);
+    umask(0007);
+}
+#endif
+
+// Cleanup function, called on exiting.
+
+void wm_cleanup()
+{
+    // Kill active child processes
+    wm_kill_children();
+
+    // Delete PID file
+
+    if (DeletePID(ARGV0) < 0) {
+        mdebug1("Couldn't delete PID file.");
+    }
+}
+
+// Action on signal
+
+void wm_signals_configure()
+{
+    struct sigaction action = { .sa_handler = wm_handler };
+
+    sigaction(SIGTERM, &action, NULL);
+
+    if (flag_foreground) {
+        sigaction(SIGHUP, &action, NULL);
+        sigaction(SIGINT, &action, NULL);
+    }
+
+    action.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &action, NULL);
+}
+
+void wm_handler(int signum)
+{
+    static bool wm_sig_processing = false;
+
+    // Raised first and before the wait below: wazuh-control signals every daemon in the same
+    // pass, so syscheckd can already be gone during the wait. wm_fim_query_json() and
+    // modulesSync() read this flag to log that as part of the shutdown instead of an ERROR,
+    // and agent-info aborts its coordination on it. Module loops blocked in
+    // wm_sleep_interruptible / wm_select_interruptible leave on it, and the modules that check
+    // it while still starting up abort their start. A second, ignored signal sets it again.
+    wm_shutdown_requested = 1;
+
+    w_mutex_lock(&sig_lock);
+    if (wm_sig_processing) {
+        mdebug2("Signal received: %d, but another one is being processed. Ignoring.", signum);
+        w_mutex_unlock(&sig_lock);
+        return;
+    } else {
+        wm_sig_processing = true;
+        mdebug2("Signal received: %d, handling.", signum);
+    }
+    w_mutex_unlock(&sig_lock);
+
+    // Grace time before the stop() callbacks, so the modules that don't read the flag can
+    // finish starting.
+    sleep(1);
+
+    wmodule * cur_module;
+    switch (signum) {
+    case SIGHUP:
+    case SIGINT:
+    case SIGTERM:
+        mdebug1("Shutting down Wazuh modules.");
+
+        for (cur_module = wmodules; cur_module && cur_module->context && cur_module->context->name; cur_module = cur_module->next) {
+            if (cur_module->context->stop) {
+                cur_module->context->stop(cur_module->data);
+            }
+        }
+
+        // Wait for all module threads to finish cleanly, with a shared 30-second
+        // total budget. This prevents RocksDB lock leaks and other resource
+        // corruption caused by abrupt thread termination.
+        {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += 30;
+
+            for (cur_module = wmodules; cur_module && cur_module->context && cur_module->context->name; cur_module = cur_module->next) {
+                if (cur_module->thread == (pthread_t)0) continue;
+                if (cur_module->thread == pthread_self()) continue;
+#ifdef __linux__
+                int join_rc = pthread_timedjoin_np(cur_module->thread, NULL, &deadline);
+                if (join_rc != 0) {
+                    mwarn("Module '%s' did not stop within the shutdown timeout. (rc=%d: %s)",
+                          cur_module->context->name, join_rc, strerror(join_rc));
+                }
+#else
+                pthread_join(cur_module->thread, NULL);
+#endif
+            }
+        }
+
+        exit(EXIT_SUCCESS);
+    default:
+        merror("unknown signal (%d)", signum);
+    }
+}

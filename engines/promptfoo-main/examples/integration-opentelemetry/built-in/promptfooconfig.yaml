@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+
+description: OTEL Tracing Validation
+
+tracing:
+  enabled: true
+
+prompts:
+  - label: math-prompt
+    raw: 'What is 2 + 2? Answer with just the number.'
+  - label: reasoning-prompt
+    raw: 'Explain why the sky is blue in one sentence.'
+
+providers:
+  # OpenAI (Category A - Direct instrumentation)
+  - id: openai:gpt-6-luna
+    config:
+      reasoning:
+        effort: none
+      temperature: 0.1
+      max_output_tokens: 50
+
+  # Anthropic (Category A - Direct instrumentation)
+  - id: anthropic:claude-haiku-4-5-20251001
+    config:
+      temperature: 0.1
+      max_tokens: 50
+
+  # Azure OpenAI (Category A - Direct instrumentation)
+  # Uncomment if you have Azure configured
+  # - id: azure:gpt-4o-mini
+  #   config:
+  #     deployment_id: your-deployment
+  #     temperature: 0.1
+
+  # Ollama (Category A - Direct instrumentation)
+  # Uncomment if you have Ollama running locally
+  # - id: ollama:llama2
+  #   config:
+  #     temperature: 0.1
+
+  # OpenRouter (Category A - Direct instrumentation with OpenAI inheritance)
+  # Uncomment if you have OpenRouter API key
+  # - id: openrouter:openai/gpt-6-sol
+  #   config:
+  #     reasoning_effort: none
+  #     temperature: 0.1
+
+tests:
+  - description: Arithmetic answer
+    prompts: [math-prompt]
+    assert:
+      - type: contains
+        value: '4'
+
+  - description: Light scattering explanation
+    prompts: [reasoning-prompt]
+    assert:
+      - type: icontains-any
+        value: [scatter, wavelength]
+
+# Evaluation settings
+evaluateOptions:
+  maxConcurrency: 2

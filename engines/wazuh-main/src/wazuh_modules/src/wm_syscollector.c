@@ -1,0 +1,1245 @@
+/*
+ * Wazuh SYSCOLLECTOR
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+#include <signal.h>
+#include <stdlib.h>
+#include "wmodules_def.h"
+#include "syscollector.h"
+#include "wmodules.h"
+#include "module_query_errors.h"
+#include "wm_syscollector.h"
+#include "syscollector.h"
+#include "sym_load.h"
+#include "defs.h"
+#include "mq_op.h"
+#include "logging_helper.h"
+#include "commonDefs.h"
+#ifndef WIN32
+#include "os_net.h"
+#include <unistd.h>
+#else
+#include "agentd.h"
+// Forward declaration - agcom_dispatch is available in the same process on Windows
+extern size_t agcom_dispatch(char* command, char** output);
+#endif
+
+#define SYS_SYNC_PROTOCOL_DB_PATH "queue/syscollector/db/syscollector_sync.db"
+#define SYS_SYNC_PROTOCOL_VD_DB_PATH "queue/syscollector/db/syscollector_vd_sync.db"
+#define SYS_SYNC_RETRIES 3
+
+// Global flag to stop sync module
+static volatile int sync_module_running = 0;
+
+#ifdef WIN32
+static DWORD WINAPI wm_sys_main(void* arg);         // Module main function. It won't return
+static DWORD WINAPI wm_sync_module(__attribute__((unused)) void* args);
+#else
+static void* wm_sys_main(wm_sys_t* sys);        // Module main function. It won't return
+static void* wm_sync_module(__attribute__((unused)) void* args);
+#endif
+static void wm_sys_destroy(wm_sys_t* data);      // Destroy data
+static void wm_sys_stop(wm_sys_t* sys);         // Module stopper
+const char* WM_SYS_LOCATION = "syscollector";   // Location field for event sending
+cJSON* wm_sys_dump(const wm_sys_t* sys);
+int wm_sync_message(const char* command, size_t command_len);
+#ifndef WIN32
+static pthread_t sync_worker_thread;
+#else
+static HANDLE sync_worker_thread = NULL;
+#endif
+static bool sync_worker_thread_initialized = false;
+pthread_mutex_t sys_reconnect_mutex = PTHREAD_MUTEX_INITIALIZER;
+// volatile sig_atomic_t, not a plain bool: this is written from wm_sys_stop(), which on
+// POSIX runs inside the SIGTERM handler (wm_handler, wazuh_modules/src/main.c), and read
+// from the module thread's polling loops below. sig_atomic_t is what a signal handler is
+// allowed to write, and volatile is what stops the compiler from hoisting the reads out of
+// those loops -- is_shutdown_process_started() is static and trivially inlinable, so the
+// function call is no barrier. Same idiom as wm_shutdown_requested (wmodules.h) and as
+// sync_module_running above.
+volatile sig_atomic_t shutdown_process_started = 0;
+
+static size_t wm_sys_query_handler(void* data, char* query, char** output); // Query handler
+
+const wm_context WM_SYS_CONTEXT =
+{
+    .name = SYSCOLLECTOR_WM_NAME,
+    .start = (wm_routine)wm_sys_main,
+    .destroy = (void(*)(void*))wm_sys_destroy,
+    .dump = (cJSON * (*)(const void*))wm_sys_dump,
+    .sync = (int(*)(const char*, size_t))wm_sync_message,
+    .stop = (void(*)(void*))wm_sys_stop,
+    .query = wm_sys_query_handler,
+};
+
+void* syscollector_module = NULL;
+
+syscollector_init_func syscollector_init_ptr = NULL;
+syscollector_start_func syscollector_start_ptr = NULL;
+syscollector_stop_func syscollector_stop_ptr = NULL;
+syscollector_release_resources_func syscollector_release_resources_ptr = NULL;
+
+// Sync protocol function pointers
+syscollector_init_sync_func syscollector_init_sync_ptr = NULL;
+syscollector_sync_module_func syscollector_sync_module_ptr = NULL;
+syscollector_persist_diff_func syscollector_persist_diff_ptr = NULL;
+syscollector_parse_response_func syscollector_parse_response_ptr = NULL;
+syscollector_parse_response_vd_func syscollector_parse_response_vd_ptr = NULL;
+syscollector_notify_data_clean_func syscollector_notify_data_clean_ptr = NULL;
+syscollector_delete_database_func syscollector_delete_database_ptr = NULL;
+
+// Query function pointer
+typedef size_t (*syscollector_query_func)(const char* query, char** output);
+syscollector_query_func syscollector_query_ptr = NULL;
+
+typedef enum
+{
+    SYSCOLLECTOR_STARTUP_ACTION_WAIT = 0,
+    SYSCOLLECTOR_STARTUP_ACTION_IMMEDIATE,
+    SYSCOLLECTOR_STARTUP_ACTION_STOP
+} wm_syscollector_startup_action_t;
+
+#define SYSCOLLECTOR_IDENTITY_POLL_SECONDS 30
+
+// Mutex access function pointers
+typedef void (*syscollector_lock_scan_mutex_func)();
+typedef void (*syscollector_unlock_scan_mutex_func)();
+syscollector_lock_scan_mutex_func syscollector_lock_scan_mutex_ptr = NULL;
+syscollector_unlock_scan_mutex_func syscollector_unlock_scan_mutex_ptr = NULL;
+
+typedef bool (*syscollector_is_scanning_func)();
+syscollector_is_scanning_func syscollector_is_scanning_ptr = NULL;
+
+typedef void (*syscollector_run_recovery_process_func)();
+syscollector_run_recovery_process_func syscollector_run_recovery_process_ptr = NULL;
+
+// agentd query function setter pointer (cross-platform)
+typedef void (*syscollector_set_agentd_query_func_ptr)(agentd_query_func_t);
+syscollector_set_agentd_query_func_ptr syscollector_set_agentd_query_func_setter = NULL;
+
+unsigned int enable_synchronization = 1;     // Database synchronization enabled (default value)
+uint32_t sync_interval = 300;                // Database synchronization interval (default value)
+uint32_t integrity_interval = 86400;         // Integrity check interval in seconds (default value)
+
+long syscollector_max_eps = 50;          // Number of events per second (default value)
+int queue_fd = 0;                        // Output queue file descriptor
+
+static bool is_shutdown_process_started()
+{
+    return shutdown_process_started != 0;
+}
+
+bool wm_sys_query_agentd(const char* command, char* output_buffer, size_t buffer_size)
+{
+    if (!command || !output_buffer || buffer_size == 0)
+    {
+        return false;
+    }
+
+    // Temporary buffer for receiving full response (including "ok " or "err " prefix)
+    char response_buffer[OS_MAXSTR];
+    ssize_t response_length = 0;
+
+#ifndef WIN32
+    // Unix/Linux: Use socket communication to get response into buffer
+    const char* AGENT_SOCKET = "queue/sockets/agent";
+    const size_t MAX_RECV_SIZE = sizeof(response_buffer) - 1;
+
+    // Connect to agent socket
+    int sock = OS_ConnectUnixDomain(AGENT_SOCKET, SOCK_STREAM, MAX_RECV_SIZE);
+
+    if (sock < 0)
+    {
+        mtdebug1(WM_SYS_LOGTAG, "Could not connect to agent socket: %s", strerror(errno));
+        return false;
+    }
+
+    // Send request
+    if (OS_SendSecureTCP(sock, strlen(command), command) != 0)
+    {
+        mterror(WM_SYS_LOGTAG, "Failed to send request to agent socket: %s", strerror(errno));
+        close(sock);
+        return false;
+    }
+
+    // Receive response (leave room for null terminator)
+    memset(response_buffer, 0, sizeof(response_buffer));
+    response_length = OS_RecvSecureTCP(sock, response_buffer, MAX_RECV_SIZE);
+    close(sock);
+
+    if (response_length <= 0)
+    {
+        if (response_length == 0)
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Empty response from agent socket");
+        }
+        else if (response_length == -2)  // OS_SOCKTERR
+        {
+            mterror(WM_SYS_LOGTAG, "Maximum buffer length reached reading from agent socket");
+        }
+        else
+        {
+            mterror(WM_SYS_LOGTAG, "Failed to receive response from agent socket: %s", strerror(errno));
+        }
+
+        return false;
+    }
+
+    // Ensure null termination (response_length is guaranteed <= MAX_RECV_SIZE)
+    response_buffer[response_length] = '\0';
+#else
+    // Windows: Use agcom_dispatch and copy response into buffer
+    // agcom_dispatch() mutates the command buffer (it splits "cmd args" in-place).
+    // Copy to a writable buffer since callers typically pass string literals.
+    char command_buffer[OS_MAXSTR];
+    strncpy(command_buffer, command, sizeof(command_buffer) - 1);
+    command_buffer[sizeof(command_buffer) - 1] = '\0';
+
+    char* output = NULL;
+    size_t result = agcom_dispatch(command_buffer, &output);
+
+    if (result == 0 || !output)
+    {
+        // Free output if allocated (defensive, in case agcom_dispatch allocated but failed)
+        os_free(output);
+        mtdebug1(WM_SYS_LOGTAG, "Failed to query agentd via agcom_dispatch");
+        return false;
+    }
+
+    // Copy response to our temporary buffer (safely)
+    size_t output_len = strlen(output);
+    size_t max_copy = sizeof(response_buffer) - 1;
+
+    if (output_len > max_copy)
+    {
+        mtwarn(WM_SYS_LOGTAG, "Response too large (%zu bytes), truncating to %zu bytes",
+               output_len, max_copy);
+        output_len = max_copy;
+    }
+
+    memcpy(response_buffer, output, output_len);
+    response_buffer[output_len] = '\0';
+    response_length = output_len;
+    os_free(output);
+#endif
+
+    // Common response parsing (works for both platforms)
+    mtdebug2(WM_SYS_LOGTAG, "Response from agentd: %s", response_buffer);
+
+    // Check if response starts with "ok "
+    if (response_length >= 3 && strncmp(response_buffer, "ok ", 3) == 0)
+    {
+        // Copy JSON part (after "ok ") to output buffer
+        const char* json_start = response_buffer + 3;
+        size_t json_len = strlen(json_start);
+
+        if (json_len >= buffer_size)
+        {
+            mterror(WM_SYS_LOGTAG, "Output buffer too small (%zu bytes needed, %zu available)",
+                    json_len + 1, buffer_size);
+            return false;
+        }
+
+        strncpy(output_buffer, json_start, buffer_size - 1);
+        output_buffer[buffer_size - 1] = '\0';
+        return true;
+    }
+    else if (response_length >= 4 && strncmp(response_buffer, "err ", 4) == 0)
+    {
+        // Error response from agentd
+        mtdebug1(WM_SYS_LOGTAG, "Agentd returned error: %s", response_buffer + 4);
+        return false;
+    }
+    else
+    {
+        mterror(WM_SYS_LOGTAG, "Unexpected response format from agentd: %s", response_buffer);
+        return false;
+    }
+}
+
+static void wm_sys_send_message(const void* data, const char queue_id)
+{
+    if (!is_shutdown_process_started())
+    {
+        const int eps = 1000000 / syscollector_max_eps;
+
+        if (wm_sendmsg_ex(eps, queue_fd, data, WM_SYS_LOCATION, queue_id, &is_shutdown_process_started) < 0)
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Unable to send message to '%s'", DEFAULTQUEUE);
+
+            // Since this method is beign called by multiple threads it's necessary this particular portion of code
+            // to be mutually exclusive. When one thread is successfully reconnected, the other ones will make use of it.
+            w_mutex_lock(&sys_reconnect_mutex);
+
+            if (!is_shutdown_process_started() && wm_sendmsg_ex(eps, queue_fd, data, WM_SYS_LOCATION, queue_id, &is_shutdown_process_started) < 0)
+            {
+                if (queue_fd = MQReconnectPredicated(DEFAULTQUEUE, &is_shutdown_process_started), 0 <= queue_fd)
+                {
+                    mtinfo(WM_SYS_LOGTAG, "Successfully reconnected to '%s'", DEFAULTQUEUE);
+
+                    if (wm_sendmsg_ex(eps, queue_fd, data, WM_SYS_LOCATION, queue_id, &is_shutdown_process_started) < 0)
+                    {
+                        mterror(WM_SYS_LOGTAG, "Unable to send message to '%s' after a successfull reconnection...", DEFAULTQUEUE);
+                    }
+                }
+            }
+
+            w_mutex_unlock(&sys_reconnect_mutex);
+        }
+    }
+}
+
+static void wm_sys_send_diff_message(const void* data)
+{
+    wm_sys_send_message(data, SYSCOLLECTOR_MQ);
+}
+
+static bool wm_sys_parse_query_int(const char* output, const char* field, int* value)
+{
+    bool result = false;
+    cJSON* root = NULL;
+
+    if (!output || !field || !value)
+    {
+        return false;
+    }
+
+    root = cJSON_Parse(output);
+
+    if (!root)
+    {
+        return false;
+    }
+
+    cJSON* error = cJSON_GetObjectItemCaseSensitive(root, "error");
+    cJSON* data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    cJSON* field_item = data ? cJSON_GetObjectItemCaseSensitive(data, field) : NULL;
+
+    if (error && field_item && cJSON_IsNumber(error) && error->valueint == MQ_SUCCESS &&
+        cJSON_IsNumber(field_item))
+    {
+        *value = field_item->valueint;
+        result = true;
+    }
+
+    cJSON_Delete(root);
+    return result;
+}
+
+static bool wm_sys_query_int(const char* query, const char* field, int* value)
+{
+    bool result = false;
+    char* output = NULL;
+
+    if (!syscollector_query_ptr || !query || !field || !value)
+    {
+        return false;
+    }
+
+    syscollector_query_ptr(query, &output);
+
+    if (output)
+    {
+        result = wm_sys_parse_query_int(output, field, value);
+        free(output);
+    }
+
+    return result;
+}
+
+// Polled so a re-enrolled agent resends its inventory right away, instead of waiting for a sync
+// interval that frequent reloads keep restarting. 1: the id changed; 0: it did not; -1: Syscollector
+// cannot tell right now (no id published yet, a failed read or query), which must not read as either.
+// resync_attempts, when not NULL, gets how many resends Syscollector has started since it came up,
+// or -1 when the answer does not say.
+static int wm_sys_identity_state(int* resync_attempts)
+{
+    int state = 0;
+    char* output = NULL;
+    bool parsed = false;
+
+    if (resync_attempts)
+    {
+        *resync_attempts = -1;
+    }
+
+    if (!syscollector_query_ptr)
+    {
+        return -1;
+    }
+
+    syscollector_query_ptr("{\"command\":\"get_identity_changed\"}", &output);
+
+    if (output)
+    {
+        parsed = wm_sys_parse_query_int(output, "identity_changed", &state);
+
+        if (parsed && resync_attempts && !wm_sys_parse_query_int(output, "resync_attempts", resync_attempts))
+        {
+            *resync_attempts = -1;
+        }
+
+        free(output);
+    }
+
+    return parsed ? state : -1;
+}
+
+static wm_syscollector_startup_action_t wm_sys_get_startup_action(bool* first_sync_completed, bool* identity_changed)
+{
+    int marker = 0;
+
+    if (first_sync_completed)
+    {
+        *first_sync_completed = false;
+    }
+
+    if (identity_changed)
+    {
+        *identity_changed = false;
+    }
+
+    if (!syscollector_query_ptr)
+    {
+        mtdebug1(WM_SYS_LOGTAG, "Syscollector query function not available. Keeping startup synchronization delay.");
+        return SYSCOLLECTOR_STARTUP_ACTION_WAIT;
+    }
+
+    if (!wm_sys_query_int("{\"command\":\"get_first_sync_completed\"}", "first_sync_completed", &marker))
+    {
+        mtdebug1(WM_SYS_LOGTAG, "Failed to detect whether the first inventory synchronization already completed. Keeping startup synchronization delay.");
+        return SYSCOLLECTOR_STARTUP_ACTION_WAIT;
+    }
+
+    if (marker > 0)
+    {
+        if (first_sync_completed)
+        {
+            *first_sync_completed = true;
+        }
+
+        if (wm_sys_identity_state(NULL) > 0)
+        {
+            mtinfo(WM_SYS_LOGTAG, "Inventory agent id changed since the last synchronization. Synchronizing now.");
+
+            if (identity_changed)
+            {
+                *identity_changed = true;
+            }
+
+            return SYSCOLLECTOR_STARTUP_ACTION_IMMEDIATE;
+        }
+
+        mtdebug1(WM_SYS_LOGTAG, "Inventory first synchronization already completed in a previous run. Keeping startup synchronization delay.");
+        return SYSCOLLECTOR_STARTUP_ACTION_WAIT;
+    }
+
+    mtdebug1(WM_SYS_LOGTAG, "Inventory initial scan data is not ready yet. First synchronization will wait for scan data.");
+
+    int log_throttle = 0;
+
+    while (sync_module_running && !is_shutdown_process_started())
+    {
+        int scan_marker = 0;
+
+        if (!wm_sys_query_int("{\"command\":\"get_first_scan_completed\"}", "first_scan_completed", &scan_marker))
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Failed to detect initial Syscollector scan completion. Keeping startup synchronization delay.");
+            return SYSCOLLECTOR_STARTUP_ACTION_WAIT;
+        }
+
+        if (scan_marker > 0)
+        {
+            mtdebug1(WM_SYS_LOGTAG, "First inventory scan completed. Triggering first synchronization without startup delay.");
+            return SYSCOLLECTOR_STARTUP_ACTION_IMMEDIATE;
+        }
+
+        if (log_throttle == 0)
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Synchronization deferred: waiting for first inventory scan to complete.");
+        }
+
+        log_throttle = (log_throttle + 1) % 30;
+        sleep(1);
+    }
+
+    return SYSCOLLECTOR_STARTUP_ACTION_STOP;
+}
+
+static void wm_sys_persist_diff_message(const char* id, Operation_t operation, const char* index, const void* data, uint64_t version)
+{
+    if (enable_synchronization && syscollector_persist_diff_ptr)
+    {
+        const char* msg = (const char*)data;
+        mtdebug2(WM_SYS_LOGTAG, "Persisting Inventory event: %s", msg);
+        syscollector_persist_diff_ptr(id, operation, index, msg, version);
+    }
+    else
+    {
+        mtdebug2(WM_SYS_LOGTAG, "Inventory synchronization is disabled or function not available");
+    }
+}
+
+static void wm_sys_log_config(wm_sys_t* sys)
+{
+    cJSON* config_json = wm_sys_dump(sys);
+
+    if (config_json)
+    {
+        char* config_str = cJSON_PrintUnformatted(config_json);
+
+        if (config_str)
+        {
+            mtdebug1(WM_SYS_LOGTAG, "%s", config_str);
+            cJSON_free(config_str);
+        }
+
+        cJSON_Delete(config_json);
+    }
+}
+
+static void wm_handle_sys_disabled_and_notify_data_clean(wm_sys_t* sys)
+{
+
+    if (w_is_file(SYSCOLLECTOR_DB_DISK_PATH))
+    {
+        mtinfo(WM_SYS_LOGTAG, "Syscollector is disabled, Syscollector database file exists. Proceeding with data clean notification.");
+    }
+    else
+    {
+        mtinfo(WM_SYS_LOGTAG, "Syscollector is disabled, Syscollector database file does not exist. Skipping data clean notification.");
+        return;
+    }
+
+    if (syscollector_module = so_get_module_handle("syscollector"), syscollector_module)
+    {
+
+        syscollector_init_ptr = so_get_function_sym(syscollector_module, "syscollector_init");
+
+        // Get sync protocol function pointers
+        syscollector_init_sync_ptr = so_get_function_sym(syscollector_module, "syscollector_init_sync");
+        syscollector_parse_response_ptr = so_get_function_sym(syscollector_module, "syscollector_parse_response");
+        syscollector_parse_response_vd_ptr = so_get_function_sym(syscollector_module, "syscollector_parse_response_vd");
+        syscollector_notify_data_clean_ptr = so_get_function_sym(syscollector_module, "syscollector_notify_data_clean");
+        syscollector_delete_database_ptr = so_get_function_sym(syscollector_module, "syscollector_delete_database");
+
+        syscollector_init_ptr(sys->interval,
+                              wm_sys_send_diff_message,
+                              wm_sys_persist_diff_message,
+                              taggedLogFunction,
+                              SYSCOLLECTOR_DB_DISK_PATH,
+                              SYSCOLLECTOR_NORM_CONFIG_DISK_PATH,
+                              SYSCOLLECTOR_NORM_TYPE,
+                              sys->flags.scan_on_start,
+                              sys->flags.hwinfo,
+                              sys->flags.osinfo,
+                              sys->flags.netinfo,
+                              sys->flags.programinfo,
+                              sys->flags.portsinfo,
+                              sys->flags.allports,
+                              sys->flags.procinfo,
+                              sys->flags.hotfixinfo,
+                              sys->flags.groups,
+                              sys->flags.users,
+                              sys->flags.services,
+                              sys->flags.browser_extensions,
+                              sys->flags.notify_first_scan);
+
+        syscollector_init_sync_ptr(WM_SYS_LOCATION, SYS_SYNC_PROTOCOL_DB_PATH, SYS_SYNC_PROTOCOL_VD_DB_PATH,
+                                   integrity_interval);
+
+        if (syscollector_notify_data_clean_ptr && syscollector_delete_database_ptr)
+        {
+            const char* indices[] =
+            {
+                SYSCOLLECTOR_SYNC_INDEX_SYSTEM,
+                SYSCOLLECTOR_SYNC_INDEX_HARDWARE,
+                SYSCOLLECTOR_SYNC_INDEX_HOTFIXES,
+                SYSCOLLECTOR_SYNC_INDEX_PACKAGES,
+                SYSCOLLECTOR_SYNC_INDEX_PROCESSES,
+                SYSCOLLECTOR_SYNC_INDEX_PORTS,
+                SYSCOLLECTOR_SYNC_INDEX_INTERFACES,
+                SYSCOLLECTOR_SYNC_INDEX_PROTOCOLS,
+                SYSCOLLECTOR_SYNC_INDEX_NETWORKS,
+                SYSCOLLECTOR_SYNC_INDEX_USERS,
+                SYSCOLLECTOR_SYNC_INDEX_GROUPS,
+                SYSCOLLECTOR_SYNC_INDEX_SERVICES,
+                SYSCOLLECTOR_SYNC_INDEX_BROWSER_EXTENSIONS,
+                SYSCOLLECTOR_SYNC_INDEX_VULNERABILITIES
+            };
+            size_t indices_count = sizeof(indices) / sizeof(indices[0]);
+            bool ret = false;
+
+            while (!ret && !is_shutdown_process_started())
+            {
+                ret = syscollector_notify_data_clean_ptr(indices, indices_count);
+
+                if (!ret)
+                {
+                    for (uint32_t i = 0; i < sync_interval && !is_shutdown_process_started(); i++)
+                    {
+                        sleep(1);
+                    }
+                }
+                else
+                {
+                    mtdebug1(WM_SYS_LOGTAG, "Syscollector data clean notification sent successfully.");
+                    syscollector_delete_database_ptr();
+                }
+            }
+        }
+        else
+        {
+            mtwarn(WM_SYS_LOGTAG, "Syscollector notify data clean functions not available.");
+        }
+
+    }
+    else
+    {
+        mtwarn(WM_SYS_LOGTAG, "Failed to load Syscollector module for data clean notification.");
+        return;
+    }
+}
+
+#ifdef WIN32
+DWORD WINAPI wm_sys_main(void* arg)
+{
+    wm_sys_t* sys = (wm_sys_t*)arg;
+#else
+void* wm_sys_main(wm_sys_t* sys)
+{
+#endif
+
+    if (sys->flags.running)
+    {
+        // Already running
+        return 0;
+    }
+
+    sys->flags.running = true;
+
+    if (!sys->flags.enabled)
+    {
+        wm_handle_sys_disabled_and_notify_data_clean(sys);
+        mtinfo(WM_SYS_LOGTAG, "Module disabled. Exiting.");
+        pthread_exit(NULL);
+    }
+
+    mtdebug1(WM_SYS_LOGTAG, "Module enabled.");
+
+#ifndef WIN32
+    // Connect to socket
+    queue_fd = StartMQPredicated(DEFAULTQUEUE, WRITE, INFINITE_OPENQ_ATTEMPTS, &is_shutdown_process_started);
+
+    if (queue_fd < 0)
+    {
+        mterror(WM_SYS_LOGTAG, "Can't connect to queue.");
+        pthread_exit(NULL);
+    }
+
+#endif
+
+    if (syscollector_module = so_get_module_handle("syscollector"), syscollector_module)
+    {
+        syscollector_init_ptr = so_get_function_sym(syscollector_module, "syscollector_init");
+        syscollector_start_ptr = so_get_function_sym(syscollector_module, "syscollector_start");
+        syscollector_stop_ptr = so_get_function_sym(syscollector_module, "syscollector_stop");
+        syscollector_release_resources_ptr = so_get_function_sym(syscollector_module, "syscollector_release_resources");
+
+        // Get sync protocol function pointers
+        syscollector_init_sync_ptr = so_get_function_sym(syscollector_module, "syscollector_init_sync");
+        syscollector_sync_module_ptr = so_get_function_sym(syscollector_module, "syscollector_sync_module");
+        syscollector_persist_diff_ptr = so_get_function_sym(syscollector_module, "syscollector_persist_diff");
+        syscollector_parse_response_ptr = so_get_function_sym(syscollector_module, "syscollector_parse_response");
+        syscollector_parse_response_vd_ptr = so_get_function_sym(syscollector_module, "syscollector_parse_response_vd");
+
+        // Get query function pointer
+        syscollector_query_ptr = so_get_function_sym(syscollector_module, "syscollector_query");
+
+        // Get mutex access function pointers
+        syscollector_lock_scan_mutex_ptr = so_get_function_sym(syscollector_module, "syscollector_lock_scan_mutex");
+        syscollector_unlock_scan_mutex_ptr = so_get_function_sym(syscollector_module, "syscollector_unlock_scan_mutex");
+        syscollector_is_scanning_ptr = so_get_function_sym(syscollector_module, "syscollector_is_scanning");
+
+        syscollector_run_recovery_process_ptr = so_get_function_sym(syscollector_module, "syscollector_run_recovery_process");
+
+        // Get agentd query function setter pointer (cross-platform)
+        syscollector_set_agentd_query_func_setter = so_get_function_sym(syscollector_module, "syscollector_set_agentd_query_func");
+    }
+    else
+    {
+        mterror(WM_SYS_LOGTAG, "Can't load syscollector.");
+        pthread_exit(NULL);
+    }
+
+    if (is_shutdown_process_started())
+    {
+        // A stop arrived while this thread was still getting here. Do not initialise:
+        // that would open the databases and clear m_stopping, and the teardown below
+        // would then have to race wm_sys_stop()'s quiesce() to put them back. Nothing
+        // was opened, so that teardown is a no-op on this path.
+        mtinfo(WM_SYS_LOGTAG, "Shutdown requested before Syscollector started; skipping startup.");
+    }
+    else if (syscollector_init_ptr && syscollector_start_ptr)
+    {
+        mtdebug1(WM_SYS_LOGTAG, "Starting module.");
+        enable_synchronization = sys->sync.enable_synchronization;
+
+        if (enable_synchronization)
+        {
+            sync_interval = sys->sync.sync_interval;
+            integrity_interval = sys->sync.integrity_interval;
+        }
+
+        if (sys->max_eps)
+        {
+            syscollector_max_eps = sys->max_eps;
+        }
+
+        wm_sys_log_config(sys);
+
+        // Initialize syscollector FIRST to set up the logger callback
+        syscollector_init_ptr(sys->interval,
+                              wm_sys_send_diff_message,
+                              wm_sys_persist_diff_message,
+                              taggedLogFunction,
+                              SYSCOLLECTOR_DB_DISK_PATH,
+                              SYSCOLLECTOR_NORM_CONFIG_DISK_PATH,
+                              SYSCOLLECTOR_NORM_TYPE,
+                              sys->flags.scan_on_start,
+                              sys->flags.hwinfo,
+                              sys->flags.osinfo,
+                              sys->flags.netinfo,
+                              sys->flags.programinfo,
+                              sys->flags.portsinfo,
+                              sys->flags.allports,
+                              sys->flags.procinfo,
+                              sys->flags.hotfixinfo,
+                              sys->flags.groups,
+                              sys->flags.users,
+                              sys->flags.services,
+                              sys->flags.browser_extensions,
+                              sys->flags.notify_first_scan);
+
+        // Set agentd query function for communication (AFTER init, BEFORE start)
+        // Syscollector will fetch document limits from agentd
+        if (syscollector_set_agentd_query_func_setter)
+        {
+            syscollector_set_agentd_query_func_setter(wm_sys_query_agentd);
+            mtdebug1(WM_SYS_LOGTAG, "Agentd query function configured for document limits.");
+        }
+        else
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Agentd query function setter not available.");
+        }
+
+        // Initialize sync protocol AFTER init (so logger is available)
+        if (enable_synchronization && syscollector_init_sync_ptr && syscollector_sync_module_ptr)
+        {
+            syscollector_init_sync_ptr(WM_SYS_LOCATION, SYS_SYNC_PROTOCOL_DB_PATH, SYS_SYNC_PROTOCOL_VD_DB_PATH,
+                                       integrity_interval);
+#ifndef WIN32
+            // Launch inventory synchronization thread as joinable so we can wait for it
+            // before releasing resources on shutdown
+            sync_module_running = 1;
+            sync_worker_thread_initialized = (CreateThreadJoinable(&sync_worker_thread, wm_sync_module, NULL) == 0);
+            if (!sync_worker_thread_initialized)
+            {
+                mterror(WM_SYS_LOGTAG, THREAD_ERROR);
+                sync_module_running = 0;
+            }
+#else
+            sync_module_running = 1;
+            sync_worker_thread = CreateThread(NULL, 0, wm_sync_module, NULL, 0, NULL);
+            if (sync_worker_thread == NULL)
+            {
+                mterror(WM_SYS_LOGTAG, THREAD_ERROR);
+                sync_module_running = 0;
+            }
+            else
+            {
+                sync_worker_thread_initialized = true;
+            }
+
+#endif
+        }
+        else
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Inventory synchronization is disabled or function not available");
+        }
+
+        // No second check here, deliberately. A stop landing *during* initialisation is
+        // still lost (init() cleared m_stopping), but skipping the scan at this point
+        // would send this thread straight into releaseResources() while wm_sys_stop() is
+        // inside quiesce(), which reads m_spSyncProtocol/m_spSyncProtocolVD without
+        // m_resourcesMutex -- with the databases already open, so there is something to
+        // pull from under it. Closing that window needs quiesce() and releaseResources()
+        // serialized first; until then, running the scan and letting it notice m_stopping
+        // is the safer of the two failure modes.
+        mtinfo(WM_SYS_LOGTAG, STARTUP_MSG, (int)getpid());
+        syscollector_start_ptr();
+    }
+    else
+    {
+        mterror(WM_SYS_LOGTAG, "Can't get syscollector_start_ptr.");
+        pthread_exit(NULL);
+    }
+
+    syscollector_init_ptr = NULL;
+    syscollector_start_ptr = NULL;
+    syscollector_stop_ptr = NULL;
+
+    if (queue_fd)
+    {
+        close(queue_fd);
+        queue_fd = 0;
+    }
+
+    // Ensure the sync worker exits even if syscollector_start_ptr returned early
+    // (e.g., all collectors disabled) without wm_sys_stop() being called first.
+    sync_module_running = 0;
+
+    // Wait for the inventory sync worker thread to finish before signaling that
+    // resources can be released.
+#ifndef WIN32
+    if (sync_worker_thread_initialized)
+    {
+        sync_worker_thread_initialized = false;
+        pthread_join(sync_worker_thread, NULL);
+    }
+#else
+    if (sync_worker_thread_initialized && sync_worker_thread != NULL)
+    {
+        sync_worker_thread_initialized = false;
+        WaitForSingleObject(sync_worker_thread, INFINITE);
+        CloseHandle(sync_worker_thread);
+        sync_worker_thread = NULL;
+    }
+#endif
+
+    mtinfo(WM_SYS_LOGTAG, "Module finished.");
+
+    // Safe to release resources now that the sync worker has exited. This runs on
+    // the module thread and before it returns, so whoever joins this thread is
+    // guaranteed the teardown already completed -- wm_sys_stop() does not need to
+    // wait for it a second time.
+    if (syscollector_release_resources_ptr)
+    {
+        syscollector_release_resources_ptr();
+        syscollector_release_resources_ptr = NULL;
+    }
+
+    return 0;
+}
+
+void wm_sys_destroy(wm_sys_t* data)
+{
+    free(data);
+}
+
+void wm_sys_stop(__attribute__((unused))wm_sys_t* data)
+{
+    // Record the stop before anything else, including the early return below. The
+    // shutdown loop signals every module before joining any of them, so this can
+    // arrive while wm_sys_main() is still starting up -- and both Syscollector::init()
+    // and Syscollector::start() clear m_stopping, so a stop delivered in that window
+    // would be erased and the module would scan on through the shutdown, burning the
+    // shared join budget and leaving its database locked for the successor process.
+    // wm_sys_main() checks this flag before initialising and before starting the scan.
+    shutdown_process_started = 1;
+
+    if (!data->flags.running)
+    {
+        // Already stopped
+        return;
+    }
+
+    data->flags.running = false;
+
+    // Stop sync module
+    sync_module_running = 0;
+
+    mtinfo(WM_SYS_LOGTAG, "Stop received for Syscollector.");
+
+    // Read the pointer once: the module thread clears syscollector_stop_ptr on its way
+    // out (see wm_sys_main), so testing the global and then calling through it can land
+    // on a NULL between the two. The worst case with a local copy is that this call
+    // arrives after the module already tore itself down, which is harmless.
+    const syscollector_stop_func stop_fn = syscollector_stop_ptr;
+
+    if (stop_fn)
+    {
+        stop_fn();
+    }
+
+    // Signal only. The module thread runs its own teardown (releaseResources())
+    // before returning, so the caller's join of that thread already guarantees it
+    // finished; waiting here as well only stacked a second per-module timeout on
+    // top of that guarantee and delayed the stop signal to the modules after this
+    // one in the shutdown loop.
+}
+
+cJSON* wm_sys_dump(const wm_sys_t* sys)
+{
+    cJSON* root = cJSON_CreateObject();
+    cJSON* wm_sys = cJSON_CreateObject();
+
+    // System provider values
+    if (sys->flags.enabled) cJSON_AddStringToObject(wm_sys, "disabled", "no");
+    else cJSON_AddStringToObject(wm_sys, "disabled", "yes");
+
+    if (sys->flags.scan_on_start) cJSON_AddStringToObject(wm_sys, "scan-on-start", "yes");
+    else cJSON_AddStringToObject(wm_sys, "scan-on-start", "no");
+
+    cJSON_AddNumberToObject(wm_sys, "interval", sys->interval);
+    cJSON_AddNumberToObject(wm_sys, "max_eps", sys->max_eps);
+
+    if (sys->flags.notify_first_scan) cJSON_AddStringToObject(wm_sys, "notify_first_scan", "yes");
+    else cJSON_AddStringToObject(wm_sys, "notify_first_scan", "no");
+
+    if (sys->flags.netinfo) cJSON_AddStringToObject(wm_sys, "network", "yes");
+    else cJSON_AddStringToObject(wm_sys, "network", "no");
+
+    if (sys->flags.osinfo) cJSON_AddStringToObject(wm_sys, "os", "yes");
+    else cJSON_AddStringToObject(wm_sys, "os", "no");
+
+    if (sys->flags.hwinfo) cJSON_AddStringToObject(wm_sys, "hardware", "yes");
+    else cJSON_AddStringToObject(wm_sys, "hardware", "no");
+
+    if (sys->flags.programinfo) cJSON_AddStringToObject(wm_sys, "packages", "yes");
+    else cJSON_AddStringToObject(wm_sys, "packages", "no");
+
+    if (sys->flags.portsinfo) cJSON_AddStringToObject(wm_sys, "ports", "yes");
+    else cJSON_AddStringToObject(wm_sys, "ports", "no");
+
+    if (sys->flags.allports) cJSON_AddStringToObject(wm_sys, "ports_all", "yes");
+    else cJSON_AddStringToObject(wm_sys, "ports_all", "no");
+
+    if (sys->flags.procinfo) cJSON_AddStringToObject(wm_sys, "processes", "yes");
+    else cJSON_AddStringToObject(wm_sys, "processes", "no");
+
+    if (sys->flags.groups) cJSON_AddStringToObject(wm_sys, "groups", "yes");
+    else cJSON_AddStringToObject(wm_sys, "groups", "no");
+
+    if (sys->flags.users) cJSON_AddStringToObject(wm_sys, "users", "yes");
+    else cJSON_AddStringToObject(wm_sys, "users", "no");
+
+    if (sys->flags.services) cJSON_AddStringToObject(wm_sys, "services", "yes");
+    else cJSON_AddStringToObject(wm_sys, "services", "no");
+
+    if (sys->flags.browser_extensions) cJSON_AddStringToObject(wm_sys, "browser_extensions", "yes");
+    else cJSON_AddStringToObject(wm_sys, "browser_extensions", "no");
+
+#ifdef WIN32
+
+    if (sys->flags.hotfixinfo) cJSON_AddStringToObject(wm_sys, "hotfixes", "yes");
+    else cJSON_AddStringToObject(wm_sys, "hotfixes", "no");
+
+#endif
+
+    // Database synchronization values
+    cJSON* synchronization = cJSON_CreateObject();
+    cJSON_AddStringToObject(synchronization, "enabled", sys->sync.enable_synchronization ? "yes" : "no");
+    cJSON_AddNumberToObject(synchronization, "interval", sys->sync.sync_interval);
+    cJSON_AddNumberToObject(synchronization, "integrity_interval", sys->sync.integrity_interval);
+
+    cJSON_AddItemToObject(wm_sys, "synchronization", synchronization);
+
+    cJSON_AddItemToObject(root, "syscollector", wm_sys);
+
+    return root;
+}
+
+int wm_sync_message(const char* command, size_t command_len)
+{
+    if (is_shutdown_process_started())
+    {
+        mtdebug1(WM_SYS_LOGTAG, "Sync message received during shutdown, ignoring");
+        return 0;
+    }
+
+    if (enable_synchronization)
+    {
+        bool ret = false;
+        size_t header_len;
+        const uint8_t* data;
+        size_t data_len;
+
+        // Check if this is a VD message by looking for "_vd" in the command
+        if (strstr(command, "_vd") != NULL)
+        {
+            // Route to VD parser with VD-specific header length
+            header_len = strlen(SYSCOLECTOR_VD_SYNC_HEADER);
+            data = (const uint8_t*)(command + header_len);
+            data_len = command_len - header_len;
+
+            if (syscollector_parse_response_vd_ptr)
+            {
+                mtdebug2(WM_SYS_LOGTAG, "Routing message to VD parser");
+                ret = syscollector_parse_response_vd_ptr(data, data_len);
+            }
+            else
+            {
+                mtdebug1(WM_SYS_LOGTAG, "VD parser function not available");
+                return -1;
+            }
+        }
+        else
+        {
+            // Route to regular parser with regular header length
+            header_len = strlen(SYSCOLECTOR_SYNC_HEADER);
+            data = (const uint8_t*)(command + header_len);
+            data_len = command_len - header_len;
+
+            if (syscollector_parse_response_ptr)
+            {
+                mtdebug2(WM_SYS_LOGTAG, "Routing message to regular parser");
+                ret = syscollector_parse_response_ptr(data, data_len);
+            }
+            else
+            {
+                mtdebug1(WM_SYS_LOGTAG, "Regular parser function not available");
+                return -1;
+            }
+        }
+
+        if (!ret)
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Error syncing module");
+            return -1;
+        }
+
+        return 0;
+    }
+    else
+    {
+        mtdebug1(WM_SYS_LOGTAG, "Inventory synchronization is disabled or function not available");
+        return -1;
+    }
+}
+
+#ifdef WIN32
+DWORD WINAPI wm_sync_module(__attribute__((unused)) void* args)
+{
+#else
+void* wm_sync_module(__attribute__((unused)) void* args)
+{
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+#endif
+    bool first_sync_completed = false;
+    bool wait_before_sync = true;
+    bool first_sync_blocked_on_scan = false;
+    // How often the wait below asks whether the agent id changed. Doubled, up to sync_interval,
+    // while a resync keeps failing, so a manager that is not ready for the new id yet gets a
+    // DataClean and every table every few minutes at most, not every 30 s.
+    uint32_t identity_poll = SYSCOLLECTOR_IDENTITY_POLL_SECONDS;
+    // INFO once per change, whichever check notices it first (the startup one included); DEBUG
+    // after that.
+    bool identity_change_logged = false;
+    // Resends Syscollector had started by the end of the previous cycle. The counter starts at zero
+    // with the module, like this thread. A failed sync moves it too, since the resend only follows a
+    // successful one. A cycle that leaves it unchanged never tried: the sync was skipped (a scan, a
+    // flush or the start-up DataClean for disabled collectors was running), or the recovery stood
+    // back from a flush or from that DataClean.
+    int last_resync_attempts = 0;
+
+    switch (wm_sys_get_startup_action(&first_sync_completed, &identity_change_logged))
+    {
+        case SYSCOLLECTOR_STARTUP_ACTION_IMMEDIATE:
+            wait_before_sync = false;
+            first_sync_blocked_on_scan = true;
+            break;
+        case SYSCOLLECTOR_STARTUP_ACTION_STOP:
+#ifdef WIN32
+            return 0;
+#else
+            return NULL;
+#endif
+        case SYSCOLLECTOR_STARTUP_ACTION_WAIT:
+        default:
+            break;
+    }
+
+    while (sync_module_running)
+    {
+        if (wait_before_sync)
+        {
+            for (uint32_t i = 0; i < sync_interval && sync_module_running; i++)
+            {
+                // Skipping i == 0 keeps retries of a failed resync at least one poll apart
+                if (i > 0 && i % identity_poll == 0 && wm_sys_identity_state(NULL) > 0)
+                {
+                    if (identity_change_logged)
+                    {
+                        mtdebug1(WM_SYS_LOGTAG, "Inventory agent id still differs from the last synchronization. Retrying the resync.");
+                    }
+                    else
+                    {
+                        mtinfo(WM_SYS_LOGTAG, "Inventory agent id changed since the last synchronization. Synchronizing now.");
+                        identity_change_logged = true;
+                    }
+
+                    break;
+                }
+
+                sleep(1);
+            }
+        }
+
+        wait_before_sync = true;
+
+        if (!sync_module_running)
+        {
+            break;
+        }
+
+        // On the first cycle after a fresh first scan, wait until scanning has
+        // actually finished rather than bypassing the scan-state guard.
+        if (first_sync_blocked_on_scan && syscollector_is_scanning_ptr)
+        {
+            while (sync_module_running && syscollector_is_scanning_ptr())
+            {
+                mtdebug1(WM_SYS_LOGTAG, "Waiting for scan to finish before forced post-first-scan synchronization.");
+                sleep(1);
+            }
+
+            first_sync_blocked_on_scan = false;
+        }
+
+        if (!sync_module_running)
+        {
+            break;
+        }
+
+        // Skip synchronization if scan is in progress to avoid syncing incomplete data.
+        if (syscollector_is_scanning_ptr && syscollector_is_scanning_ptr())
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Scan in progress, skipping sync cycle");
+            continue;
+        }
+
+        if (syscollector_sync_module_ptr)
+        {
+            // Do not hold scan mutex while waiting for sync ACKs.
+            bool sync_succeeded = syscollector_sync_module_ptr(MODE_DELTA);
+
+            if (sync_succeeded && !first_sync_completed)
+            {
+                first_sync_completed = true;
+            }
+
+            // Recovery touches shared state; keep this section serialized.
+            if (sync_succeeded && sync_module_running && syscollector_run_recovery_process_ptr)
+            {
+                if (syscollector_lock_scan_mutex_ptr && syscollector_unlock_scan_mutex_ptr)
+                {
+                    syscollector_lock_scan_mutex_ptr();
+                    syscollector_run_recovery_process_ptr();
+                    syscollector_unlock_scan_mutex_ptr();
+                }
+                else
+                {
+                    syscollector_run_recovery_process_ptr();
+                }
+            }
+        }
+        else
+        {
+            mtdebug1(WM_SYS_LOGTAG, "Sync function not available");
+        }
+
+        // An id still changed after the cycle was not resent (checkAgentIdentity() records the new
+        // id only once every table reached the manager): back off before the next attempt. An
+        // answer of -1 says nothing either way and leaves the retry state as it is.
+        int resync_attempts = -1;
+        const int identity_state = wm_sys_identity_state(&resync_attempts);
+
+        if (identity_state > 0)
+        {
+            // Only a resend that was started and failed says the manager is not ready yet; a cycle
+            // that never got to it keeps the period. An answer without the count backs off, the
+            // safe side.
+            const bool attempted = resync_attempts < 0 || resync_attempts != last_resync_attempts;
+
+            if (attempted && identity_poll < sync_interval)
+            {
+                identity_poll = (identity_poll > sync_interval / 2) ? sync_interval : identity_poll * 2;
+            }
+
+            // The wait below never runs past sync_interval, whatever the poll period says.
+            const uint32_t next_attempt = identity_poll < sync_interval ? identity_poll : sync_interval;
+
+            if (!attempted)
+            {
+                mtdebug1(WM_SYS_LOGTAG, "Inventory resync under the new agent id was not attempted this cycle, next check in %u seconds.", next_attempt);
+            }
+            else if (identity_change_logged)
+            {
+                mtdebug1(WM_SYS_LOGTAG, "Inventory resync under the new agent id did not complete, next attempt in %u seconds.", next_attempt);
+            }
+            else
+            {
+                mtinfo(WM_SYS_LOGTAG, "Inventory agent id changed since the last synchronization. Resyncing in %u seconds.", next_attempt);
+                identity_change_logged = true;
+            }
+        }
+        else if (identity_state == 0)
+        {
+            identity_poll = SYSCOLLECTOR_IDENTITY_POLL_SECONDS;
+            identity_change_logged = false;
+        }
+
+        if (resync_attempts >= 0)
+        {
+            last_resync_attempts = resync_attempts;
+        }
+    }
+
+#ifdef WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static size_t wm_sys_query_handler(void* data, char* query, char** output)
+{
+    (void)data;  // Unused parameter
+
+    if (!query || !output)
+    {
+        return 0;
+    }
+
+    // Mirrors #36762 (FIM): when synchronization is disabled the sync worker never runs, so the
+    // syscollector first-sync marker is never set. Report it as completed so agent-info coordination
+    // is not blocked deferring on a first sync that will never happen. The startup priming path calls
+    // syscollector_query_ptr directly and is unaffected by this handler-level short-circuit.
+    if (!enable_synchronization && strstr(query, "get_first_sync_completed"))
+    {
+        os_strdup("{\"error\":0,\"data\":{\"action\":\"get_first_sync_completed\",\"module\":\"syscollector\",\"first_sync_completed\":1}}", *output);
+        return strlen(*output);
+    }
+
+    // Call the C++ query function if available
+    if (syscollector_query_ptr)
+    {
+        return syscollector_query_ptr(query, output);
+    }
+    else
+    {
+        char error_msg[256];
+        snprintf(error_msg, sizeof(error_msg), "{\"error\":%d,\"message\":\"%s\"}",
+                 MQ_ERR_MODULE_NOT_RUNNING, MQ_MSG_MODULE_NOT_RUNNING);
+        os_strdup(error_msg, *output);
+        return strlen(*output);
+    }
+}

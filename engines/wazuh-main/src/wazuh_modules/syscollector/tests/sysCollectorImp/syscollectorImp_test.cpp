@@ -1,0 +1,6991 @@
+/*
+ * Wazuh SyscollectorImp
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <functional>
+#include <future>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sqlite3.h>
+#include <thread>
+
+#include "syscollectorImp_test.h"
+#include "syscollector.hpp"
+#include "module_query_errors.h"
+#include "syscollectorTablesDef.hpp"
+#include "schemaValidator.hpp"
+
+#include <mock_sysinfo.hpp>
+#include "mock_agent_sync_protocol.hpp"
+
+constexpr auto SYSCOLLECTOR_DB_PATH {":memory:"};
+constexpr auto SYSCOLLECTOR_TEST_DB_PATH {"syscollector_test.db"};
+
+// Mock SchemaValidatorEngine for dependency injection in tests
+class MockSchemaValidatorEngine : public SchemaValidator::ISchemaValidatorEngine
+{
+    public:
+        MOCK_METHOD(SchemaValidator::ValidationResult, validate, (const std::string&), (override));
+        MOCK_METHOD(SchemaValidator::ValidationResult, validate, (const nlohmann::json&), (override));
+        MOCK_METHOD(std::string, getSchemaName, (), (const, override));
+};
+
+// Helper to populate test DB manually
+void populateTestDb()
+{
+    std::string sql;
+    sql += OS_SQL_STATEMENT;
+    sql += HW_SQL_STATEMENT;
+    sql += PACKAGES_SQL_STATEMENT;
+    sql += HOTFIXES_SQL_STATEMENT;
+    sql += PROCESSES_SQL_STATEMENT;
+    sql += PORTS_SQL_STATEMENT;
+    sql += NETIFACE_SQL_STATEMENT;
+    sql += NETPROTO_SQL_STATEMENT;
+    sql += NETADDR_SQL_STATEMENT;
+    sql += USERS_SQL_STATEMENT;
+    sql += GROUPS_SQL_STATEMENT;
+    sql += SERVICES_SQL_STATEMENT;
+    sql += BROWSER_EXTENSIONS_SQL_STATEMENT;
+    sql += TABLE_METADATA_SQL_STATEMENT;
+
+    // Use DBSync to create the database structure correctly (including metadata tables)
+    {
+        auto callbackErrorLogWrapper = [](const std::string& /*data*/) {};
+        // Ensure DBSync is initialized with our dummy logger
+        DBSync::initialize(callbackErrorLogWrapper);
+        // With the upgrade statements, as Syscollector::init() does: the schema above is the
+        // latest one, so the database must be stamped with the latest version too.
+        DBSync dbSync(HostType::AGENT, DbEngineType::SQLITE3, SYSCOLLECTOR_TEST_DB_PATH, sql, DbManagement::PERSISTENT,
+                      UPGRADE_SQL_STATEMENTS);
+    }
+
+    sqlite3* db = nullptr;
+    // Open existing DB created by DBSync
+    int rc = sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr);
+
+    if (rc != SQLITE_OK)
+    {
+        if (db) sqlite3_close(db);
+
+        throw std::runtime_error("Failed to open test DB");
+    }
+
+    // Insert dummy data to trigger "disabled collector with data" detection
+    const char* inserts[] =
+    {
+        "INSERT INTO dbsync_packages (name, version_, architecture, type, path, checksum) VALUES ('pkg1', '1.0', 'arch', 'type', 'path', 'sum');",
+        "INSERT INTO dbsync_processes (pid, name, checksum) VALUES ('123', 'proc1', 'sum');",
+        "INSERT INTO dbsync_hwinfo (serial_number, checksum) VALUES ('sn1', 'sum');",
+        "INSERT INTO dbsync_osinfo (os_name, os_version, checksum) VALUES ('os1', 'version1', 'sum');",
+        "INSERT INTO dbsync_ports (file_inode, network_transport, source_ip, source_port, checksum) VALUES (1, 'tcp', '127.0.0.1', 80, 'sum');",
+        "INSERT INTO dbsync_network_iface (interface_name, interface_alias, interface_type, checksum) VALUES ('eth0', 'alias', 'ethernet', 'sum');",
+        "INSERT INTO dbsync_network_protocol (interface_name, network_type, checksum) VALUES ('eth0', 'ipv4', 'sum');",
+        "INSERT INTO dbsync_network_address (interface_name, network_type, network_ip, checksum) VALUES ('eth0', 0, '1.1.1.1', 'sum');"
+    };
+
+    char* errMsg = 0;
+
+    for (const auto& insertSql : inserts)
+    {
+        rc = sqlite3_exec(db, insertSql, 0, 0, &errMsg);
+
+        if (rc != SQLITE_OK)
+        {
+            std::string msg = errMsg;
+            sqlite3_free(errMsg);
+            sqlite3_close(db);
+            throw std::runtime_error("Failed to insert data: " + msg);
+        }
+    }
+
+    // Ensure all data is flushed to disk (important for WAL mode)
+    sqlite3_exec(db, "PRAGMA wal_checkpoint(FULL);", 0, 0, 0);
+
+    sqlite3_close(db);
+}
+
+// Defines to replace inline JSON in EXPECT_CALLs
+#define EXPECT_CALL_HARDWARE_JSON R"({"serial_number":"Intel Corporation", "cpu_speed":2904,"cpu_cores":2,"cpu_name":"Intel(R) Core(TM) i5-9400 CPU @ 2.90GHz", "memory_free":1000000,"memory_total":4000000,"memory_used":3000000})"
+#define EXPECT_CALL_OS_JSON R"({"architecture":"x86_64", "hostname":"UBUNTU","os_build":"7601","os_major":"6","os_minor":"1","os_name":"Microsoft Windows 7","os_display_version":"sp1","os_full":"Microsoft Windows 7 sp1","os_version":"6.1.7601","os_kernel_release":"6.1.7601","os_type":"windows"})"
+#define EXPECT_CALL_NETWORKS_JSON R"({"iface":[{"network_ip":"127.0.0.1", "host_mac":"d4:5d:64:51:07:5d", "network_gateway":"192.168.0.1|600","network_broadcast":"127.255.255.255", "interface_mtu":1500, "interface_name":"enp4s0", "interface_alias":" ", "interface_type":"ethernet", "interface_state":"up", "network_dhcp":0,"network_metric":"75","network_netmask":"255.0.0.0","network_type":"IPv4","host_network_ingress_bytes":0,"host_network_ingress_drops":0,"host_network_ingress_errors":0,"host_network_ingress_packages":0,"host_network_egress_bytes":0,"host_network_egress_drops":0,"host_network_egress_errors":0,"host_network_egress_packages":0, "IPv4":[{"network_ip":"192.168.153.1","network_broadcast":"192.168.153.255","network_dhcp":0,"network_metric":" ","network_netmask":"255.255.255.0"}], "IPv6":[{"network_ip":"fe80::250:56ff:fec0:8","network_dhcp":0,"network_metric":" ","network_netmask":"ffff:ffff:ffff:ffff::"}]}]})"
+#define EXPECT_CALL_PORTS_JSON R"([{"file_inode":0,"source_ip":"127.0.0.1", "source_port":631,"process_pid":0,"process_name":"System Idle Process","network_transport":"tcp","destination_ip":"0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"listening","host_network_egress_queue":0}])"
+#define EXPECT_CALL_PORTS_ALL_JSON R"([{"file_inode":0,"source_ip":"127.0.0.1", "source_port":631,"process_pid":0,"process_name":"System Idle Process","network_transport":"udp","destination_ip":"0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"","host_network_egress_queue":0},{"file_inode":0,"source_ip":"127.0.0.1", "source_port":631,"process_pid":0,"process_name":"System Idle Process","network_transport":"tcp","destination_ip":"0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"listening","host_network_egress_queue":0}])"
+#define EXPECT_CALL_PACKAGES_JSON R"({"architecture":"amd64", "category":"x11","name":"xserver-xorg","priority":"optional","size":4111222333,"source":"xorg","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})"
+#define EXPECT_CALL_HOTFIXES_JSON R"([{"hotfix_name":"KB12345678"}])"
+#define EXPECT_CALL_PROCESSES_JSON R"({"name":"kworker/u256:2-","pid":"431625","parent_pid":2,"start":9302261,"state":"I","stime":3,"utime":0})"
+#define EXPECT_CALL_GROUPS_JSON R"([{"group_description": null, "group_id": 1, "group_id_signed": 1, "group_is_hidden": 0, "group_name": "daemon", "group_users": "daemon:pollinate:vboxadd", "group_uuid": null }])"
+#define EXPECT_CALL_USERS_JSON R"([{"host_ip":"192.168.0.84","login_status":0,"login_tty":"pts/0","login_type":"user","process_pid":"129870","user_auth_failed_count":0,"user_auth_failed_timestamp":0,"user_created":0,"user_full_name":"root","user_group_id":0,"user_group_id_signed":0,"user_groups":0,"user_home":"/root","user_id":0,"user_is_hidden":0,"user_is_remote":1,"user_last_login":"1749605216","user_name":"root","user_password_expiration_date":-1,"user_password_hash_algorithm":"y","user_password_inactive_days":-1,"user_password_last_change":1745971200.0,"user_password_max_days_between_changes":99999,"user_password_min_days_between_changes":0,"user_password_status":"active","user_password_warning_days_before_expiration":7,"user_roles":"sudo","user_shell":"/bin/bash","user_type":null,"user_uid_signed":0,"user_uuid":null}])"
+#define EXPECT_CALL_SERVICES_JSON R"([{"service_id":"wazuh-agent","service_name":"Wazuh Agent","service_description":"Monitors system activity","service_state":"running","service_sub_state":"subState","service_start_type":"auto","service_type":"type","process_pid":1234,"service_exit_code":0,"service_win32_exit_code":0,"process_executable":"/usr/bin/wazuh-agent","service_address":"/lib/systemd/system/wazuh-agent.service","user_name":"root","service_enabled":"enabled","service_following":"following","service_object_path":"objectPath","service_target_ephemeral_id":0,"service_target_type":"jobType","service_target_address":"jobPath","file_path":"sourcePath"}])"
+#define EXPECT_CALL_BROWSER_EXTENSIONS_JSON R"([{"browser_name":"chrome","user_id":"S-1-5-21-1234567890-987654321-1122334455-1001","package_name":"uBlock Origin","package_id":"cjpalhdlnbpafiamejdnhcphjbkeiagm","package_version_":"1.52.2","package_description":"Finally, an efficient wide-spectrum content blocker. Easy on CPU and memory.","package_vendor":"Raymond Hill","package_build_version":"","package_path":"C:\\Users\\john.doe\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Extensions\\cjpalhdlnbpafiamejdnhcphjbkeiagm\\1.52.2_0","browser_profile_name":"Default","browser_profile_path":"C:\\Users\\john.doe\\AppData\\Local\\Google\\Chrome\\User Data\\Default","package_reference":"https://clients2.google.com/service/update2/crx","package_permissions":"[\\\"activeTab\\\",\\\"storage\\\",\\\"tabs\\\",\\\"webNavigation\\\"]","package_type":"extension","package_enabled":1,"package_visible":0,"package_autoupdate":1,"package_persistent":0,"package_from_webstore":1,"browser_profile_referenced":1,"package_installed":"1710489821000","file_hash_sha256":"a1b2c3d4e5f6789012345678901234567890abcdef123456789012345678901234","scan_time":"2020/12/28 21:49:50"}])"
+
+const auto expected_dbsync_hwinfo
+{
+    R"({"collector":"dbsync_hwinfo","data":{"event":{"changed_fields":[],"type":"created"},"host":{"cpu":{"cores":2,"name":"Intel(R) Core(TM) i5-9400 CPU @ 2.90GHz","speed":2904},"memory":{"free":1000000,"total":4000000,"usage":0.75,"used":3000000},"serial_number":"Intel Corporation"}},"module":"inventory"})"
+};
+const auto expected_dbsync_osinfo
+{
+    R"({"collector":"dbsync_osinfo","data":{"event":{"changed_fields":[],"type":"created"},"host":{"architecture":"x86_64","hostname":"UBUNTU","os":{"build":"7601","codename":null,"display_version":"sp1","full":"Microsoft Windows 7 sp1","kernel":"6.1.7601","major":"6","minor":"1","name":"Microsoft Windows 7","patch":null,"platform":null,"type":"windows","version":"6.1.7601"}}},"module":"inventory"})"
+};
+const auto expected_dbsync_network_iface
+{
+    R"({"collector":"dbsync_network_iface","data":{"event":{"changed_fields":[],"type":"created"},"host":{"mac":["d4:5d:64:51:07:5d"],"network":{"egress":{"bytes":0,"drops":0,"errors":0,"packets":0},"ingress":{"bytes":0,"drops":0,"errors":0,"packets":0}}},"interface":{"alias":null,"mtu":1500,"name":"enp4s0","state":"up","type":"ethernet"}},"module":"inventory"})"
+};
+const auto expected_dbsync_network_protocol_1
+{
+    R"({"collector":"dbsync_network_protocol","data":{"event":{"changed_fields":[],"type":"created"},"interface":{"name":"enp4s0"},"network":{"dhcp":false,"gateway":["192.168.0.1|600"],"metric":null,"type":"ipv4"}},"module":"inventory"})"
+};
+const auto expected_dbsync_network_protocol_2
+{
+    R"({"collector":"dbsync_network_protocol","data":{"event":{"changed_fields":[],"type":"created"},"interface":{"name":"enp4s0"},"network":{"dhcp":false,"gateway":["192.168.0.1|600"],"metric":null,"type":"ipv6"}},"module":"inventory"})"
+};
+const auto expected_dbsync_network_address_1
+{
+    R"({"collector":"dbsync_network_address","data":{"event":{"changed_fields":[],"type":"created"},"interface":{"name":"enp4s0"},"network":{"broadcast":null,"ip":["fe80::250:56ff:fec0:8"],"netmask":["ffff:ffff:ffff:ffff::"],"type":"1"}},"module":"inventory"})"
+};
+const auto expected_dbsync_network_address_2
+{
+    R"({"collector":"dbsync_network_address","data":{"event":{"changed_fields":[],"type":"created"},"interface":{"name":"enp4s0"},"network":{"broadcast":["192.168.153.255"],"ip":["192.168.153.1"],"netmask":["255.255.255.0"],"type":"0"}},"module":"inventory"})"
+};
+const auto expected_dbsync_ports
+{
+    R"({"collector":"dbsync_ports","data":{"destination":{"ip":["0.0.0.0"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"0"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"listening"},"network":{"transport":"tcp"},"process":{"name":"System Idle Process","pid":0},"source":{"ip":["127.0.0.1"],"port":631}},"module":"inventory"})"
+};
+const auto expected_dbsync_ports_udp
+{
+    R"({"collector":"dbsync_ports","data":{"destination":{"ip":["0.0.0.0"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"0"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp"},"process":{"name":"System Idle Process","pid":0},"source":{"ip":["127.0.0.1"],"port":631}},"module":"inventory"})"
+};
+const auto expected_dbsync_processes
+{
+    R"({"collector":"dbsync_processes","data":{"event":{"changed_fields":[],"type":"created"},"process":{"args":null,"args_count":null,"command_line":null,"name":"kworker/u256:2-","parent":{"pid":2},"pid":431625,"start":9302261,"state":"I","stime":3,"utime":0}},"module":"inventory"})"
+};
+const auto expected_dbsync_packages
+{
+    R"({"collector":"dbsync_packages","data":{"event":{"changed_fields":[],"type":"created"},"package":{"architecture":"amd64","category":"x11","description":null,"installed":null,"multiarch":null,"name":"xserver-xorg","path":null,"priority":"optional","size":4111222333,"source":"xorg","type":"deb","vendor":null,"version":"1:7.7+19ubuntu14"}},"module":"inventory"})"
+};
+const auto expected_dbsync_hotfixes
+{
+    R"({"collector":"dbsync_hotfixes","data":{"event":{"changed_fields":[],"type":"created"},"package":{"hotfix":{"name":"KB12345678"}}},"module":"inventory"})"
+};
+const auto expected_dbsync_groups
+{
+    R"({"collector":"dbsync_groups","data":{"event":{"changed_fields":[],"type":"created"},"group":{"description":null,"id":1,"id_signed":1,"is_hidden":false,"name":"daemon","users":["daemon:pollinate:vboxadd"],"uuid":null}},"module":"inventory"})"
+};
+const auto expected_dbsync_users
+{
+    R"({"collector":"dbsync_users","data":{"event":{"changed_fields":[],"type":"created"},"host":{"ip":["192.168.0.84"]},"login":{"status":false,"tty":"pts/0","type":"user"},"process":{"pid":"129870"},"user":{"auth_failures":{"count":0,"timestamp":0},"created":0,"full_name":"root","group":{"id":0,"id_signed":0},"groups":[0],"home":"/root","id":"0","is_hidden":false,"is_remote":true,"last_login":"1749605216","name":"root","password":{"expiration_date":-1,"hash_algorithm":"y","inactive_days":-1,"last_change":1745971200.0,"max_days_between_changes":99999,"min_days_between_changes":0,"status":"active","warning_days_before_expiration":7},"roles":["sudo"],"shell":"/bin/bash","type":null,"uid_signed":0,"uuid":null}},"module":"inventory"})"
+};
+const auto expected_dbsync_services
+{
+    R"({"collector":"dbsync_services","data":{"error":{"log":{"file":{"path":null}}},"event":{"changed_fields":[],"type":"created"},"file":{"path":"sourcePath"},"log":{"file":{"path":null}},"process":{"args":null,"executable":"/usr/bin/wazuh-agent","group":{"name":null},"pid":1234,"root_directory":null,"user":{"name":null},"working_directory":null},"service":{"address":"/lib/systemd/system/wazuh-agent.service","description":"Monitors system activity","enabled":"enabled","exit_code":0,"following":"following","frequency":null,"id":"wazuh-agent","inetd_compatibility":null,"name":"Wazuh Agent","object_path":"objectPath","restart":null,"start_type":"auto","starts":{"on_mount":null,"on_not_empty_directory":null,"on_path_modified":null},"state":"running","sub_state":"subState","target":{"address":"jobPath","ephemeral_id":"0","type":"jobType"},"type":"type","win32_exit_code":0}},"module":"inventory"})"
+};
+const auto expected_dbsync_browser_extensions
+{
+    R"({"collector":"dbsync_browser_extensions","data":{"browser":{"name":"chrome","profile":{"name":"Default","path":"C:\\Users\\john.doe\\AppData\\Local\\Google\\Chrome\\User Data\\Default","referenced":true}},"event":{"changed_fields":[],"type":"created"},"file":{"hash":{"sha256":"a1b2c3d4e5f6789012345678901234567890abcdef123456789012345678901234"}},"package":{"autoupdate":true,"build_version":null,"description":"Finally, an efficient wide-spectrum content blocker. Easy on CPU and memory.","enabled":true,"from_webstore":true,"id":"cjpalhdlnbpafiamejdnhcphjbkeiagm","installed":1710489821000,"name":"uBlock Origin","path":"C:\\Users\\john.doe\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Extensions\\cjpalhdlnbpafiamejdnhcphjbkeiagm\\1.52.2_0","permissions":["[\\\"activeTab\\\"","\\\"storage\\\"","\\\"tabs\\\"","\\\"webNavigation\\\"]"],"persistent":false,"reference":"https://clients2.google.com/service/update2/crx","type":"extension","vendor":"Raymond Hill","version":"1.52.2","visible":false},"user":{"id":"S-1-5-21-1234567890-987654321-1122334455-1001"}},"module":"inventory"})"
+};
+
+void SyscollectorImpTest::SetUp()
+{
+    std::remove(SYSCOLLECTOR_TEST_DB_PATH);
+
+    // Initialize SchemaValidatorFactory with mocks to prevent issues in Wine/Windows tests
+    // This ensures all tests use mock validators instead of loading real embedded schemas
+    m_mockValidator = std::make_shared<MockSchemaValidatorEngine>();
+    SchemaValidator::ValidationResult successResult;
+    successResult.isValid = true;
+
+    EXPECT_CALL(*m_mockValidator, validate(testing::An<const std::string&>()))
+    .WillRepeatedly(testing::Return(successResult));
+    EXPECT_CALL(*m_mockValidator, validate(testing::An<const nlohmann::json&>()))
+    .WillRepeatedly(testing::Return(successResult));
+    EXPECT_CALL(*m_mockValidator, getSchemaName())
+    .WillRepeatedly(testing::Return("mock-validator"));
+
+    // Inject mock validators for all indices
+    std::map<std::string, std::shared_ptr<SchemaValidator::ISchemaValidatorEngine>> mockValidators;
+    mockValidators["wazuh-states-inventory-hardware"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-system"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-interfaces"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-protocols"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-networks"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-ports"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-packages"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-processes"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-hotfixes"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-groups"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-users"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-services"] = m_mockValidator;
+    mockValidators["wazuh-states-inventory-browser-extensions"] = m_mockValidator;
+
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+    SchemaValidator::SchemaValidatorFactory::getInstance().initialize(mockValidators);
+};
+
+void SyscollectorImpTest::TearDown()
+{
+    std::remove(SYSCOLLECTOR_TEST_DB_PATH);
+
+    // Ensure Syscollector singleton is destroyed after each test
+    // This prevents stale function pointer issues between tests
+    Syscollector::instance().destroy();
+
+    // Clean up SchemaValidatorFactory after each test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+};
+
+using ::testing::_;
+using ::testing::Return;
+
+class CallbackMock
+{
+    public:
+        CallbackMock() = default;
+        ~CallbackMock() = default;
+        MOCK_METHOD(void, callbackMock, (const std::string&), ());
+};
+
+class CallbackMockPersist
+{
+    public:
+        CallbackMockPersist() = default;
+        ~CallbackMockPersist() = default;
+        MOCK_METHOD(void, callbackMock, (const std::string&, Operation_t, const std::string&, const std::string&, uint64_t), ());
+};
+
+void reportFunction(const std::string& /*payload*/)
+{
+    //std::cout << payload << std::endl;
+}
+
+void persistFunction(const std::string&, Operation_t, const std::string&, const std::string& /*payload*/, uint64_t /*version*/)
+{
+    // std::cout << payload << std::endl;
+}
+
+void logFunction(const modules_log_level_t /*level*/, const std::string& /*log*/)
+{
+    //static const std::map<modules_log_level_t, std::string> s_logStringMap
+    // {
+    //     {LOG_ERROR, "ERROR"},
+    //     {LOG_INFO, "INFO"},
+    //     {LOG_DEBUG, "DEBUG"},
+    //     {LOG_DEBUG_VERBOSE, "DEBUG2"}
+    // };
+    // std::cout << s_logStringMap.at(level) << ": " << log << std::endl;
+}
+
+// Log capturing structure for testing
+struct LogEntry
+{
+    modules_log_level_t level;
+    std::string message;
+};
+
+class LogCapture
+{
+    public:
+        std::vector<LogEntry> logs;
+
+        void clear()
+        {
+            logs.clear();
+        }
+
+        void capture(modules_log_level_t level, const std::string& message)
+        {
+            logs.push_back({level, message});
+        }
+
+        bool contains(modules_log_level_t level, const std::string& substring) const
+        {
+            for (const auto& entry : logs)
+            {
+                if (entry.level == level && entry.message.find(substring) != std::string::npos)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        size_t count(modules_log_level_t level) const
+        {
+            size_t cnt = 0;
+
+            for (const auto& entry : logs)
+            {
+                if (entry.level == level)
+                {
+                    cnt++;
+                }
+            }
+
+            return cnt;
+        }
+};
+
+static bool waitUntil(const std::function<bool()>& predicate,
+                      const std::chrono::milliseconds timeout = std::chrono::milliseconds(1000))
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        if (predicate())
+        {
+            return true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    return predicate();
+}
+
+// Expected results for persist callback - shared across all tests
+static const auto expectedPersistHW
+{
+    R"({"checksum":{"hash":{"sha1":"05de049f5eaaf072b338a135039930089535cdc4"}},"host":{"cpu":{"cores":2,"name":"Intel(R) Core(TM) i5-9400 CPU @ 2.90GHz","speed":2904},"memory":{"free":1000000,"total":4000000,"usage":0.75,"used":3000000},"serial_number":"Intel Corporation"}})"
+};
+static const auto expectedPersistOS
+{
+    R"({"checksum":{"hash":{"sha1":"d320a2a019f99d06b7019020bdf710ba4d609088"}},"host":{"architecture":"x86_64","hostname":"UBUNTU","os":{"build":"7601","codename":null,"display_version":"sp1","full":"Microsoft Windows 7 sp1","kernel":"6.1.7601","major":"6","minor":"1","name":"Microsoft Windows 7","patch":null,"platform":null,"type":"windows","version":"6.1.7601"}}})"
+};
+static const auto expectedPersistNetIface
+{
+    R"({"checksum":{"hash":{"sha1":"81571a9a6ac1018501f851021ac837fd205bdc57"}},"host":{"mac":["d4:5d:64:51:07:5d"],"network":{"egress":{"bytes":0,"drops":0,"errors":0,"packets":0},"ingress":{"bytes":0,"drops":0,"errors":0,"packets":0}}},"interface":{"alias":null,"mtu":1500,"name":"enp4s0","state":"up","type":"ethernet"}})"
+};
+static const auto expectedPersistNetProtoIPv4
+{
+    R"({"checksum":{"hash":{"sha1":"50f3c227c2278cdf43b6107da8455901a09dfa49"}},"interface":{"name":"enp4s0"},"network":{"dhcp":false,"gateway":["192.168.0.1|600"],"metric":null,"type":"ipv4"}})"
+};
+static const auto expectedPersistNetAddrIPv4
+{
+    R"({"checksum":{"hash":{"sha1":"24ecdd6a316b2320c809085106812f6cf8a4cf67"}},"interface":{"name":"enp4s0"},"network":{"broadcast":["192.168.153.255"],"ip":["192.168.153.1"],"netmask":["255.255.255.0"],"type":"0"}})"
+};
+static const auto expectedPersistNetProtoIPv6
+{
+    R"({"checksum":{"hash":{"sha1":"53a9aa90a75f0264beae6beb9bf19192cfc23df1"}},"interface":{"name":"enp4s0"},"network":{"dhcp":false,"gateway":["192.168.0.1|600"],"metric":null,"type":"ipv6"}})"
+};
+static const auto expectedPersistNetAddrIPv6
+{
+    R"({"checksum":{"hash":{"sha1":"7271714e0616caea85422916dd6ab2fbdac2b5cd"}},"interface":{"name":"enp4s0"},"network":{"broadcast":null,"ip":["fe80::250:56ff:fec0:8"],"netmask":["ffff:ffff:ffff:ffff::"],"type":"1"}})"
+};
+static const auto expectedPersistPorts
+{
+    R"({"checksum":{"hash":{"sha1":"7223807075622557e855677b47f23f321091353c"}},"destination":{"ip":["0.0.0.0"],"port":0},"file":{"inode":"0"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"listening"},"network":{"transport":"tcp"},"process":{"name":"System Idle Process","pid":0},"source":{"ip":["127.0.0.1"],"port":631}})"
+};
+static const auto expectedPersistPortsUdp
+{
+    R"({"checksum":{"hash":{"sha1":"dff9e7c5127ea90f4e9c38840683330b8c1351c9"}},"destination":{"ip":["0.0.0.0"],"port":0},"file":{"inode":"0"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp"},"process":{"name":"System Idle Process","pid":0},"source":{"ip":["127.0.0.1"],"port":631}})"
+};
+static const auto expectedPersistProcess
+{
+    R"({"checksum":{"hash":{"sha1":"e4f22515111f6059c067d8602289786e90855a1e"}},"process":{"args":null,"args_count":null,"command_line":null,"name":"kworker/u256:2-","parent":{"pid":2},"pid":431625,"start":9302261,"state":"I","stime":3,"utime":0}})"
+};
+static const auto expectedPersistPackage
+{
+    R"({"checksum":{"hash":{"sha1":"ca4acded6b5f748d7b812b535877b56fc2f9365e"}},"package":{"architecture":"amd64","category":"x11","description":null,"installed":null,"multiarch":null,"name":"xserver-xorg","path":null,"priority":"optional","size":4111222333,"source":"xorg","type":"deb","vendor":null,"version":"1:7.7+19ubuntu14"}})"
+};
+static const auto expectedPersistHotfix
+{
+    R"({"checksum":{"hash":{"sha1":"759c555df92c606e73b435e5e768d692b9815e29"}},"package":{"hotfix":{"name":"KB12345678"}}})"
+};
+static const auto expectedPersistGroup
+{
+    R"({"checksum":{"hash":{"sha1":"81793e529c565256a60eff6c6345e2f5c5ee8cb0"}},"group":{"description":null,"id":1,"id_signed":1,"is_hidden":false,"name":"daemon","users":["daemon:pollinate:vboxadd"],"uuid":null}})"
+};
+static const auto expectedPersistUser
+{
+    R"({"checksum":{"hash":{"sha1":"11769088416d594d547a508e084cec990e282ece"}},"host":{"ip":["192.168.0.84"]},"login":{"status":false,"tty":"pts/0","type":"user"},"process":{"pid":"129870"},"user":{"auth_failures":{"count":0,"timestamp":0},"created":0,"full_name":"root","group":{"id":0,"id_signed":0},"groups":[0],"home":"/root","id":"0","is_hidden":false,"is_remote":true,"last_login":"1749605216","name":"root","password":{"expiration_date":-1,"hash_algorithm":"y","inactive_days":-1,"last_change":1745971200.0,"max_days_between_changes":99999,"min_days_between_changes":0,"status":"active","warning_days_before_expiration":7},"roles":["sudo"],"shell":"/bin/bash","type":null,"uid_signed":0,"uuid":null}})"
+};
+static const auto expectedPersistService
+{
+    R"({"checksum":{"hash":{"sha1":"daa615e783788aec35ae17eeed912ace3910f209"}},"error":{"log":{"file":{"path":null}}},"file":{"path":"sourcePath"},"log":{"file":{"path":null}},"process":{"args":null,"executable":"/usr/bin/wazuh-agent","group":{"name":null},"pid":1234,"root_directory":null,"user":{"name":null},"working_directory":null},"service":{"address":"/lib/systemd/system/wazuh-agent.service","description":"Monitors system activity","enabled":"enabled","exit_code":0,"following":"following","frequency":null,"id":"wazuh-agent","inetd_compatibility":null,"name":"Wazuh Agent","object_path":"objectPath","restart":null,"start_type":"auto","starts":{"on_mount":null,"on_not_empty_directory":null,"on_path_modified":null},"state":"running","sub_state":"subState","target":{"address":"jobPath","ephemeral_id":"0","type":"jobType"},"type":"type","win32_exit_code":0}})"
+};
+static const auto expectedPersistBrowserExtension
+{
+    R"({"browser":{"name":"chrome","profile":{"name":"Default","path":"C:\\Users\\john.doe\\AppData\\Local\\Google\\Chrome\\User Data\\Default","referenced":true}},"checksum":{"hash":{"sha1":"5c01aa0a10c0347b5373039e38518a506515ba58"}},"file":{"hash":{"sha256":"a1b2c3d4e5f6789012345678901234567890abcdef123456789012345678901234"}},"package":{"autoupdate":true,"build_version":null,"description":"Finally, an efficient wide-spectrum content blocker. Easy on CPU and memory.","enabled":true,"from_webstore":true,"id":"cjpalhdlnbpafiamejdnhcphjbkeiagm","installed":1710489821000,"name":"uBlock Origin","path":"C:\\Users\\john.doe\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Extensions\\cjpalhdlnbpafiamejdnhcphjbkeiagm\\1.52.2_0","permissions":["[\\\"activeTab\\\"","\\\"storage\\\"","\\\"tabs\\\"","\\\"webNavigation\\\"]"],"persistent":false,"reference":"https://clients2.google.com/service/update2/crx","type":"extension","vendor":"Raymond Hill","version":"1.52.2","visible":false},"user":{"id":"S-1-5-21-1234567890-987654321-1122334455-1001"}})"
+};
+
+TEST_F(SyscollectorImpTest, defaultCtor)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules enabled in this test
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    // Note: Mock validators are automatically initialized in SetUp() to prevent Wine issues
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, intervalSeconds)
+{
+#ifdef WIN32
+    GTEST_SKIP() << "Skipping intervalSeconds test on Windows due to sync protocol issues in Wine environment";
+#endif
+    const auto spInfoWrapper {std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(R"([{"hotfix":"KB12345678"},{"hotfix":"KB87654321"}])"_json));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(::testing::AtLeast(2)).WillRepeatedly(testing::InvokeArgument<0>(nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON)));
+
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .Times(::testing::AtLeast(2))
+    .WillRepeatedly(::testing::InvokeArgument<0>
+                    (R"({"name":"TEXT", "version_":"TEXT", "vendor":"TEXT", "installed":"TEXT", "path":"TEXT", "architecture":"TEXT", "category":"TEXT", "description":"TEXT", "size":"TEXT", "priority":"TEXT", "multiarch":"TEXT", "source":"TEXT", "os_patch":"TEXT"})"_json));
+
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    std::thread t
+    {
+        [&spInfoWrapper]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          reportFunction,
+                                          persistFunction,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          1, true, true, true, true, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds{10});
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noScanOnStart)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, networks()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, users()).Times(0);
+
+    std::thread t
+    {
+        [&spInfoWrapper]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          reportFunction,
+                                          persistFunction,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, false);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+// releaseResources() must explicitly release the ISysInfo implementation's per-thread
+// resources (on Windows: the hotfixes() COM context) on this thread, before m_spInfo is
+// destroyed -- instead of relying on automatic thread_local teardown at thread exit,
+// which used to fault with a null `this` inside sysinfo.dll every time the syscollector
+// worker thread exited. This mirrors the exact call path wm_sys_main() takes: start() and
+// releaseResources() run sequentially on the same worker thread, while quiesce() (the
+// stop signal) is issued from a different, control thread -- so releaseThreadResources()
+// must land on the thread that actually owns the per-thread resources, not the caller's.
+TEST_F(SyscollectorImpTest, releaseResourcesReleasesSysInfoThreadResourcesOnStartThread)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, networks()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, users()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          reportFunction,
+                                          persistFunction,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, false);
+
+            Syscollector::instance().start();
+
+            // Same-thread sequencing as wm_sys_main(): releaseResources() runs on the
+            // worker thread right after start() returns, before the thread exits.
+            Syscollector::instance().releaseResources();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+
+    // Issued from the test/control thread, like wm_sys_stop() does in production.
+    Syscollector::instance().quiesce();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noHardware)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Hardware (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, true, true, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+}
+
+TEST_F(SyscollectorImpTest, noOs)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except OS (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, true, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noNetwork)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Network (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, false, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noPackages)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Packages (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, false, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noPorts)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Ports (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, false, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noPortsAll)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_ALL_JSON)));
+
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports_udp)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except PortsAll
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPortsUdp, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, false, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noProcesses)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Processes (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, false, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noHotfixes)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Hotfixes (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, false, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noUsers)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Users (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, true, false, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noGroups)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Groups (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, false, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noServices)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules except Services (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, true, true, false, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, noBrowserExtensions)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).Times(0);
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+
+    // All modules except Browser Extensions (disabled in this test)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, true, true, true, false, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, portAllEnable)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(R"(
+    [
+        {
+            "destination_ip":"0.0.0.0",
+            "destination_port":0,
+            "file_inode":43481,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"",
+            "network_transport":"udp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"0.0.0.0",
+            "source_port":47748
+        },
+        {
+            "destination_ip":"::",
+            "destination_port":0,
+            "file_inode":43482,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"",
+            "network_transport":"udp6",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"::",
+            "source_port":51087
+        },
+        {
+            "destination_ip":"0.0.0.0",
+            "destination_port":0,
+            "file_inode":50324,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"listening",
+            "network_transport":"tcp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"127.0.0.1",
+            "source_port":33060
+        },
+        {
+            "destination_ip":"44.238.116.130",
+            "destination_port":443,
+            "file_inode":122575,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"established",
+            "network_transport":"tcp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"192.168.0.104",
+            "source_port":39106
+        },
+        {
+            "destination_ip":"44.238.116.130",
+            "destination_port":443,
+            "file_inode":122575,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"established",
+            "network_transport":"tcp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"192.168.0.104",
+            "source_port":39106
+        }
+    ])")));
+
+    CallbackMock wrapper;
+    std::function<void(const std::string&)> callbackData
+    {
+        [&wrapper](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapper.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    const auto expectedResult1
+    {
+        R"({"collector":"dbsync_ports","data":{"destination":{"ip":["0.0.0.0"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"43481"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp"},"process":{"name":null,"pid":0},"source":{"ip":["0.0.0.0"],"port":47748}},"module":"inventory"})"
+    };
+
+    const auto expectedResult2
+    {
+        R"({"collector":"dbsync_ports","data":{"destination":{"ip":["::"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"43482"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp6"},"process":{"name":null,"pid":0},"source":{"ip":["::"],"port":51087}},"module":"inventory"})"
+    };
+
+    const auto expectedResult3
+    {
+        R"({"collector":"dbsync_ports","data":{"destination":{"ip":["0.0.0.0"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"50324"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"listening"},"network":{"transport":"tcp"},"process":{"name":null,"pid":0},"source":{"ip":["127.0.0.1"],"port":33060}},"module":"inventory"})"
+    };
+
+    const auto expectedResult4
+    {
+        R"({"collector":"dbsync_ports","data":{"destination":{"ip":["44.238.116.130"],"port":443},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"122575"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"established"},"network":{"transport":"tcp"},"process":{"name":null,"pid":0},"source":{"ip":["192.168.0.104"],"port":39106}},"module":"inventory"})"
+    };
+
+    EXPECT_CALL(wrapper, callbackMock(expectedResult1)).Times(1);
+    EXPECT_CALL(wrapper, callbackMock(expectedResult2)).Times(1);
+    EXPECT_CALL(wrapper, callbackMock(expectedResult3)).Times(1);
+    EXPECT_CALL(wrapper, callbackMock(expectedResult4)).Times(1);
+
+    const auto expectedPersistPorts1
+    {
+        R"({"checksum":{"hash":{"sha1":"88b40f1347d9ef9d381287b00c9e924e800a25f7"}},"destination":{"ip":["0.0.0.0"],"port":0},"file":{"inode":"43481"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp"},"process":{"name":null,"pid":0},"source":{"ip":["0.0.0.0"],"port":47748}})"
+    };
+
+    const auto expectedPersistPorts2
+    {
+        R"({"checksum":{"hash":{"sha1":"62a2fc1c9277988df156c208c2a7897b1fb41236"}},"destination":{"ip":["::"],"port":0},"file":{"inode":"43482"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp6"},"process":{"name":null,"pid":0},"source":{"ip":["::"],"port":51087}})"
+    };
+
+    const auto expectedPersistPorts3
+    {
+        R"({"checksum":{"hash":{"sha1":"e049eb5f4a3dbf71dc1e6bdd11a4d070459b36fe"}},"destination":{"ip":["0.0.0.0"],"port":0},"file":{"inode":"50324"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"listening"},"network":{"transport":"tcp"},"process":{"name":null,"pid":0},"source":{"ip":["127.0.0.1"],"port":33060}})"
+    };
+
+    const auto expectedPersistPorts4
+    {
+        R"({"checksum":{"hash":{"sha1":"1fcee2154ec4ad7e68c2627a731760dd72fb45ae"}},"destination":{"ip":["44.238.116.130"],"port":443},"file":{"inode":"122575"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"established"},"network":{"transport":"tcp"},"process":{"name":null,"pid":0},"source":{"ip":["192.168.0.104"],"port":39106}})"
+    };
+
+    // Only ports enabled in this test
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts1, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts2, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts3, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts4, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackData, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackData,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, false, false, true, true, false, false, false, false, false, false, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, portAllDisable)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(R"(
+    [
+        {
+            "destination_ip":"0.0.0.0",
+            "destination_port":0,
+            "file_inode":43481,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"",
+            "network_transport":"udp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"0.0.0.0",
+            "source_port":47748
+        },
+        {
+            "destination_ip":"::",
+            "destination_port":0,
+            "file_inode":43482,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"",
+            "network_transport":"udp6",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"::",
+            "source_port":51087
+        },
+        {
+            "destination_ip":"0.0.0.0",
+            "destination_port":0,
+            "file_inode":50324,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"listening",
+            "network_transport":"tcp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"127.0.0.1",
+            "source_port":33060
+        },
+        {
+            "destination_ip":"0.0.0.0",
+            "destination_port":0,
+            "file_inode":50324,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"listening",
+            "network_transport":"tcp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"127.0.0.1",
+            "source_port":33060
+        },
+        {
+            "destination_ip":"44.238.116.130",
+            "destination_port":443,
+            "file_inode":122575,
+            "host_network_egress_queue":0,
+            "host_network_ingress_queue":0,
+            "interface_state":"established",
+            "network_transport":"tcp",
+            "process_name":"",
+            "process_pid":0,
+            "source_ip":"192.168.0.104",
+            "source_port":39106
+        }
+    ])")));
+
+    CallbackMock wrapper;
+    std::function<void(const std::string&)> callbackData
+    {
+        [&wrapper](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapper.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    const auto expectedResult1
+    {
+        R"({"collector":"dbsync_ports","data":{"destination":{"ip":["0.0.0.0"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"43481"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp"},"process":{"name":null,"pid":0},"source":{"ip":["0.0.0.0"],"port":47748}},"module":"inventory"})"
+    };
+
+    const auto expectedResult2
+    {
+        R"({"collector":"dbsync_ports","data":{"destination":{"ip":["::"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"43482"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp6"},"process":{"name":null,"pid":0},"source":{"ip":["::"],"port":51087}},"module":"inventory"})"
+    };
+
+    const auto expectedResult3
+    {
+        R"({"collector":"dbsync_ports","data":{"destination":{"ip":["0.0.0.0"],"port":0},"event":{"changed_fields":[],"type":"created"},"file":{"inode":"50324"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"listening"},"network":{"transport":"tcp"},"process":{"name":null,"pid":0},"source":{"ip":["127.0.0.1"],"port":33060}},"module":"inventory"})"
+    };
+
+    EXPECT_CALL(wrapper, callbackMock(expectedResult1)).Times(1);
+    EXPECT_CALL(wrapper, callbackMock(expectedResult2)).Times(1);
+    EXPECT_CALL(wrapper, callbackMock(expectedResult3)).Times(1);
+
+    const auto expectedPersistPorts1
+    {
+        R"({"checksum":{"hash":{"sha1":"88b40f1347d9ef9d381287b00c9e924e800a25f7"}},"destination":{"ip":["0.0.0.0"],"port":0},"file":{"inode":"43481"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp"},"process":{"name":null,"pid":0},"source":{"ip":["0.0.0.0"],"port":47748}})"
+    };
+
+    const auto expectedPersistPorts2
+    {
+        R"({"checksum":{"hash":{"sha1":"62a2fc1c9277988df156c208c2a7897b1fb41236"}},"destination":{"ip":["::"],"port":0},"file":{"inode":"43482"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":null},"network":{"transport":"udp6"},"process":{"name":null,"pid":0},"source":{"ip":["::"],"port":51087}})"
+    };
+
+    const auto expectedPersistPorts3
+    {
+        R"({"checksum":{"hash":{"sha1":"e049eb5f4a3dbf71dc1e6bdd11a4d070459b36fe"}},"destination":{"ip":["0.0.0.0"],"port":0},"file":{"inode":"50324"},"host":{"network":{"egress":{"queue":0},"ingress":{"queue":0}}},"interface":{"state":"listening"},"network":{"transport":"tcp"},"process":{"name":null,"pid":0},"source":{"ip":["127.0.0.1"],"port":33060}})"
+    };
+
+    // Only ports enabled in this test
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts1, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts2, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts3, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackData, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackData,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, false, false, true, false, false, false, false, false, false, false, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, PackagesDuplicated)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .Times(::testing::AtLeast(1))
+    .WillOnce(::testing::DoAll(
+                  ::testing::InvokeArgument<0>
+                  (R"({"architecture":"amd64", "category":"x11","name":"xserver-xorg","priority":"optional","size":4111222333,"source":"xorg","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})"_json),
+                  ::testing::InvokeArgument<0>
+                  (R"({"architecture":"amd64", "category":"x11","name":"xserver-xorg","priority":"optional","size":4111222333,"source":"xorg","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})"_json)));
+
+    CallbackMock wrapper;
+    std::function<void(const std::string&)> callbackData
+    {
+        [&wrapper](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapper.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapper, callbackMock(expected_dbsync_packages)).Times(1);
+
+    // Only packages enabled in this test
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackData, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackData,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, false, true, false, false, false, false, false, false, false, false, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, sanitizeJsonValues)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(
+                                                                      R"({"serial_number":" Intel Corporation", "cpu_speed":2904,"cpu_cores":2,"cpu_name":" Intel(R) Core(TM) i5-9400 CPU @ 2.90GHz ", "memory_free":1000000,"memory_total":4000000,"memory_used":3000000})")));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(
+                                                                R"({"architecture":" x86_64", "hostname":" UBUNTU ","os_build":"  7601","os_major":"6  ","os_minor":"  1  ","os_name":" Microsoft Windows 7 ","os_display_version":"   sp1","os_full":" Microsoft Windows 7 sp1  ","os_version":"6.1.7601   ","os_kernel_release":"  6.1.7601 ","os_kernel_name":" Windows_NT ","os_kernel_version":" 6.1 ","os_type":" windows "})")));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(
+                                                                      R"({"iface":[{"network_ip":"127.0.0.1", "host_mac":"d4:5d:64:51:07:5d", "network_gateway":"192.168.0.1|600","network_broadcast":"127.255.255.255", "interface_name":"enp4s0", "interface_alias":" ", "interface_type":"   ethernet", "interface_state":"up   ", "network_dhcp":0,"interface_mtu":1500,"host_network_ingress_bytes":0,"host_network_ingress_drops":0,"host_network_ingress_errors":0,"host_network_ingress_packages":0,"host_network_egress_bytes":0,"host_network_egress_drops":0,"host_network_egress_errors":0,"host_network_egress_packages":0, "IPv4":[{"network_ip":"192.168.153.1","network_broadcast":"192.168.153.255","network_dhcp":0,"network_metric":" ","network_netmask":"255.255.255.0"}], "IPv6":[{"network_ip":"fe80::250:56ff:fec0:8","network_dhcp":0,"network_metric":" ","network_netmask":"ffff:ffff:ffff:ffff::"}]}]})")));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(
+                                                                   R"([{"file_inode":0,"source_ip":" 127.0.0.1 ", "source_port":631,"process_pid":0,"process_name":"System Idle Process","network_transport":"tcp   ","destination_ip":"   0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"listening","host_network_egress_queue":0}])")));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .Times(::testing::AtLeast(1))
+    .WillOnce(::testing::InvokeArgument<0>
+              (R"({"architecture":" amd64", "category":"  x11  ","name":" xserver-xorg","priority":"optional ","size":4111222333,"source":"xorg","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})"_json));
+
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(R"([{"hotfix_name":" KB12345678 "}])"_json));
+
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .Times(testing::AtLeast(1))
+    .WillOnce(::testing::InvokeArgument<0>
+              (R"({"name":" kworker/u256:2-  ","pid":"431625","parent_pid":2,"start":9302261,"state":"I","stime":3,"utime":0})"_json));
+
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(
+                                                             R"([{"group_description": null, "group_id": 1, "group_id_signed": 1, "group_is_hidden": 0, "group_name": "daemon", "group_users": "daemon:pollinate:vboxadd", "group_uuid": null }])"_json));
+
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return
+                                                        (R"([{"host_ip":"192.168.0.84","login_status":0,"login_tty":"pts/0","login_type":"user","process_pid":"129870","user_auth_failed_count":0,"user_auth_failed_timestamp":0,"user_created":0,"user_full_name":"root","user_group_id":0,"user_group_id_signed":0,"user_groups":0,"user_home":"/root","user_id":0,"user_is_hidden":0,"user_is_remote":1,"user_last_login":"1749605216","user_name":"root","user_password_expiration_date":-1,"user_password_hash_algorithm":"y","user_password_inactive_days":-1,"user_password_last_change":1745971200.0,"user_password_max_days_between_changes":99999,"user_password_min_days_between_changes":0,"user_password_status":"active","user_password_warning_days_before_expiration":7,"user_roles":"sudo","user_shell":"/bin/bash","user_type":null,"user_uid_signed":0,"user_uuid":null}])"_json));
+
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            auto delta = nlohmann::json::parse(data);
+
+            if (delta.contains("data") && delta["data"].contains("event") && delta["data"]["event"].contains("created"))
+            {
+                delta["data"]["event"].erase("created");
+            }
+
+            wrapperDelta.callbackMock(delta.dump());
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto persist = nlohmann::json::parse(data);
+
+            // Validate that state object exists and contains document_version
+            if (persist.contains("state"))
+            {
+                EXPECT_TRUE(persist["state"].contains("document_version"));
+                EXPECT_TRUE(persist["state"].contains("modified_at"));
+                // Validate document_version is a positive integer
+                EXPECT_TRUE(persist["state"]["document_version"].is_number_integer());
+                EXPECT_GT(persist["state"]["document_version"].get<int>(), 0);
+                // Remove state before comparing with expected values (since modified_at is dynamic)
+                persist.erase("state");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, persist.dump(), version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hwinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_osinfo)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_iface)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_protocol_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_1)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_network_address_2)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_ports)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_processes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_packages)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_hotfixes)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_groups)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_users)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_services)).Times(1);
+    EXPECT_CALL(wrapperDelta, callbackMock(expected_dbsync_browser_extensions)).Times(1);
+
+    // All modules enabled in this test
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHW, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistOS, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetIface, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv4, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetProtoIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistNetAddrIPv6, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPorts, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistProcess, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistPackage, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistHotfix, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistGroup, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistUser, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistService, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, expectedPersistBrowserExtension, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, sanitizeJsonValuesReplacesInvalidUtf8)
+{
+    // A process can set its name to arbitrary bytes, which then reach the ports inventory.
+    auto ports = nlohmann::json::parse(
+                     R"([{"file_inode":43481,"source_ip":"0.0.0.0","source_port":47748,"process_pid":1234,"network_transport":"udp","destination_ip":"0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"","host_network_egress_queue":0}])");
+    ports[0]["process_name"] = std::string {"evil\xFF"};
+
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(ports));
+
+    CallbackMock wrapper;
+    std::function<void(const std::string&)> callbackData
+    {
+        [&wrapper](const std::string & data)
+        {
+            wrapper.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    const std::string expectedName {R"("name":"evil)" "\xEF\xBF\xBD" R"(")"};
+
+    EXPECT_CALL(wrapper, callbackMock(testing::HasSubstr(expectedName))).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, testing::HasSubstr(expectedName), testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackData, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackData,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, false, false, true, true, false, false, false, false, false, false, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+// ========================================
+// Tests for query method and coordination commands
+// ========================================
+
+TEST_F(SyscollectorImpTest, queryCommandPause)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Start the module in a thread
+    std::thread t
+    {
+        []()
+        {
+            Syscollector::instance().start();
+        }
+    };
+
+    // Give it time to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Test pause command
+    std::string queryJson = R"({"command":"pause"})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+    EXPECT_TRUE(responseJson.contains("data"));
+
+    // Verify success
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["module"], "syscollector");
+    EXPECT_EQ(responseJson["data"]["action"], "pause");
+
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, queryCommandResume)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Start the module in a thread
+    std::thread t
+    {
+        []()
+        {
+            Syscollector::instance().start();
+        }
+    };
+
+    // Give it time to start
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // First pause
+    std::string pauseJson = R"({"command":"pause"})";
+    Syscollector::instance().query(pauseJson);
+
+    // Then test resume command
+    std::string queryJson = R"({"command":"resume"})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+    EXPECT_TRUE(responseJson.contains("data"));
+
+    // Verify success
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["module"], "syscollector");
+    EXPECT_EQ(responseJson["data"]["action"], "resume");
+
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, queryCommandFlushNoSyncProtocol)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Test flush command without sync protocol initialized
+    std::string queryJson = R"({"command":"flush"})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+    EXPECT_TRUE(responseJson.contains("data"));
+
+    // Verify success (flush returns 0 even if sync protocol not initialized)
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["module"], "syscollector");
+    EXPECT_EQ(responseJson["data"]["action"], "flush");
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryCommandFlushReportsCompletedError)
+{
+    const auto spInfoWrapper {std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false,
+                                  false, false, false, false, false, false, false, false);
+
+    Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 0);
+
+    // No sync intake socket is available in the test environment, so the flush
+    // synchronization fails and the query must report completed with error.
+    auto flushResponse = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"flush"})"));
+    EXPECT_EQ(flushResponse["error"], MQ_SUCCESS);
+    EXPECT_EQ(flushResponse["data"]["action"], "flush");
+
+    EXPECT_TRUE(waitUntil([]()
+    {
+        auto completedResponse =
+            nlohmann::json::parse(Syscollector::instance().query(R"({"command":"is_flush_completed"})"));
+        return completedResponse["data"]["status"] == "completed";
+    }));
+
+    auto completedResponse = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"is_flush_completed"})"));
+    EXPECT_EQ(completedResponse["data"]["status"], "completed");
+    EXPECT_EQ(completedResponse["data"]["result"], "error");
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetVersion)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, true, true, true, true, true, true, true, true, true, true, true, true, true, false);
+
+    std::thread t
+    {
+        [&spInfoWrapper]()
+        {
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for scan to complete
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Test get_version command
+    std::string queryJson = R"({"command":"get_version"})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+    EXPECT_TRUE(responseJson.contains("data"));
+
+    // Verify success
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_TRUE(responseJson["data"].contains("version"));
+    // Version should be > 0 since we did a scan
+    EXPECT_GT(responseJson["data"]["version"].get<int>(), 0);
+
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetFirstSyncCompletedDefaultsToFalse)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_first_sync_completed"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["first_sync_completed"], 0);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetFirstSyncCompletedReturnsTrueWhenMetadataExists)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    Syscollector::instance().destroy();
+
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+
+    char* errMsg = nullptr;
+    ASSERT_EQ(sqlite3_exec(db,
+                           "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('first_sync_completed', 123456);",
+                           nullptr,
+                           nullptr,
+                           &errMsg),
+              SQLITE_OK)
+            << (errMsg ? errMsg : "");
+
+    if (errMsg)
+    {
+        sqlite3_free(errMsg);
+    }
+
+    sqlite3_close(db);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_first_sync_completed"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["first_sync_completed"], 1);
+
+    Syscollector::instance().destroy();
+}
+
+
+// ── #38601: synced_agent_id marker and query ─────────────────────────────────
+//
+// An agent deleted on the manager re-enrolls under a new id while local.db -- the first-sync
+// marker in it included -- survives untouched, so every later cycle sends a delta against a
+// baseline the manager no longer has for this identity. This marker is what lets a cycle notice.
+
+TEST_F(SyscollectorImpTest, queryCommandGetSyncedAgentIdDefaultsToZero)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Zero, not an error: a database that has never recorded one is the normal state of every
+    // agent before its first cycle, and of every agent upgrading in place.
+    std::string response = Syscollector::instance().query(R"({"command":"get_synced_agent_id"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["synced_agent_id"], 0);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetSyncedAgentIdReturnsStoredValue)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    Syscollector::instance().destroy();
+
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+
+    char* errMsg = nullptr;
+    // Stored as a plain number: OS_IsValidID() has already rejected anything but at most 8
+    // digits by the time an id reaches client.keys, so it fits the INTEGER column.
+    ASSERT_EQ(sqlite3_exec(db,
+                           "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('synced_agent_id', 42);",
+                           nullptr,
+                           nullptr,
+                           &errMsg),
+              SQLITE_OK)
+            << (errMsg ? errMsg : "");
+
+    if (errMsg)
+    {
+        sqlite3_free(errMsg);
+    }
+
+    sqlite3_close(db);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_synced_agent_id"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["synced_agent_id"], 42);
+
+    Syscollector::instance().destroy();
+}
+
+// ── first_scan_completed marker and query ────────────────────────────────────
+
+TEST_F(SyscollectorImpTest, queryCommandGetFirstScanCompletedDefaultsToFalse)
+{
+    // No scan has run and no marker is present: expect first_scan_completed == 0.
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_first_scan_completed"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["first_scan_completed"], 0);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetFirstScanCompletedReturnsTrueWhenMetadataExists)
+{
+    // Seed the marker directly into the DB, then verify the query reports it.
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    Syscollector::instance().destroy();
+
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+
+    char* errMsg = nullptr;
+    ASSERT_EQ(sqlite3_exec(db,
+                           "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('first_scan_completed', 123456);",
+                           nullptr,
+                           nullptr,
+                           &errMsg),
+              SQLITE_OK)
+            << (errMsg ? errMsg : "");
+
+    if (errMsg)
+    {
+        sqlite3_free(errMsg);
+    }
+
+    sqlite3_close(db);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_first_scan_completed"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["first_scan_completed"], 1);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, scanSetsFirstScanCompletedMarkerAfterFullScan)
+{
+    // After a complete scan() the first_scan_completed marker must be written
+    // with a positive Unix timestamp.
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillRepeatedly([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillRepeatedly([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    std::thread t
+    {
+        [&spInfoWrapper]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          reportFunction,
+                                          persistFunction,
+                                          logFunction,
+                                          SYSCOLLECTOR_TEST_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify the raw timestamp was written and is non-zero.
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &db, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
+    sqlite3_stmt* stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT last_sync_time FROM table_metadata WHERE table_name='first_scan_completed';",
+                                 -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int64_t ts = sqlite3_column_int64(stmt, 0);
+    EXPECT_GT(ts, 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
+
+TEST_F(SyscollectorImpTest, scanFirstScanCompletedMarkerIsIdempotent)
+{
+    // If the marker is already set, a subsequent scan must NOT overwrite the timestamp.
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillRepeatedly([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillRepeatedly([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    constexpr int64_t PRIOR_TIMESTAMP = 111111;
+
+    // Seed the marker before the first scan.
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+    Syscollector::instance().destroy();
+
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+    char* errMsg = nullptr;
+    ASSERT_EQ(sqlite3_exec(db,
+                           "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('first_scan_completed', 111111);",
+                           nullptr, nullptr, &errMsg), SQLITE_OK)
+            << (errMsg ? errMsg : "");
+
+    if (errMsg)
+    {
+        sqlite3_free(errMsg);
+    }
+
+    sqlite3_close(db);
+
+    // Now run a full scan — the marker must NOT be overwritten.
+    std::thread t
+    {
+        [&spInfoWrapper]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          reportFunction,
+                                          persistFunction,
+                                          logFunction,
+                                          SYSCOLLECTOR_TEST_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, true, true, true, true, true, true, true, true, true, true, true, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify the original timestamp was preserved.
+    db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &db, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
+    sqlite3_stmt* stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT last_sync_time FROM table_metadata WHERE table_name='first_scan_completed';",
+                                 -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int64_t ts = sqlite3_column_int64(stmt, 0);
+    EXPECT_EQ(ts, PRIOR_TIMESTAMP);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
+
+TEST_F(SyscollectorImpTest, queryCommandSetVersion)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_NETWORKS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_PORTS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PACKAGES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HOTFIXES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .WillOnce([](const std::function<void(nlohmann::json&)>& cb)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        cb(data);
+    });
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_GROUPS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_USERS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_SERVICES_JSON)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_BROWSER_EXTENSIONS_JSON)));
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, true, true, true, true, true, true, true, true, true, true, true, true, true, false);
+
+    std::thread t
+    {
+        [&spInfoWrapper]()
+        {
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for scan to complete
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Test set_version command
+    int newVersion = 42;
+    std::string queryJson = R"({"command":"set_version","parameters":{"version":)" + std::to_string(newVersion) + R"(}})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+    EXPECT_TRUE(responseJson.contains("data"));
+
+    // Verify success
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_TRUE(responseJson["data"].contains("version"));
+    EXPECT_EQ(responseJson["data"]["version"].get<int>(), newVersion);
+
+    // Verify version was actually set
+    std::string getVersionJson = R"({"command":"get_version"})";
+    std::string getVersionResponse = Syscollector::instance().query(getVersionJson);
+    auto getVersionResponseJson = nlohmann::json::parse(getVersionResponse);
+    EXPECT_EQ(getVersionResponseJson["data"]["version"].get<int>(), newVersion);
+
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+}
+
+TEST_F(SyscollectorImpTest, queryCommandUnknown)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Test unknown command
+    std::string queryJson = R"({"command":"unknown_command"})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+    EXPECT_TRUE(responseJson.contains("data"));
+
+    // Verify error
+    EXPECT_EQ(responseJson["error"], MQ_ERR_UNKNOWN_COMMAND);
+    EXPECT_EQ(responseJson["data"]["command"], "unknown_command");
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryInvalidJson)
+{
+#ifdef WIN32
+    GTEST_SKIP() << "Skipping queryInvalidJson test on Windows due to exception handling issues in Wine environment";
+#endif
+    const auto spInfoWrapper {std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Test invalid JSON
+    std::string queryJson = "invalid json";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+
+    // Verify error
+    EXPECT_EQ(responseJson["error"], MQ_ERR_INTERNAL);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryMissingCommand)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Test missing command field
+    std::string queryJson = R"({"parameters":{"version":1}})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+
+    // Verify error
+    EXPECT_EQ(responseJson["error"], MQ_ERR_INVALID_PARAMS);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, querySetVersionMissingParameter)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Test set_version without version parameter
+    std::string queryJson = R"({"command":"set_version","parameters":{}})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+
+    // Verify error
+    EXPECT_EQ(responseJson["error"], MQ_ERR_INVALID_PARAMS);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, querySetVersionInvalidParameterType)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Test set_version with invalid parameter type (string instead of number)
+    std::string queryJson = R"({"command":"set_version","parameters":{"version":"not_a_number"}})";
+    std::string response = Syscollector::instance().query(queryJson);
+
+    // Parse response
+    auto responseJson = nlohmann::json::parse(response);
+
+    // Verify response structure
+    EXPECT_TRUE(responseJson.contains("error"));
+    EXPECT_TRUE(responseJson.contains("message"));
+
+    // Verify error
+    EXPECT_EQ(responseJson["error"], MQ_ERR_INVALID_PARAMS);
+
+    Syscollector::instance().destroy();
+}
+
+// ========================================
+// Tests for initSyncProtocol()
+// ========================================
+
+TEST_F(SyscollectorImpTest, initSyncProtocol_AllModulesEnabled)
+{
+    /**
+     * Test: Verify initSyncProtocol initializes both sync protocols correctly
+     * when all VD-relevant modules (packages, OS, hotfixes) are enabled
+     */
+
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    // Initialize with all VD-relevant modules enabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,   // scanOnStart
+                                  false,   // hardware
+                                  true,    // os (enabled)
+                                  false,   // network
+                                  true,    // packages (enabled)
+                                  false,   // ports
+                                  false,   // portsAll
+                                  false,   // processes
+#ifdef _WIN32
+                                  true,    // hotfixes (enabled on Windows)
+#else
+                                  false,   // hotfixes (not available on Linux)
+#endif
+                                  false,   // groups
+                                  false,   // users
+                                  false,   // services
+                                  false,   // browserExtensions
+                                  false);  // notifyOnFirstScan
+
+    // Test initSyncProtocol - should not throw
+    EXPECT_NO_THROW(
+    {
+        Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                 );
+    });
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, initSyncProtocol_PackagesDisabled)
+{
+    /**
+     * Test: Verify initSyncProtocol handles packages being disabled
+     * VD sync should still be enabled if OS or hotfixes are enabled
+     */
+
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    // Initialize with packages disabled but OS enabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,   // scanOnStart
+                                  false,   // hardware
+                                  true,    // os (enabled)
+                                  false,   // network
+                                  false,   // packages (disabled)
+                                  false,   // ports
+                                  false,   // portsAll
+                                  false,   // processes
+                                  false,   // hotfixes (disabled)
+                                  false,   // groups
+                                  false,   // users
+                                  false,   // services
+                                  false,   // browserExtensions
+                                  false);  // notifyOnFirstScan
+
+    // Test initSyncProtocol - should not throw
+    EXPECT_NO_THROW(
+    {
+        Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                 );
+    });
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, initSyncProtocol_OsDisabled)
+{
+    /**
+     * Test: Verify initSyncProtocol handles OS being disabled
+     * VD sync should still be enabled if packages are enabled
+     */
+
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    // Initialize with OS disabled but packages enabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,   // scanOnStart
+                                  false,   // hardware
+                                  false,   // os (disabled)
+                                  false,   // network
+                                  true,    // packages (enabled)
+                                  false,   // ports
+                                  false,   // portsAll
+                                  false,   // processes
+                                  false,   // hotfixes (disabled)
+                                  false,   // groups
+                                  false,   // users
+                                  false,   // services
+                                  false,   // browserExtensions
+                                  false);  // notifyOnFirstScan
+
+    // Test initSyncProtocol - should not throw
+    EXPECT_NO_THROW(
+    {
+        Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                 );
+    });
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, initSyncProtocol_DifferentParameters)
+{
+    /**
+     * Test: Verify initSyncProtocol accepts and handles different parameter values
+     * Tests various timeout and retry values
+     */
+
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    // Initialize with packages enabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,   // scanOnStart
+                                  false,   // hardware
+                                  true,    // os (enabled)
+                                  false,   // network
+                                  true,    // packages (enabled)
+                                  false,   // ports
+                                  false,   // portsAll
+                                  false,   // processes
+                                  false,   // hotfixes (disabled)
+                                  false,   // groups
+                                  false,   // users
+                                  false,   // services
+                                  false,   // browserExtensions
+                                  false);  // notifyOnFirstScan
+
+    // Test with different parameter values
+    EXPECT_NO_THROW(
+    {
+        Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", // Different retries
+                                                  86400
+                                                 );
+    });
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, notifyDisableCollectorsDataCleanNoDisabledCollectors)
+{
+    // Test case: All collectors enabled, no data to clean
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Setup log capturing
+    LogCapture logCapture;
+    auto captureLogFunction = [&logCapture](modules_log_level_t level, const std::string & log)
+    {
+        logCapture.capture(level, log);
+    };
+
+    // Initialize with all collectors enabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  captureLogFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  true,
+                                  true,   // hardware
+                                  true,   // os
+                                  true,   // network
+                                  true,   // packages
+                                  true,   // ports
+                                  true,
+                                  true,   // processes
+                                  true,   // hotfixes
+                                  true,   // groups
+                                  true,   // users
+                                  true,   // services
+                                  true,   // browser_extensions
+                                  false);
+
+    // Verify no "Disabled collectors with data detected" log (all collectors enabled)
+    EXPECT_FALSE(logCapture.contains(LOG_INFO, "Disabled collectors indices with data detected"));
+
+    // Call notifyDisableCollectorsDataClean - should return true (no data to clean)
+    EXPECT_TRUE(Syscollector::instance().notifyDisableCollectorsDataClean());
+
+    // Verify log message for no disabled collectors
+    EXPECT_TRUE(logCapture.contains(LOG_DEBUG, "No disabled collectors indices with data to notify for cleanup"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, notifyDisableCollectorsDataCleanWithDisabledCollectorsNoData)
+{
+    // Test case: Some collectors disabled but no data in database
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Setup log capturing
+    LogCapture logCapture;
+    auto captureLogFunction = [&logCapture](modules_log_level_t level, const std::string & log)
+    {
+        logCapture.capture(level, log);
+    };
+
+    // Initialize with packages and processes collectors disabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  captureLogFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  true,
+                                  true,   // hardware
+                                  true,   // os
+                                  true,   // network
+                                  false,  // packages - DISABLED
+                                  true,   // ports
+                                  true,
+                                  false,  // processes - DISABLED
+                                  true,   // hotfixes
+                                  true,   // groups
+                                  true,   // users
+                                  true,   // services
+                                  true,   // browser_extensions
+                                  false);
+
+    // Verify no "Disabled collectors with data detected" log (no data in tables)
+    EXPECT_FALSE(logCapture.contains(LOG_INFO, "Disabled collectors indices with data detected"));
+
+    // Call notifyDisableCollectorsDataClean - should return true (no data in tables)
+    EXPECT_TRUE(Syscollector::instance().notifyDisableCollectorsDataClean());
+
+    // Verify log message for no disabled collectors with data
+    EXPECT_TRUE(logCapture.contains(LOG_DEBUG, "No disabled collectors indices with data to notify for cleanup"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, notifyDisableCollectorsDataCleanWithDisabledCollectorsAndData)
+{
+    // Test case: Disabled collectors with data in database
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Manually populate test DB
+    populateTestDb();
+
+    // Setup log capturing for initialization
+    LogCapture logCapture;
+    auto captureLogFunction = [&logCapture](modules_log_level_t level, const std::string & log)
+    {
+        logCapture.capture(level, log);
+    };
+
+    // Initialize with packages and processes disabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  captureLogFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,
+                                  true,   // hardware
+                                  true,   // os
+                                  true,   // network
+                                  false,  // packages - DISABLED
+                                  true,   // ports
+                                  true,
+                                  false,  // processes - DISABLED
+                                  true,   // hotfixes
+                                  true,   // groups
+                                  true,   // users
+                                  true,   // services
+                                  true,   // browser_extensions
+                                  false);
+
+    // Verify "Disabled collectors with data detected" log (packages and processes have data)
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Disabled collectors indices with data detected"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "packages"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "processes"));
+
+    // Note: notifyDisableCollectorsDataClean requires sync protocol to be initialized
+    // Without sync protocol, it should return false
+    // This tests the error handling path
+    EXPECT_FALSE(Syscollector::instance().notifyDisableCollectorsDataClean());
+
+    // Verify info log for missing sync protocol
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Sync protocol not initialized, cannot notify data clean"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, deleteDisableCollectorsDataNoDisabledCollectors)
+{
+    // Test case: No disabled collectors, nothing to delete
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Setup log capturing
+    LogCapture logCapture;
+    auto captureLogFunction = [&logCapture](modules_log_level_t level, const std::string & log)
+    {
+        logCapture.capture(level, log);
+    };
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  captureLogFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  true,
+                                  true,   // hardware
+                                  true,   // os
+                                  true,   // network
+                                  true,   // packages
+                                  true,   // ports
+                                  true,
+                                  true,   // processes
+                                  true,   // hotfixes
+                                  true,   // groups
+                                  true,   // users
+                                  true,   // services
+                                  true,   // browser_extensions
+                                  false);
+
+    // Call deleteDisableCollectorsData - should not throw and handle empty case gracefully
+    EXPECT_NO_THROW(Syscollector::instance().deleteDisableCollectorsData());
+
+    // Verify log message for no disabled collectors
+    EXPECT_TRUE(logCapture.contains(LOG_DEBUG, "No disabled collectors indices with data to delete"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, deleteDisableCollectorsDataWithDisabledCollectorsAndData)
+{
+    // Test case: Delete data for disabled collectors
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Manually populate test DB
+    populateTestDb();
+
+    // Setup log capturing for initialization
+    LogCapture logCapture;
+    auto captureLogFunction = [&logCapture](modules_log_level_t level, const std::string & log)
+    {
+        logCapture.capture(level, log);
+    };
+
+    // Initialize with packages disabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  captureLogFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,
+                                  true,   // hardware
+                                  true,   // os
+                                  true,   // network
+                                  false,  // packages - DISABLED
+                                  true,   // ports
+                                  true,
+                                  true,   // processes
+                                  false,  // hotfixes
+                                  false,  // groups
+                                  false,  // users
+                                  false,  // services
+                                  false,  // browser_extensions
+                                  false);
+
+    // Verify "Disabled collectors with data detected" log (packages has data)
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Disabled collectors indices with data detected"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "packages"));
+
+    // Call deleteDisableCollectorsData - should clear tables for disabled collectors
+    EXPECT_NO_THROW(Syscollector::instance().deleteDisableCollectorsData());
+
+    // Verify log messages for deletion
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Deleting data for disabled collectors indices"));
+    EXPECT_TRUE(logCapture.contains(LOG_DEBUG, "Cleared table dbsync_packages"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, allCollectorsDisabledWithData)
+{
+    // Test case: All collectors disabled - should detect it during initialization
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Manually populate test DB
+    populateTestDb();
+
+    // Setup log capturing for initialization
+    LogCapture logCapture;
+    auto captureLogFunction = [&logCapture](modules_log_level_t level, const std::string & log)
+    {
+        logCapture.capture(level, log);
+    };
+
+    // Re-initialize with ALL collectors disabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  captureLogFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,
+                                  false,  // hardware - DISABLED
+                                  false,  // os - DISABLED
+                                  false,  // network - DISABLED
+                                  false,  // packages - DISABLED
+                                  false,  // ports - DISABLED
+                                  true,
+                                  false,  // processes - DISABLED
+                                  false,  // hotfixes - DISABLED
+                                  false,  // groups - DISABLED
+                                  false,  // users - DISABLED
+                                  false,  // services - DISABLED
+                                  false,  // browser_extensions - DISABLED
+                                  false);
+
+    // Verify "Disabled collectors with data detected" log mentions all collectors with data
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Disabled collectors indices with data detected"));
+    // Should contain hardware, os, network (3 indices), packages, ports and processes
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "hardware"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "system"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "interfaces") ||
+                logCapture.contains(LOG_INFO, "protocols") ||
+                logCapture.contains(LOG_INFO, "networks"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "packages"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "ports"));
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "processes"));
+
+    // The populateDisabledCollectorsIndexes() should have detected all disabled collectors with data
+    // We can verify this by calling notifyDisableCollectorsDataClean (will fail without sync protocol)
+    EXPECT_FALSE(Syscollector::instance().notifyDisableCollectorsDataClean());
+
+    // Verify info log for missing sync protocol
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Sync protocol not initialized, cannot notify data clean"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, networkCollectorDisabledThreeIndices)
+{
+    // Test case: Network collector disabled - should detect 3 indices (interfaces, protocols, networks)
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Manually populate test DB
+    populateTestDb();
+
+    // Setup log capturing for initialization
+    LogCapture logCapture;
+    auto captureLogFunction = [&logCapture](modules_log_level_t level, const std::string & log)
+    {
+        logCapture.capture(level, log);
+    };
+
+    // Re-initialize with network disabled
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  captureLogFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600,
+                                  false,
+                                  true,  // hardware
+                                  true,  // os
+                                  false,  // network - DISABLED (should trigger 3 indices cleanup)
+                                  true,  // packages
+                                  true,  // ports
+                                  true,
+                                  true,  // processes
+                                  false,  // hotfixes
+                                  false,  // groups
+                                  false,  // users
+                                  false,  // services
+                                  false,  // browser_extensions
+                                  false);
+
+    // Verify "Disabled collectors with data detected" log contains network-related indices
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Disabled collectors indices with data detected"));
+    // Network collector produces 3 indices
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "interfaces") ||
+                logCapture.contains(LOG_INFO, "protocols") ||
+                logCapture.contains(LOG_INFO, "networks"));
+
+    // Should have detected network collector disabled with 3 indices
+    // Verify by attempting notification (will fail without sync protocol but tests the detection)
+    EXPECT_FALSE(Syscollector::instance().notifyDisableCollectorsDataClean());
+
+    // Verify info log for missing sync protocol
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Sync protocol not initialized, cannot notify data clean"));
+
+    // Cleanup should work even without sync protocol
+    EXPECT_NO_THROW(Syscollector::instance().deleteDisableCollectorsData());
+
+    // Verify log messages for deletion of 3 network tables
+    EXPECT_TRUE(logCapture.contains(LOG_INFO, "Deleting data for disabled collectors indices"));
+    EXPECT_TRUE(logCapture.contains(LOG_DEBUG, "Cleared table dbsync_network_iface"));
+    EXPECT_TRUE(logCapture.contains(LOG_DEBUG, "Cleared table dbsync_network_protocol"));
+    EXPECT_TRUE(logCapture.contains(LOG_DEBUG, "Cleared table dbsync_network_address"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, invalidUtf8DoesNotAbortScan)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    auto badProcess = R"({"name":"","pid":"1","parent_pid":0,"state":"S"})"_json;
+    badProcess["name"] = std::string{"bad\xff"};
+    const auto goodProcess = R"({"name":"good","pid":"2","parent_pid":0,"state":"S"})"_json;
+
+    auto badPort =
+        R"({"file_inode":1,"source_ip":"127.0.0.1","source_port":631,"process_pid":1,"process_name":"","network_transport":"tcp","destination_ip":"0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"listening","host_network_egress_queue":0})"_json;
+    badPort["process_name"] = std::string{"bad\xff"};
+    const auto goodPort =
+        R"({"file_inode":2,"source_ip":"127.0.0.1","source_port":632,"process_pid":2,"process_name":"good","network_transport":"tcp","destination_ip":"0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"listening","host_network_egress_queue":0})"_json;
+
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::array({badPort, goodPort})));
+    EXPECT_CALL(*spInfoWrapper, processes(_))
+    .Times(::testing::AtLeast(1))
+    .WillOnce(::testing::DoAll(::testing::InvokeArgument<0>(badProcess),
+                               ::testing::InvokeArgument<0>(goodProcess)));
+
+    std::mutex insertedMutex;
+    std::vector<std::string> inserted;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&inserted, &insertedMutex](const std::string & data)
+        {
+            const auto delta = nlohmann::json::parse(data);
+            const auto namePointer = nlohmann::json::json_pointer("/data/process/name");
+
+            if (delta.contains("collector") && delta.contains(namePointer))
+            {
+                std::lock_guard<std::mutex> lock(insertedMutex);
+                inserted.push_back(delta.at("collector").get<std::string>() + ":" +
+                                   delta.at(namePointer).get<std::string>());
+            }
+        }
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          persistFunction,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, false, false, true, false, true, false, false, false, false, false, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    std::sort(inserted.begin(), inserted.end());
+    const std::vector<std::string> expected
+    {
+        "dbsync_ports:bad\xEF\xBF\xBD",
+        "dbsync_ports:good",
+        "dbsync_processes:bad\xEF\xBF\xBD",
+        "dbsync_processes:good",
+    };
+    EXPECT_EQ(inserted, expected);
+}
+
+TEST_F(SyscollectorImpTest, destroyWaitsForSyncLoopCompletion)
+{
+    auto spInfoWrapper
+    {
+        std::make_shared<MockSysInfo>()
+    };
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    CallbackMock wrapper;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapper](const std::string & data)
+        {
+            wrapper.callbackMock(data);
+        }
+    };
+
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapper](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)
+        {
+            // Empty callback for this test
+        }
+    };
+
+    // Allow any number of callback invocations
+    EXPECT_CALL(wrapper, callbackMock(testing::_)).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+
+    std::atomic<bool> syncLoopExited{false};
+    std::atomic<bool> destroyReturned{false};
+
+    std::thread t
+    {
+        [&]()
+        {
+            // Start syscollector with a long interval
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, // 1 hour interval to ensure we control the timing
+                                          true, true, true, false, false, false, false, false, false, false, false, false, false, false);
+            syncLoopExited = true;
+        }
+    };
+
+    // Wait for init to start and complete first scan
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // Call destroy in separate thread to verify it blocks
+    std::thread destroyThread{[&]()
+    {
+        Syscollector::instance().destroy();
+        destroyReturned = true;
+    }};
+
+    // Give destroy time to be called
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // At this point, destroy should have been called and should be waiting
+    // Now wait for syncLoop to actually exit
+    destroyThread.join();
+
+    // Verify the correct order: syncLoop must exit before destroy returns
+    // If destroy returned, syncLoop must have exited
+    EXPECT_TRUE(destroyReturned);
+    EXPECT_TRUE(syncLoopExited);
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+}
+
+TEST_F(SyscollectorImpTest, stoppingDuringScanSkipsRemainingTasks)
+{
+    auto spInfoWrapper
+    {
+        std::make_shared<MockSysInfo>()
+    };
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    CallbackMock wrapper;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapper](const std::string & data)
+        {
+            wrapper.callbackMock(data);
+        }
+    };
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t) {}
+    };
+    EXPECT_CALL(wrapper, callbackMock(testing::_)).Times(testing::AnyNumber());
+
+    std::promise<void> hardwareStarted;
+    std::future<void> hardwareStartedFuture { hardwareStarted.get_future() };
+
+    // hardware() backs scanHardware(), the FIRST task scan() runs. Block
+    // inside it long enough to flip m_stopping (via quiesce()) from the
+    // test thread while the scan is still in flight, then verify no LATER
+    // task (os(), networks(), ...) runs afterward. This reproduces the
+    // window that commit 3be02ea5a3 opened by removing the per-task
+    // m_stopping check inside TRY_CATCH_TASK.
+    EXPECT_CALL(*spInfoWrapper, hardware())
+    .WillOnce(testing::Invoke([&]()
+    {
+        hardwareStarted.set_value();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON);
+    }));
+
+    // If the per-task stop check works, none of these later tasks should run.
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, networks()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(testing::_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, processes(testing::_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, users()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, services()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).Times(0);
+
+    std::thread initThread
+    {
+        [&]()
+        {
+            // init() only sets up state; start() is what actually runs the sync
+            // loop (see e.g. noHardware above), so it must be started on its own
+            // thread since it blocks until shutdown.
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, // 1 hour interval: only the scan-on-start run matters here
+                                          true,  // scanOnStart
+                                          true, true, true, true, true, true, true, true,
+                                          true, true, true, true, false);
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait until scan() is inside hardware(), i.e. mid-scan.
+    hardwareStartedFuture.wait();
+
+    // Request shutdown WHILE the scan is still running.
+    Syscollector::instance().quiesce();
+
+    if (initThread.joinable())
+    {
+        initThread.join();
+    }
+
+    // TearDown() calls Syscollector::instance().destroy() for us.
+}
+
+// Recovery functions tests via public interface
+TEST_F(SyscollectorImpTest, initSyncProtocolWithIntegrityInterval)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Initialize sync protocol with integrity interval
+    EXPECT_NO_THROW(
+        Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400  // 24 hours integrity interval
+                                                 )
+    );
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, runRecoveryProcessWithoutSyncProtocol)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Running recovery without sync protocol should not crash
+    EXPECT_NO_THROW(Syscollector::instance().runRecoveryProcess());
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, runRecoveryProcessWithSyncProtocol)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    // Initialize sync protocol
+    Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                             );
+
+    // Run recovery process - should execute without throwing
+    EXPECT_NO_THROW(Syscollector::instance().runRecoveryProcess());
+
+    Syscollector::instance().destroy();
+}
+
+// Schema validation tests
+TEST_F(SyscollectorImpTest, schemaValidationAcceptsValidDataAfterCorrections)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Return valid hardware data (cpu_speed as integer, which our correction handles)
+    const std::string validHardwareJson =
+        R"({"serial_number":"Intel Corporation", "cpu_speed":2904,"cpu_cores":2,"cpu_name":"Intel(R) Core(TM) i5-9400","memory_free":1000000,"memory_total":4000000,"memory_used":3000000})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(validHardwareJson)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    // Expect persist callback for valid hardware data (will pass validation)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-hardware"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+TEST_F(SyscollectorImpTest, schemaValidationWithCorrectedDataTypes)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Data that our corrections should handle:
+    // - file_inode as number (will be converted to string)
+    // - cpu_speed as float (will be converted to integer)
+    const std::string hardwareJson = R"({"serial_number":"Intel", "cpu_speed":2688.0,"cpu_cores":2,"cpu_name":"Intel i5","memory_free":1000000,"memory_total":2000000,"memory_used":1000000})";
+    const std::string portsJson =
+        R"([{"file_inode":6822,"source_ip":"127.0.0.1","source_port":22,"process_pid":822,"process_name":"sshd","network_transport":"tcp","destination_ip":"0.0.0.0","destination_port":0,"host_network_ingress_queue":0,"interface_state":"listening","host_network_egress_queue":0}])";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(hardwareJson)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse(portsJson)));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            // Verify corrected data types in the actual data
+            auto jsonData = nlohmann::json::parse(data);
+
+            if (index == "wazuh-states-inventory-hardware")
+            {
+                // cpu_speed should be integer now
+                EXPECT_TRUE(jsonData["host"]["cpu"]["speed"].is_number_integer());
+                EXPECT_EQ(jsonData["host"]["cpu"]["speed"].get<int>(), 2688);
+            }
+            else if (index == "wazuh-states-inventory-ports")
+            {
+                // file.inode should be string now
+                EXPECT_TRUE(jsonData["file"]["inode"].is_string());
+                EXPECT_EQ(jsonData["file"]["inode"].get<std::string>(), "6822");
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    // Expect persist callbacks for valid data after corrections
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-hardware"), testing::_, testing::_)).Times(1);
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-ports"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, false, false, true, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+TEST_F(SyscollectorImpTest, packageWithoutSizeKeepsTheStoredSizeInThePersistedDocument)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // First scan measures the package. Later scans fail to measure it and, in the same scan, the
+    // vendor changes. The row is therefore modified, and the document sent to the inventory is
+    // built only from what that scan carried. Without the stored size being put back, the document
+    // would report no size while the database still holds 4558446240, and no later scan would
+    // correct it because the measurement then matches what is stored.
+    const std::string measured =
+        R"({"architecture":"amd64","category":"x11","name":"xserver-xorg","priority":"optional","size":4558446240,"source":"xorg","vendor":"before","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})";
+    const std::string unmeasuredAndChanged =
+        R"({"architecture":"amd64","category":"x11","name":"xserver-xorg","priority":"optional","source":"xorg","vendor":"after","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    std::atomic<int> scanCount{0};
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce(testing::Invoke([&measured, &scanCount](std::function<void(nlohmann::json&)> callback)
+    {
+        ++scanCount;
+        auto item = nlohmann::json::parse(measured);
+        callback(item);
+    }))
+    .WillRepeatedly(testing::Invoke([&unmeasuredAndChanged, &scanCount](std::function<void(nlohmann::json&)> callback)
+    {
+        ++scanCount;
+        auto item = nlohmann::json::parse(unmeasuredAndChanged);
+        callback(item);
+    }));
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::mutex sizesMutex;
+    std::vector<nlohmann::json> reportedSizes;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist, &sizesMutex, &reportedSizes](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            if (index == "wazuh-states-inventory-packages")
+            {
+                auto jsonData = nlohmann::json::parse(data);
+                std::lock_guard<std::mutex> lock{sizesMutex};
+                reportedSizes.push_back(jsonData["package"]["size"]);
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(testing::_)).Times(testing::AnyNumber());
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, testing::_, testing::_)).Times(testing::AnyNumber());
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          1, true, false, false, false, true, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock{sizesMutex};
+        // Without a second report the check would pass by never having exercised the case.
+        ASSERT_GE(scanCount.load(), 2) << "only " << scanCount.load() << " scan(s) ran";
+        ASSERT_GE(reportedSizes.size(), 2u)
+                << "the package was reported " << reportedSizes.size()
+                << " time(s); the scan that omits the size must still report the modified row";
+
+        for (size_t i = 0; i < reportedSizes.size(); ++i)
+        {
+            EXPECT_FALSE(reportedSizes[i].is_null())
+                    << "report " << i << " carries no size, although the stored one was 4558446240";
+            EXPECT_EQ(reportedSizes[i], 4558446240)
+                    << "report " << i << " carries " << reportedSizes[i].dump()
+                    << " instead of the stored size";
+        }
+    }
+
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+TEST_F(SyscollectorImpTest, packageWithoutSizeRaisesNoChangeEvent)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // First scan measures the package. Every later scan fails to measure it and leaves the key
+    // out, which is what a collector does when the walk cannot establish a size. Nothing about
+    // the package changed, so no change event may be raised: the size takes no part in the
+    // checksum, and an absent column is not compared.
+    const std::string withSize =
+        R"({"architecture":"amd64","category":"x11","name":"xserver-xorg","priority":"optional","size":4558446240,"source":"xorg","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})";
+    const std::string withoutSize =
+        R"({"architecture":"amd64","category":"x11","name":"xserver-xorg","priority":"optional","source":"xorg","version_":"1:7.7+19ubuntu14","type":"deb","path":" "})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    std::atomic<int> scanCount{0};
+    EXPECT_CALL(*spInfoWrapper, packages(_))
+    .WillOnce(testing::Invoke([&withSize, &scanCount](std::function<void(nlohmann::json&)> callback)
+    {
+        ++scanCount;
+        auto item = nlohmann::json::parse(withSize);
+        callback(item);
+    }))
+    .WillRepeatedly(testing::Invoke([&withoutSize, &scanCount](std::function<void(nlohmann::json&)> callback)
+    {
+        ++scanCount;
+        auto item = nlohmann::json::parse(withoutSize);
+        callback(item);
+    }));
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::mutex versionsMutex;
+    std::vector<uint64_t> packageVersions;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist, &versionsMutex, &packageVersions](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            if (index == "wazuh-states-inventory-packages")
+            {
+                std::lock_guard<std::mutex> lock{versionsMutex};
+                packageVersions.push_back(version);
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperDelta, callbackMock(testing::_)).Times(testing::AnyNumber());
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::_, testing::_, testing::_)).Times(testing::AnyNumber());
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          1, true, false, false, false, true, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock{versionsMutex};
+        // Without several scans the check would pass by never having exercised the omission.
+        ASSERT_GE(scanCount.load(), 2) << "only " << scanCount.load() << " scan(s) ran";
+        // The package is reported once, when it is inserted. Every later scan omits the size and
+        // changes nothing else, so it must not be reported again.
+        EXPECT_EQ(packageVersions.size(), 1u)
+                << "the package was reported " << packageVersions.size()
+                << " times across " << scanCount.load() << " scans: omitting the size modified it";
+    }
+
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+TEST_F(SyscollectorImpTest, packageSizeZeroIsReportedAsNull)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // A package never occupies 0 bytes: collectors store 0 when the size is unknown, and it
+    // has to reach the document as null rather than as a misleading 0.
+    const std::string packagesJson =
+        R"([{"architecture":"amd64","category":"x11","name":"xserver-xorg","priority":"optional","size":0,"source":"xorg","version_":"1:7.7+19ubuntu14","type":"deb","path":" "}])";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).WillRepeatedly(testing::Invoke(
+                                                                [&packagesJson](std::function<void(nlohmann::json&)> callback)
+    {
+        for (auto& item : nlohmann::json::parse(packagesJson))
+        {
+            callback(item);
+        }
+    }));
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            if (index == "wazuh-states-inventory-packages")
+            {
+                auto jsonData = nlohmann::json::parse(data);
+
+                // A stored 0 must reach the document as null, not as a literal 0
+                EXPECT_TRUE(jsonData["package"]["size"].is_null());
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-packages"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, false, true, false, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+TEST_F(SyscollectorImpTest, serviceArrayFieldsDecodeJsonArrayStrings)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // launchd stores plist arrays as JSON array strings. Elements may contain spaces, commas and
+    // quotes, and each one must reach the document as its own array entry. A value that is not a
+    // JSON string array, such as one stored by an older agent, is kept as a single entry.
+    const std::string servicesJson = R"([
+        {"service_id":"com.example.encoded","service_name":"encoded","process_executable":"/Applications/My App.app/Contents/MacOS/My App",
+         "process_args":"[\"/Applications/My App.app/Contents/MacOS/My App\",\"--x=a,b\",\"say \\\"hi\\\"\",\"\"]",
+         "service_starts_on_path_modified":"[\"/Applications/\",\"/Applications/Utilities/\"]",
+         "service_starts_on_not_empty_directory":"[\"/var/spool/my queue\"]","file_path":"/Library/LaunchDaemons/com.example.encoded.plist"},
+        {"service_id":"com.example.legacy","service_name":"legacy","process_executable":"/usr/bin/tool",
+         "process_args":"/usr/bin/tool --flag","service_starts_on_path_modified":"[1,2]",
+         "service_starts_on_not_empty_directory":" ","file_path":"/Library/LaunchDaemons/com.example.legacy.plist"}
+    ])";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse(servicesJson)));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    std::map<std::string, nlohmann::json> documents;
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist, &documents](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            if (index == "wazuh-states-inventory-services")
+            {
+                auto jsonData = nlohmann::json::parse(data);
+                documents[jsonData["service"]["id"].get<std::string>()] = jsonData;
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-services"), testing::_, testing::_)).Times(2);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, false, false, false, false, false, false, false, false, true, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    ASSERT_EQ(documents.count("com.example.encoded"), 1u);
+    const auto& encoded = documents["com.example.encoded"];
+    EXPECT_EQ(encoded["process"]["args"],
+              nlohmann::json::parse(R"(["/Applications/My App.app/Contents/MacOS/My App","--x=a,b","say \"hi\"",""])"));
+    EXPECT_EQ(encoded["service"]["starts"]["on_path_modified"], nlohmann::json::parse(R"(["/Applications/","/Applications/Utilities/"])"));
+    EXPECT_EQ(encoded["service"]["starts"]["on_not_empty_directory"], nlohmann::json::parse(R"(["/var/spool/my queue"])"));
+
+    ASSERT_EQ(documents.count("com.example.legacy"), 1u);
+    const auto& legacy = documents["com.example.legacy"];
+    EXPECT_EQ(legacy["process"]["args"], nlohmann::json::parse(R"(["/usr/bin/tool --flag"])"));
+    EXPECT_EQ(legacy["service"]["starts"]["on_path_modified"], nlohmann::json::parse(R"(["[1,2]"])"));
+    EXPECT_TRUE(legacy["service"]["starts"]["on_not_empty_directory"].is_null());
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+TEST_F(SyscollectorImpTest, hardwareCpuSpeedZeroIsReportedAsNull)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // cpu_speed as 0.0 represents an unavailable value (e.g. macOS ARM) and must be
+    // reported as null instead of a misleading 0.
+    const std::string hardwareJson = R"({"serial_number":"Apple Inc.", "cpu_speed":0.0,"cpu_cores":8,"cpu_name":"Apple M1","memory_free":1000000,"memory_total":2000000,"memory_used":1000000})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(hardwareJson)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            if (index == "wazuh-states-inventory-hardware")
+            {
+                auto jsonData = nlohmann::json::parse(data);
+
+                // cpu_speed 0.0 must be reported as null, not as a literal 0
+                EXPECT_TRUE(jsonData["host"]["cpu"]["speed"].is_null());
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-hardware"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+// host.memory.usage is not collected: it is derived from memory_used over memory_total. The schema
+// stores it as a fraction between 0 and 1, not as a 0-100 percentage.
+TEST_F(SyscollectorImpTest, hardwareMemoryUsageIsComputedAsFraction)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    const std::string hardwareJson =
+        R"({"serial_number":"Intel","cpu_speed":2688.0,"cpu_cores":2,"cpu_name":"Intel i5","memory_free":1000000,"memory_total":4000000,"memory_used":3000000})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(hardwareJson)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            if (index == "wazuh-states-inventory-hardware")
+            {
+                auto jsonData = nlohmann::json::parse(data);
+
+                EXPECT_TRUE(jsonData["host"]["memory"]["usage"].is_number());
+                EXPECT_DOUBLE_EQ(jsonData["host"]["memory"]["usage"].get<double>(), 0.75);
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-hardware"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+// A zero memory_total (reported by collectors that cannot read the value) must not divide.
+TEST_F(SyscollectorImpTest, hardwareMemoryUsageIsNullWhenTotalIsZero)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    const std::string hardwareJson =
+        R"({"serial_number":"Intel","cpu_speed":2688.0,"cpu_cores":2,"cpu_name":"Intel i5","memory_free":0,"memory_total":0,"memory_used":0})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(hardwareJson)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            if (index == "wazuh-states-inventory-hardware")
+            {
+                auto jsonData = nlohmann::json::parse(data);
+
+                EXPECT_TRUE(jsonData["host"]["memory"]["usage"].is_null());
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-hardware"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+// End-to-end check that the volatile counters stay current without being reported as changes.
+// Hardware memory, process CPU times and network byte/packet counters change on every scan below
+// (as real monotonic counters do), while every other field stays constant: each collector must
+// keep refreshing its state document on every cycle, and must report none of those cycles as a
+// change on the stateless path.
+TEST_F(SyscollectorImpTest, volatileCountersRefreshStateWithoutStatelessNoise)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    constexpr int64_t FIRST_MEMORY_FREE {1000000};
+
+    int hwCallCount{0};
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(testing::Invoke(
+                                                               [&hwCallCount]()
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON);
+        data["memory_free"] = FIRST_MEMORY_FREE + (hwCallCount * 4096);
+        data["memory_used"] = 3000000 + hwCallCount;
+        // dbsync_hwinfo.cpu_speed is a DOUBLE column; the shared fixture's plain "2904"
+        // literal parses as a JSON integer, which permanently mismatches the DB-stored
+        // value on every diff comparison. Force it to the float type the column expects.
+        data["cpu_speed"] = data["cpu_speed"].get<double>();
+        ++hwCallCount;
+        return data;
+    }));
+
+    int procCallCount{0};
+    EXPECT_CALL(*spInfoWrapper, processes(_)).WillRepeatedly(testing::Invoke(
+                                                                 [&procCallCount](std::function<void(nlohmann::json&)> callback)
+    {
+        auto data = nlohmann::json::parse(EXPECT_CALL_PROCESSES_JSON);
+        data["utime"] = procCallCount;
+        data["stime"] = procCallCount + 1;
+        // dbsync_processes.start is a TEXT column (real providers always report an ISO8601
+        // string); the shared fixture's plain "9302261" literal parses as a JSON integer,
+        // which permanently mismatches the DB-stored value on every diff comparison.
+        data["start"] = std::to_string(data["start"].get<int64_t>());
+        ++procCallCount;
+        callback(data);
+    }));
+
+    int netCallCount{0};
+    const auto networksJsonTemplate
+    {
+        R"({"iface":[{"host_mac":"d4:5d:64:51:07:5d", "interface_mtu":1500, "interface_name":"eth0", )"
+        R"("interface_alias":" ", "interface_type":"ethernet", "interface_state":"up",)"
+        R"("host_network_ingress_bytes":0,"host_network_ingress_drops":0,"host_network_ingress_errors":0,)"
+        R"("host_network_ingress_packages":0,"host_network_egress_bytes":0,"host_network_egress_drops":0,)"
+        R"("host_network_egress_errors":0,"host_network_egress_packages":0}]})"
+    };
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(testing::Invoke(
+                                                               [&netCallCount, networksJsonTemplate]()
+    {
+        auto data = nlohmann::json::parse(networksJsonTemplate);
+        data["iface"][0]["host_network_ingress_bytes"]    = 100000 + (netCallCount * 1024);
+        data["iface"][0]["host_network_egress_bytes"]     = 200000 + (netCallCount * 2048);
+        data["iface"][0]["host_network_ingress_packages"] = 1000 + netCallCount;
+        data["iface"][0]["host_network_egress_packages"]  = 2000 + netCallCount;
+        ++netCallCount;
+        return data;
+    }));
+
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, ports()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, users()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, services()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).Times(0);
+
+    std::mutex countsMutex;
+    std::map<std::string, int> statefulCount;
+    std::map<std::string, int> statelessCount;
+    std::map<std::string, nlohmann::json> lastStateful;
+
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&countsMutex, &statefulCount, &lastStateful](const std::string&, Operation_t, const std::string & index,
+                                                      const std::string & data, uint64_t)
+        {
+            std::lock_guard<std::mutex> lock{countsMutex};
+            ++statefulCount[index];
+            lastStateful[index] = nlohmann::json::parse(data);
+        }
+    };
+
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&countsMutex, &statelessCount](const std::string & payload)
+        {
+            const auto parsed = nlohmann::json::parse(payload);
+            std::lock_guard<std::mutex> lock{countsMutex};
+            ++statelessCount[parsed.at("collector").get<std::string>()];
+        }
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          1, true, true, false, true, false, false, false, true, false, false, false, false, false, true);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    // interval=1s: initial scan at t=0, further counter-only scans roughly once per second.
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Sanity check: more than one scan actually ran, otherwise the rest proves nothing.
+    ASSERT_GT(hwCallCount, 1);
+    ASSERT_GT(procCallCount, 1);
+    ASSERT_GT(netCallCount, 1);
+
+    // Every scan refreshes the state document, so the inventory keeps up with the host.
+    EXPECT_GT(statefulCount["wazuh-states-inventory-hardware"], 1);
+    EXPECT_GT(statefulCount["wazuh-states-inventory-processes"], 1);
+    EXPECT_GT(statefulCount["wazuh-states-inventory-interfaces"], 1);
+
+    // notifyOnFirstScan is enabled, so the initial insert is reported. Every scan after it only
+    // moves the volatile counters, and none of those is reported.
+    EXPECT_EQ(statelessCount["dbsync_hwinfo"], 1);
+    EXPECT_EQ(statelessCount["dbsync_processes"], 1);
+    EXPECT_EQ(statelessCount["dbsync_network_iface"], 1);
+
+    // The last state document carries a later value than the first scan's, which is the whole
+    // point: before this behavior the document stayed pinned to the first-scan snapshot.
+    ASSERT_TRUE(lastStateful.count("wazuh-states-inventory-hardware"));
+    EXPECT_GT(lastStateful["wazuh-states-inventory-hardware"]["host"]["memory"]["free"].get<int64_t>(),
+              FIRST_MEMORY_FREE);
+}
+
+// Windows reports interface_mtu as 4294967295 (UINT32_MAX) when the MTU is not available;
+// this correction must discard that placeholder and report interface.mtu as null.
+TEST_F(SyscollectorImpTest, schemaValidationDiscardsInvalidMtuValueOnWindows)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // No "IPv4"/"IPv6" sub-arrays are included on purpose, so that only the
+    // "dbsync_network_iface" table (and its "wazuh-states-inventory-interfaces" index)
+    // is generated, keeping this test focused on the MTU normalization.
+    const std::string networksJson =
+        R"({"iface":[{"host_mac":"d4:5d:64:51:07:5d", "interface_mtu":4294967295, "interface_name":"enp4s0", "interface_alias":" ", "interface_type":"ethernet", "interface_state":"up","host_network_ingress_bytes":0,"host_network_ingress_drops":0,"host_network_ingress_errors":0,"host_network_ingress_packages":0,"host_network_egress_bytes":0,"host_network_egress_drops":0,"host_network_egress_errors":0,"host_network_egress_packages":0}]})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(networksJson)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto jsonData = nlohmann::json::parse(data);
+
+            if (index == "wazuh-states-inventory-interfaces")
+            {
+                // interface.mtu should be null instead of the raw 4294967295 placeholder
+                EXPECT_TRUE(jsonData["interface"]["mtu"].is_null());
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-interfaces"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, true, false, false, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+// UNIX (Linux/BSD) reports interface_mtu as 0 when the MTU is not available;
+// this correction must discard that placeholder and report interface.mtu as null.
+TEST_F(SyscollectorImpTest, schemaValidationDiscardsInvalidMtuValueOnUnix)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // No "IPv4"/"IPv6" sub-arrays are included on purpose, so that only the
+    // "dbsync_network_iface" table (and its "wazuh-states-inventory-interfaces" index)
+    // is generated, keeping this test focused on the MTU normalization.
+    const std::string networksJson =
+        R"({"iface":[{"host_mac":"d4:5d:64:51:07:5d", "interface_mtu":0, "interface_name":"enp4s0", "interface_alias":" ", "interface_type":"ethernet", "interface_state":"up","host_network_ingress_bytes":0,"host_network_ingress_drops":0,"host_network_ingress_errors":0,"host_network_ingress_packages":0,"host_network_egress_bytes":0,"host_network_egress_drops":0,"host_network_egress_errors":0,"host_network_egress_packages":0}]})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse(networksJson)));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            auto jsonData = nlohmann::json::parse(data);
+
+            if (index == "wazuh-states-inventory-interfaces")
+            {
+                // interface.mtu should be null instead of the raw 0 placeholder
+                EXPECT_TRUE(jsonData["interface"]["mtu"].is_null());
+            }
+
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-interfaces"), testing::_, testing::_)).Times(1);
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          logFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, false, false, true, false, false, false, false, false, false, false, false, false, false);
+
+            // Initialize sync protocol to enable schema validation
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+}
+
+// Schema validation test using mock to force rejection
+TEST_F(SyscollectorImpTest, schemaValidationRejectsInvalidDataWithMock)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    // Return any hardware data (content doesn't matter, mock will force failure)
+    const std::string hardwareJson =
+        R"({"serial_number":"Intel Corporation", "cpu_speed":2688,"cpu_cores":2,"cpu_name":"Intel(R) Core(TM) i5-9400","memory_free":1000000,"memory_total":4000000,"memory_used":3000000})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(hardwareJson)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    // Expect NO persist callback for invalid hardware data (will be rejected by mock validator)
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-hardware"), testing::_, testing::_)).Times(0);
+
+    // Capture log messages to verify validation errors.
+    // Keep data on heap because Syscollector may still invoke the logger during fixture TearDown.
+    auto loggedMessages = std::make_shared<std::vector<std::string>>();
+    auto customLogFunction = [loggedMessages](modules_log_level_t, const std::string & message)
+    {
+        loggedMessages->push_back(message);
+    };
+
+    // Create mock validator that will reject all validations
+    auto mockValidator = std::make_shared<MockSchemaValidatorEngine>();
+
+    SchemaValidator::ValidationResult failureResult;
+    failureResult.isValid = false;
+    failureResult.errors = {"Field 'host.memory.free' has invalid type: expected 'long', got 'string'"};
+
+    EXPECT_CALL(*mockValidator, validate(testing::An<const std::string&>()))
+    .WillRepeatedly(testing::Return(failureResult));
+
+    EXPECT_CALL(*mockValidator, getSchemaName())
+    .WillRepeatedly(testing::Return("wazuh-states-inventory-hardware"));
+
+    // Inject mock validator into factory
+    std::map<std::string, std::shared_ptr<SchemaValidator::ISchemaValidatorEngine>> mockValidators;
+    mockValidators["wazuh-states-inventory-hardware"] = mockValidator;
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &customLogFunction, &mockValidators]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          customLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            // Reset and initialize factory with mock BEFORE initSyncProtocol
+            SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+            SchemaValidator::SchemaValidatorFactory::getInstance().initialize(mockValidators);
+
+            // Initialize sync protocol
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+
+    // Verify that validation errors were logged
+    ASSERT_FALSE(loggedMessages->empty());
+
+    bool foundValidationError = false;
+    bool foundDiscardMessage = false;
+    bool foundDeferredDeletion = false;
+
+    for (const auto& msg : *loggedMessages)
+    {
+        if (msg.find("Schema validation failed") != std::string::npos)
+        {
+            foundValidationError = true;
+        }
+
+        if (msg.find("Discarding invalid Syscollector message") != std::string::npos)
+        {
+            foundDiscardMessage = true;
+        }
+
+        if (msg.find("Marking entry from table") != std::string::npos &&
+                msg.find("for deferred deletion") != std::string::npos)
+        {
+            foundDeferredDeletion = true;
+        }
+    }
+
+    EXPECT_TRUE(foundValidationError) << "Expected validation error not found";
+    EXPECT_TRUE(foundDiscardMessage) << "Expected discard message not found";
+    EXPECT_TRUE(foundDeferredDeletion) << "Expected deferred deletion log not found";
+}
+
+// Test for missing validator: factory is initialized but no validator for the index.
+// The message must be discarded (restrictive behaviour) and a warning logged.
+TEST_F(SyscollectorImpTest, schemaValidationDiscardsWhenValidatorNotFound)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    const std::string hardwareJson =
+        R"({"serial_number":"Intel Corporation", "cpu_speed":2688,"cpu_cores":2,"cpu_name":"Intel(R) Core(TM) i5-9400","memory_free":1000000,"memory_total":4000000,"memory_used":3000000})";
+
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(hardwareJson)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).Times(0);
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json{}));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json{}));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string & data)
+        {
+            wrapperDelta.callbackMock(data);
+        }
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string & id, Operation_t operation, const std::string & index, const std::string & data, uint64_t version)
+        {
+            wrapperPersist.callbackMock(id, operation, index, data, version);
+        }
+    };
+
+    // No persist callback expected: with no validator for the index the message is discarded
+    EXPECT_CALL(wrapperPersist, callbackMock(testing::_, testing::_, testing::Eq("wazuh-states-inventory-hardware"), testing::_, testing::_)).Times(0);
+
+    // Capture log messages to verify warning is logged
+    // Use shared_ptr to prevent dangling references after test completes
+    auto loggedMessages = std::make_shared<std::vector<std::string>>();
+    auto customLogFunction = [loggedMessages](modules_log_level_t, const std::string & message)
+    {
+        loggedMessages->push_back(message);
+    };
+
+    // Create mock validator for a DIFFERENT index (not for hardware)
+    auto mockValidator = std::make_shared<MockSchemaValidatorEngine>();
+
+    EXPECT_CALL(*mockValidator, getSchemaName())
+    .WillRepeatedly(testing::Return("some-other-index"));
+
+    // Inject mock validator for a different index (factory is initialized, but no validator for hardware)
+    std::map<std::string, std::shared_ptr<SchemaValidator::ISchemaValidatorEngine>> mockValidators;
+    mockValidators["some-other-index"] = mockValidator;
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &customLogFunction, &mockValidators]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          customLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          3600, true, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            // Reset and initialize factory with mock for DIFFERENT index
+            SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+            SchemaValidator::SchemaValidatorFactory::getInstance().initialize(mockValidators);
+
+            // Initialize sync protocol
+            Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400
+                                                     );
+
+            Syscollector::instance().start();
+        }
+    };
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Reset factory after test
+    SchemaValidator::SchemaValidatorFactory::getInstance().reset();
+
+    // Verify that warning was logged for missing validator
+    EXPECT_FALSE(loggedMessages->empty());
+
+    bool foundMissingValidatorWarning = false;
+
+    for (const auto& msg : *loggedMessages)
+    {
+        if (msg.find("No schema validator found for index: wazuh-states-inventory-hardware") != std::string::npos)
+        {
+            foundMissingValidatorWarning = true;
+            break;
+        }
+    }
+
+    EXPECT_TRUE(foundMissingValidatorWarning) << "Expected warning for missing validator not found";
+}
+
+// Test setDocumentLimits with invalid input (not a JSON object)
+// This tests the input validation path: if (!limits.is_object()) return false;
+TEST_F(SyscollectorImpTest, DocumentLimits_InvalidInput_NotAnObject)
+{
+    // Capture log messages
+    // Use shared_ptr to prevent dangling references after test completes
+    auto logCapture = std::make_shared<LogCapture>();
+
+    // Create log function that captures messages
+    std::function<void(const modules_log_level_t, const std::string&)> captureLogFunction =
+        [logCapture](const modules_log_level_t level, const std::string & message)
+    {
+        logCapture->capture(level, message);
+    };
+
+    // Set up mock agentd query to return an array instead of an object
+    auto mockQuery = [](const char*, char* output, size_t size) -> bool
+    {
+        // Return invalid JSON - an array instead of an object
+        std::string response = R"([1, 2, 3])";
+        std::strncpy(output, response.c_str(), size - 1);
+        output[size - 1] = '\0';
+        return true;
+    };
+
+    Syscollector::instance().setAgentdQueryFunction(mockQuery);
+
+    // Set up minimal mock sysinfo (no scan data needed for this test)
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string&) {}
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t) {}
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &captureLogFunction]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          captureLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          5, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for syncLoop to attempt fetching and applying limits
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify that an error was logged about failing to apply document limits
+    // When setDocumentLimits receives a non-object (an array in this case),
+    // it should return false, causing the error message to be logged
+    EXPECT_TRUE(logCapture->contains(LOG_ERROR, "Failed to apply document limits"))
+            << "Expected error log about failing to apply document limits";
+}
+
+// Test setDocumentLimits with valid input - limit value of 0 (unlimited)
+// This tests the path where limits are valid and set to 0 (no limit)
+TEST_F(SyscollectorImpTest, DocumentLimits_ValidInput_UnlimitedPackages)
+{
+    // Capture log messages
+    // Use shared_ptr to prevent dangling references after test completes
+    auto logCapture = std::make_shared<LogCapture>();
+
+    // Create log function that captures messages
+    std::function<void(const modules_log_level_t, const std::string&)> captureLogFunction =
+        [logCapture](const modules_log_level_t level, const std::string & message)
+    {
+        logCapture->capture(level, message);
+    };
+
+    // Set up mock agentd query to return valid limits with packages=0 (unlimited)
+    auto mockQuery = [](const char*, char* output, size_t size) -> bool
+    {
+        // Return valid JSON object with packages limit set to 0 (unlimited)
+        std::string response = R"({"packages": 0})";
+        std::strncpy(output, response.c_str(), size - 1);
+        output[size - 1] = '\0';
+        return true;
+    };
+
+    Syscollector::instance().setAgentdQueryFunction(mockQuery);
+
+    // Set up minimal mock sysinfo
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string&) {}
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t) {}
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &captureLogFunction]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          captureLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          5, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for syncLoop to fetch and apply limits
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify that document limits were successfully configured
+    // When limit is 0 (unlimited), should log info about unlimited
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG, "Document limits successfully configured from agentd"))
+            << "Expected success message about document limits";
+
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG, "Document limit set to unlimited for index 'wazuh-states-inventory-packages'"))
+            << "Expected info log about unlimited packages";
+}
+
+// Test setDocumentLimits with invalid limit value (not a number)
+// This tests the validation path for limit values: if (!limit.is_number_unsigned())
+TEST_F(SyscollectorImpTest, DocumentLimits_InvalidLimitValue_NotANumber)
+{
+    // Capture log messages
+    // Use shared_ptr to prevent dangling references after test completes
+    auto logCapture = std::make_shared<LogCapture>();
+
+    // Create log function that captures messages
+    std::function<void(const modules_log_level_t, const std::string&)> captureLogFunction =
+        [logCapture](const modules_log_level_t level, const std::string & message)
+    {
+        logCapture->capture(level, message);
+    };
+
+    // Set up mock agentd query to return invalid limit value (string instead of number)
+    auto mockQuery = [](const char*, char* output, size_t size) -> bool
+    {
+        // Return JSON object with invalid limit value (string instead of unsigned number)
+        std::string response = R"({"packages": "invalid"})";
+        std::strncpy(output, response.c_str(), size - 1);
+        output[size - 1] = '\0';
+        return true;
+    };
+
+    Syscollector::instance().setAgentdQueryFunction(mockQuery);
+
+    // Set up minimal mock sysinfo
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string&) {}
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t) {}
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &captureLogFunction]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          captureLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          5, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for syncLoop to fetch and attempt to apply limits
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify that appropriate error messages were logged
+    // Should have error about invalid limit value
+    EXPECT_TRUE(logCapture->contains(LOG_ERROR, "Invalid limit value for index: packages"))
+            << "Expected error log about invalid limit value";
+
+    // Should have error about failing to apply document limits
+    EXPECT_TRUE(logCapture->contains(LOG_ERROR, "Failed to apply document limits"))
+            << "Expected error log about failing to apply document limits";
+}
+
+// Test setDocumentLimits with unknown index name
+// This tests the validation path for index names: AGENTD_TO_INDEX_MAP.find()
+TEST_F(SyscollectorImpTest, DocumentLimits_UnknownIndexName)
+{
+    // Capture log messages
+    // Use shared_ptr to prevent dangling references after test completes
+    auto logCapture = std::make_shared<LogCapture>();
+
+    // Create log function that captures messages
+    std::function<void(const modules_log_level_t, const std::string&)> captureLogFunction =
+        [logCapture](const modules_log_level_t level, const std::string & message)
+    {
+        logCapture->capture(level, message);
+    };
+
+    // Set up mock agentd query to return unknown index name
+    auto mockQuery = [](const char*, char* output, size_t size) -> bool
+    {
+        // Return JSON object with unknown index name
+        std::string response = R"({"unknown_index": 100})";
+        std::strncpy(output, response.c_str(), size - 1);
+        output[size - 1] = '\0';
+        return true;
+    };
+
+    Syscollector::instance().setAgentdQueryFunction(mockQuery);
+
+    // Set up minimal mock sysinfo
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string&) {}
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t) {}
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &captureLogFunction]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          captureLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          5, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for syncLoop to fetch and attempt to apply limits
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify that appropriate error messages were logged
+    // Should have error about unknown index
+    EXPECT_TRUE(logCapture->contains(LOG_ERROR, "Unknown index from agentd: unknown_index"))
+            << "Expected error log about unknown index";
+
+    // Should have error about failing to apply document limits
+    EXPECT_TRUE(logCapture->contains(LOG_ERROR, "Failed to apply document limits"))
+            << "Expected error log about failing to apply document limits";
+}
+
+// Test setDocumentLimits with valid numeric limit (newLimit >= currentCount case)
+// This tests the path where limit is set and no data exceeds it
+// Lines covered: validation, counting, accept limit
+TEST_F(SyscollectorImpTest, DocumentLimits_ValidInput_NumericLimit)
+{
+    // Capture log messages
+    // Use shared_ptr to prevent dangling references after test completes
+    auto logCapture = std::make_shared<LogCapture>();
+
+    // Create log function that captures messages
+    std::function<void(const modules_log_level_t, const std::string&)> captureLogFunction =
+        [logCapture](const modules_log_level_t level, const std::string & message)
+    {
+        logCapture->capture(level, message);
+    };
+
+    // Set up mock agentd query to return valid numeric limit
+    auto mockQuery = [](const char*, char* output, size_t size) -> bool
+    {
+        // Return valid JSON object with packages limit set to 100
+        std::string response = R"({"packages": 100})";
+        std::strncpy(output, response.c_str(), size - 1);
+        output[size - 1] = '\0';
+        return true;
+    };
+
+    Syscollector::instance().setAgentdQueryFunction(mockQuery);
+
+    // Set up minimal mock sysinfo
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string&) {}
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t) {}
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &captureLogFunction]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          captureLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          5, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for syncLoop to fetch and apply limits
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify that document limits were successfully configured
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG, "Document limits successfully configured from agentd"))
+            << "Expected success message about document limits";
+
+    // When currentCount (0) < newLimit (100), it attempts to promote unsynced items
+    // Since there are no unsynced items, it logs a DEBUG message
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG_VERBOSE, "Document limit increased from 0 to 100: No unsynced items available to promote"))
+            << "Expected debug log about no unsynced items to promote";
+}
+
+// Summary test to verify the DocumentLimits feature works end-to-end
+// This test verifies that:
+// 1. Document limits are fetched from agentd
+// 2. Limits are applied successfully
+// 3. The system respects the limits during operation
+// Lines covered: Validates the overall document limits functionality
+TEST_F(SyscollectorImpTest, DocumentLimits_EndToEnd_Summary)
+{
+    // Capture log messages
+    auto logCapture = std::make_shared<LogCapture>();
+
+    // Create log function that captures messages
+    std::function<void(const modules_log_level_t, const std::string&)> captureLogFunction =
+        [logCapture](const modules_log_level_t level, const std::string & message)
+    {
+        logCapture->capture(level, message);
+    };
+
+    // Set up mock agentd query to return multiple valid limits
+    auto mockQuery = [](const char*, char* output, size_t size) -> bool
+    {
+        // Return JSON object with multiple index limits
+        std::string response = R"({"packages": 50, "processes": 0, "hotfixes": 10})";
+        std::strncpy(output, response.c_str(), size - 1);
+        output[size - 1] = '\0';
+        return true;
+    };
+
+    Syscollector::instance().setAgentdQueryFunction(mockQuery);
+
+    // Set up minimal mock sysinfo
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_HARDWARE_JSON)));
+    EXPECT_CALL(*spInfoWrapper, os()).WillRepeatedly(Return(nlohmann::json::parse(EXPECT_CALL_OS_JSON)));
+    EXPECT_CALL(*spInfoWrapper, networks()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, ports()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, packages(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, hotfixes()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, processes(_)).WillRepeatedly(Return());
+    EXPECT_CALL(*spInfoWrapper, groups()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, users()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, services()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+    EXPECT_CALL(*spInfoWrapper, browserExtensions()).WillRepeatedly(Return(nlohmann::json::parse("[]")));
+
+    CallbackMock wrapperDelta;
+    std::function<void(const std::string&)> callbackDataDelta
+    {
+        [&wrapperDelta](const std::string&) {}
+    };
+
+    CallbackMockPersist wrapperPersist;
+    std::function<void(const std::string&, Operation_t, const std::string&, const std::string&, uint64_t)> callbackDataPersist
+    {
+        [&wrapperPersist](const std::string&, Operation_t, const std::string&, const std::string&, uint64_t) {}
+    };
+
+    std::thread t
+    {
+        [&spInfoWrapper, &callbackDataDelta, &callbackDataPersist, &captureLogFunction]()
+        {
+            Syscollector::instance().init(spInfoWrapper,
+                                          callbackDataDelta,
+                                          callbackDataPersist,
+                                          captureLogFunction,
+                                          SYSCOLLECTOR_DB_PATH,
+                                          "",
+                                          "",
+                                          5, false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+
+            Syscollector::instance().start();
+        }
+    };
+
+    // Wait for syncLoop to fetch and apply limits
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    Syscollector::instance().destroy();
+
+    if (t.joinable())
+    {
+        t.join();
+    }
+
+    // Verify that document limits were successfully configured
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG, "Document limits successfully configured from agentd"))
+            << "Expected success message about document limits";
+
+    // Verify that limits were set for each index
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG_VERBOSE, "Document limit increased from 0 to 50"))
+            << "Expected packages limit to be set to 50";
+
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG, "Document limit set to unlimited for index 'wazuh-states-inventory-processes'"))
+            << "Expected processes to be unlimited (0)";
+
+    EXPECT_TRUE(logCapture->contains(LOG_DEBUG_VERBOSE, "Document limit increased from 0 to 10"))
+            << "Expected hotfixes limit to be set to 10";
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetVDFirstSyncCompletedDefaultsToFalse)
+{
+    // No VD sync has run and no marker is present: expect vd_first_sync_completed == 0.
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_vd_first_sync_completed"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["vd_first_sync_completed"], 0);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetVDFirstSyncCompletedReturnsTrueWhenMetadataExists)
+{
+    // Seed the marker directly into the DB, then verify the query reports it.
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    Syscollector::instance().destroy();
+
+    {
+        sqlite3* rawDb = nullptr;
+        ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &rawDb, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db {rawDb, &sqlite3_close};
+
+        char* rawErrMsg = nullptr;
+        const int execResult = sqlite3_exec(db.get(),
+                                            "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('vd_first_sync_completed', 123456);",
+                                            nullptr,
+                                            nullptr,
+                                            &rawErrMsg);
+        std::unique_ptr<char, decltype(&sqlite3_free)> errMsg {rawErrMsg, &sqlite3_free};
+        ASSERT_EQ(execResult, SQLITE_OK) << (errMsg ? errMsg.get() : "");
+    }
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_vd_first_sync_completed"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["vd_first_sync_completed"], 1);
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, queryCommandGetVDFirstSyncCompletedIgnoresZeroTimestamp)
+{
+    // A row with last_sync_time=0 must NOT be reported as completed (boolean is "> 0").
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+    EXPECT_CALL(*spInfoWrapper, hardware()).Times(0);
+    EXPECT_CALL(*spInfoWrapper, os()).Times(0);
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    Syscollector::instance().destroy();
+
+    {
+        sqlite3* rawDb = nullptr;
+        ASSERT_EQ(sqlite3_open_v2(SYSCOLLECTOR_TEST_DB_PATH, &rawDb, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db {rawDb, &sqlite3_close};
+
+        char* rawErrMsg = nullptr;
+        const int execResult = sqlite3_exec(db.get(),
+                                            "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('vd_first_sync_completed', 0);",
+                                            nullptr,
+                                            nullptr,
+                                            &rawErrMsg);
+        std::unique_ptr<char, decltype(&sqlite3_free)> errMsg {rawErrMsg, &sqlite3_free};
+        ASSERT_EQ(execResult, SQLITE_OK) << (errMsg ? errMsg.get() : "");
+    }
+
+    Syscollector::instance().init(spInfoWrapper,
+                                  reportFunction,
+                                  persistFunction,
+                                  logFunction,
+                                  SYSCOLLECTOR_TEST_DB_PATH,
+                                  "",
+                                  "",
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+
+    std::string response = Syscollector::instance().query(R"({"command":"get_vd_first_sync_completed"})");
+    auto responseJson = nlohmann::json::parse(response);
+
+    EXPECT_EQ(responseJson["error"], MQ_SUCCESS);
+    EXPECT_EQ(responseJson["data"]["vd_first_sync_completed"], 0);
+
+    Syscollector::instance().destroy();
+}
+
+// Test-only access to Syscollector's private getMetadataValue()/updateMetadataValue(), without
+// modifying Syscollector itself. Naming a private member as the non-type template argument of an
+// explicit template instantiation is not access-checked at that point (a long-standing, widely
+// used C++ idiom for reaching private members from test code with zero production-code changes).
+namespace syscollector_test_access
+{
+    template <typename Tag, typename Tag::type Member>
+    struct Rob
+    {
+        friend typename Tag::type stealAccess(Tag)
+        {
+            return Member;
+        }
+    };
+
+    struct GetMetadataValueTag
+    {
+        using type = bool (Syscollector::*)(const std::string&, int64_t&);
+        friend type stealAccess(GetMetadataValueTag);
+    };
+
+    struct UpdateMetadataValueTag
+    {
+        using type = bool (Syscollector::*)(const std::string&, int64_t);
+        friend type stealAccess(UpdateMetadataValueTag);
+    };
+
+    template struct Rob<GetMetadataValueTag, &Syscollector::getMetadataValue>;
+    template struct Rob<UpdateMetadataValueTag, &Syscollector::updateMetadataValue>;
+}
+
+// init() leaves m_spDBSync null if constructing DBSync fails (e.g. an unopenable db path,
+// mirroring a locked database file in the field) -- its very first statement constructs DBSync,
+// before any member is assigned, so a throw there leaves the object in exactly that state.
+// Calling both metadata accessors directly here bypasses syncModule()/persistVDFirstSyncIfNeeded(),
+// their only two production callers -- both currently skip this path via m_stopping, but that's an
+// accidental side effect of init()'s statement order, not a deliberate safeguard.
+TEST_F(SyscollectorImpTest, updateMetadataValueNullDBSyncAfterFailedInit)
+{
+#ifdef WIN32
+    GTEST_SKIP() << "Skipping updateMetadataValueNullDBSyncAfterFailedInit test on Windows: opening "
+                 "an unopenable db path crashes the process at a lower level than a catchable "
+                 "std::exception under Wine, instead of the clean throw this test relies on";
+#endif
+    const auto spInfoWrapper {std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    bool initThrew = false;
+
+    try
+    {
+        Syscollector::instance().init(spInfoWrapper,
+                                      reportFunction,
+                                      persistFunction,
+                                      logFunction,
+                                      "/nonexistent-dir/local.db",
+                                      "",
+                                      "",
+                                      3600, false);
+    }
+    catch (const std::exception&)
+    {
+        initThrew = true;
+    }
+
+    ASSERT_TRUE(initThrew) << "Expected DBSync construction to throw for an unopenable db path";
+
+    // Unqualified on purpose: stealAccess() is a hidden friend, only reachable via ADL on its
+    // Tag argument's namespace -- explicit qualification (syscollector_test_access::stealAccess)
+    // does not find it.
+    const auto getMetadataValuePtr = stealAccess(syscollector_test_access::GetMetadataValueTag{});
+    const auto updateMetadataValuePtr = stealAccess(syscollector_test_access::UpdateMetadataValueTag{});
+
+    int64_t value = -1;
+    // Guarded: returns false safely instead of dereferencing a null m_spDBSync.
+    EXPECT_FALSE((Syscollector::instance().*getMetadataValuePtr)("test_key", value));
+
+    // Unguarded: dereferences a null m_spDBSync -- crashes without the fix applied above.
+    EXPECT_FALSE((Syscollector::instance().*updateMetadataValuePtr)("test_key", 1));
+}
+
+// --- Local-transport-unavailable log-level decision (issue #38621) ------------------------------
+// These inject a MockAgentSyncProtocol via m_spSyncProtocol/m_spSyncProtocolVD (through the
+// FRIEND_TEST grants in syscollector_defs.hpp) so the classification logic in syncModule() is
+// exercised without a live transport.
+
+namespace
+{
+    // VD sync isn't the subject of these tests; make it succeed trivially so it never adds noise
+    // (a WARNING/INFO log or a failed overall result) to the assertions on the regular-sync path.
+    void expectVDSyncSucceeds(MockAgentSyncProtocol& mockSyncProtocolVD)
+    {
+        EXPECT_CALL(mockSyncProtocolVD, synchronizeModule(testing::_, testing::_))
+        .WillRepeatedly(testing::Return(SyncModuleResult{true}));
+    }
+}
+
+/// Initializes Syscollector and injects fresh mocks for both the regular and VD sync protocols,
+/// wiring the regular one to return `result` for a Mode::DELTA/Option::SYNC call. Declares
+/// `logCapture` for the caller to assert against. Written as a macro, not a helper function, for
+/// the same reason as INJECT_MOCK_PROTOCOLS() in syscollector_identity_tests.cpp: FRIEND_TEST
+/// grants access to the test body, not to a function it calls.
+#define INIT_SYSCOLLECTOR_WITH_MOCKED_SYNC(spInfoWrapper, ...)                                                        \
+    auto logCapture = std::make_unique<LogCapture>();                                                                \
+    auto captureLogFunction = [logCapturePtr = logCapture.get()](modules_log_level_t level, const std::string & log) \
+    {                                                                                                                 \
+        logCapturePtr->capture(level, log);                                                                          \
+    };                                                                                                                \
+    Syscollector::instance().init(spInfoWrapper,                                                                     \
+                                  reportFunction,                                                                     \
+                                  persistFunction,                                                                    \
+                                  captureLogFunction,                                                                 \
+                                  SYSCOLLECTOR_DB_PATH,                                                               \
+                                  "",                                                                                 \
+                                  "",                                                                                 \
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false); \
+    Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400);                        \
+    auto mockSyncProtocol = std::make_unique<MockAgentSyncProtocol>();                                               \
+    EXPECT_CALL(*mockSyncProtocol, synchronizeModule(Mode::DELTA, Option::SYNC))                                     \
+    .WillOnce(testing::Return(__VA_ARGS__));                                                                         \
+    Syscollector::instance().m_spSyncProtocol = std::move(mockSyncProtocol);                                         \
+    auto mockSyncProtocolVD = std::make_unique<MockAgentSyncProtocol>();                                             \
+    expectVDSyncSucceeds(*mockSyncProtocolVD);                                                                       \
+    Syscollector::instance().m_spSyncProtocolVD = std::move(mockSyncProtocolVD)
+
+// While the local sync intake itself isn't reachable yet (streak within tolerance), the
+// synchronization is reported at INFO as deferred, not as a WARNING.
+TEST_F(SyscollectorImpTest, SyncModule_LocalTransportUnavailableWithinToleranceLogsDeferred)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    INIT_SYSCOLLECTOR_WITH_MOCKED_SYNC(
+        spInfoWrapper,
+        SyncModuleResult{.failureReason = "Local sync intake is unreachable.",
+                         .consecutiveFailures = 1u,
+                         .localTransportUnavailable = true});
+
+    Syscollector::instance().syncModule(Mode::DELTA);
+
+    EXPECT_TRUE(logCapture->contains(LOG_INFO,
+                                     "Syscollector synchronization deferred: Local sync intake is unreachable. Will retry next cycle."));
+    EXPECT_FALSE(logCapture->contains(LOG_WARNING, "Syscollector synchronization failed"));
+
+    Syscollector::instance().destroy();
+}
+
+// Right at the tolerance boundary, still deferred at INFO.
+TEST_F(SyscollectorImpTest, SyncModule_LocalTransportUnavailableAtToleranceLogsDeferred)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    INIT_SYSCOLLECTOR_WITH_MOCKED_SYNC(
+        spInfoWrapper,
+        SyncModuleResult{.failureReason = "Local sync intake is unreachable.",
+                         .consecutiveFailures = SYNC_MANAGER_NOT_READY_TOLERANCE,
+                         .localTransportUnavailable = true});
+
+    Syscollector::instance().syncModule(Mode::DELTA);
+
+    EXPECT_TRUE(logCapture->contains(LOG_INFO,
+                                     "Syscollector synchronization deferred: Local sync intake is unreachable. Will retry next cycle."));
+    EXPECT_FALSE(logCapture->contains(LOG_WARNING, "Syscollector synchronization failed"));
+
+    Syscollector::instance().destroy();
+}
+
+// Past the tolerance, escalates to a WARNING that names the streak.
+TEST_F(SyscollectorImpTest, SyncModule_LocalTransportUnavailablePastToleranceLogsWarning)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    const unsigned int streak = SYNC_MANAGER_NOT_READY_TOLERANCE + 1;
+    INIT_SYSCOLLECTOR_WITH_MOCKED_SYNC(
+        spInfoWrapper,
+        SyncModuleResult{.failureReason = "Local sync intake is unreachable.",
+                         .consecutiveFailures = streak,
+                         .localTransportUnavailable = true});
+
+    Syscollector::instance().syncModule(Mode::DELTA);
+
+    EXPECT_TRUE(logCapture->contains(LOG_WARNING,
+                                     "Syscollector synchronization failed " + std::to_string(streak) +
+                                     " times in a row: Local sync intake is unreachable."));
+
+    Syscollector::instance().destroy();
+}
+
+// --- Generic-failure (e.g. 409 checksum/version mismatch) log-level decision (issue #39543) ----
+// A session rejection that isn't stopped/awaitingPrerequisite/managerNotReady/
+// localTransportUnavailable -- most commonly a 409 on synchronizeModule() (CHECKSUM_ERROR,
+// see determineSyncFailureReasonBasedOnSyncResult()) -- used to always log at WARNING, even on
+// the very first occurrence. A fresh agent's first VD sync racing the manager's already-loaded
+// feed hits exactly this path every time, which made a self-healing, one-cycle condition look
+// like a persistent failure. Same grace as the managerNotReady/localTransportUnavailable tests
+// above: INFO while within SYNC_MANAGER_NOT_READY_TOLERANCE, WARNING only once it persists.
+
+namespace
+{
+    // Regular sync isn't the subject of the VD-focused tests below; make it succeed trivially,
+    // mirroring expectVDSyncSucceeds() above.
+    void expectRegularSyncSucceeds(MockAgentSyncProtocol& mockSyncProtocol)
+    {
+        EXPECT_CALL(mockSyncProtocol, synchronizeModule(testing::_, testing::_))
+        .WillOnce(testing::Return(SyncModuleResult{true}));
+    }
+}
+
+/// Same shape as INIT_SYSCOLLECTOR_WITH_MOCKED_SYNC, but wires the VD protocol to `result` and
+/// lets the regular one succeed trivially -- for exercising the VD-sync branch of syncModule().
+#define INIT_SYSCOLLECTOR_WITH_MOCKED_VD_SYNC(spInfoWrapper, ...)                                                    \
+    auto logCapture = std::make_unique<LogCapture>();                                                               \
+    auto captureLogFunction = [logCapturePtr = logCapture.get()](modules_log_level_t level, const std::string & log) \
+    {                                                                                                                 \
+        logCapturePtr->capture(level, log);                                                                          \
+    };                                                                                                                \
+    Syscollector::instance().init(spInfoWrapper,                                                                     \
+                                  reportFunction,                                                                     \
+                                  persistFunction,                                                                    \
+                                  captureLogFunction,                                                                 \
+                                  SYSCOLLECTOR_DB_PATH,                                                               \
+                                  "",                                                                                 \
+                                  "",                                                                                 \
+                                  3600, false, false, false, false, false, false, false, false, false, false, false, false, false, false); \
+    Syscollector::instance().initSyncProtocol("syscollector", ":memory:", ":memory:", 86400);                        \
+    auto mockSyncProtocol = std::make_unique<MockAgentSyncProtocol>();                                               \
+    expectRegularSyncSucceeds(*mockSyncProtocol);                                                                     \
+    Syscollector::instance().m_spSyncProtocol = std::move(mockSyncProtocol);                                         \
+    auto mockSyncProtocolVD = std::make_unique<MockAgentSyncProtocol>();                                             \
+    EXPECT_CALL(*mockSyncProtocolVD, synchronizeModule(testing::_, testing::_))                                      \
+    .WillOnce(testing::Return(__VA_ARGS__));                                                                         \
+    Syscollector::instance().m_spSyncProtocolVD = std::move(mockSyncProtocolVD)
+
+TEST_F(SyscollectorImpTest, SyncModule_GenericFailureWithinToleranceLogsDeferred)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    INIT_SYSCOLLECTOR_WITH_MOCKED_SYNC(
+        spInfoWrapper,
+        SyncModuleResult{.failureReason = "Manager reported a checksum/version mismatch (409).",
+                         .consecutiveFailures = 1u});
+
+    Syscollector::instance().syncModule(Mode::DELTA);
+
+    EXPECT_TRUE(logCapture->contains(LOG_INFO,
+                                     "Syscollector synchronization deferred: Manager reported a checksum/version "
+                                     "mismatch (409). Will retry next cycle."));
+    EXPECT_FALSE(logCapture->contains(LOG_WARNING, "Syscollector synchronization failed"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, SyncModule_GenericFailurePastToleranceLogsWarning)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    const unsigned int streak = SYNC_MANAGER_NOT_READY_TOLERANCE + 1;
+    INIT_SYSCOLLECTOR_WITH_MOCKED_SYNC(
+        spInfoWrapper,
+        SyncModuleResult{.failureReason = "Manager reported a checksum/version mismatch (409).",
+                         .consecutiveFailures = streak});
+
+    Syscollector::instance().syncModule(Mode::DELTA);
+
+    EXPECT_TRUE(logCapture->contains(LOG_WARNING,
+                                     "Syscollector synchronization failed " + std::to_string(streak) +
+                                     " times in a row: Manager reported a checksum/version mismatch (409)."));
+
+    Syscollector::instance().destroy();
+}
+
+// The exact #39543 shape: a fresh agent's first VD sync, offset 0 racing the manager's
+// already-loaded feed -- one 409, consecutiveFailures == 1, logged at INFO, not WARNING.
+TEST_F(SyscollectorImpTest, SyncModule_VDGenericFailureWithinToleranceLogsDeferred)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    INIT_SYSCOLLECTOR_WITH_MOCKED_VD_SYNC(
+        spInfoWrapper,
+        SyncModuleResult{.failureReason =
+                             "Manager reported a feed version mismatch (409) for this session; it will be "
+                             "retried on the next sync cycle.",
+                         .consecutiveFailures = 1u});
+
+    Syscollector::instance().syncModule(Mode::DELTA);
+
+    EXPECT_TRUE(logCapture->contains(
+                    LOG_INFO,
+                    "Syscollector VD synchronization deferred: Manager reported a feed version mismatch (409) for "
+                    "this session; it will be retried on the next sync cycle. Will retry next cycle."));
+    EXPECT_FALSE(logCapture->contains(LOG_WARNING, "Syscollector VD synchronization failed"));
+
+    Syscollector::instance().destroy();
+}
+
+TEST_F(SyscollectorImpTest, SyncModule_VDGenericFailurePastToleranceLogsWarning)
+{
+    const auto spInfoWrapper{std::make_shared<MockSysInfo>()};
+    EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(testing::AnyNumber());
+
+    const unsigned int streak = SYNC_MANAGER_NOT_READY_TOLERANCE + 1;
+    INIT_SYSCOLLECTOR_WITH_MOCKED_VD_SYNC(
+        spInfoWrapper,
+        SyncModuleResult{.failureReason = "Manager reported a feed version mismatch (409) for this session.",
+                         .consecutiveFailures = streak});
+
+    Syscollector::instance().syncModule(Mode::DELTA);
+
+    EXPECT_TRUE(logCapture->contains(LOG_WARNING,
+                                     "Syscollector VD synchronization failed " + std::to_string(streak) +
+                                     " times in a row: Manager reported a feed version mismatch (409) for this session."));
+
+    Syscollector::instance().destroy();
+}

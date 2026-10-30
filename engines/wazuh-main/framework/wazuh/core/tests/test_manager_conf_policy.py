@@ -1,0 +1,128 @@
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+"""wazuh.core.manager_conf_policy: protected sections of etc/wazuh-manager.conf (api.yaml upload_configuration)."""
+
+from copy import deepcopy
+
+import pytest
+
+from wazuh.core.exception import WazuhError
+from wazuh.core.manager_conf_policy import check_protected_sections, check_secret_sections
+
+CURRENT = {
+    'indexer': {'hosts': ['https://127.0.0.1:9200'], 'ssl': {'certificate_authorities': [], 'certificate': '', 'key': ''}},
+    'auth': {'agents': {'allow_higher_versions': False}},
+    'remote': {'agents': {'allow_higher_versions': False}},
+    'cluster': {'name': 'wazuh', 'node_type': 'master', 'key': 'c98b62a9b6169ac5f67dae55ae4a9088',
+                'nodes': ['127.0.0.1'], 'port': 1516, 'bind_addr': ['0.0.0.0']},
+}
+ALLOW_ALL = {'agents': {'allow_higher_versions': {'allow': True}}, 'indexer': {'allow': True}}
+DENY_ALL = {'agents': {'allow_higher_versions': {'allow': False}}, 'indexer': {'allow': False}}
+
+
+def _changed(pointer: str, value):
+    document = deepcopy(CURRENT)
+    node = document
+    parts = pointer.strip('/').split('/')
+    for part in parts[:-1]:
+        node = node[part]
+    node[parts[-1]] = value
+    return document
+
+
+def test_unchanged_document_passes_with_every_knob():
+    check_protected_sections(deepcopy(CURRENT), CURRENT, upload_configuration=DENY_ALL)
+    check_protected_sections(deepcopy(CURRENT), CURRENT, upload_configuration=ALLOW_ALL)
+
+
+@pytest.mark.parametrize('pointer, value, code, protected', [
+    ('/indexer/hosts', ['https://10.0.0.2:9200'], 1127, '/indexer'),
+    ('/indexer/ssl/certificate', 'etc/certs/other.pem', 1127, '/indexer'),
+    ('/auth/agents/allow_higher_versions', True, 1129, '/auth/agents/allow_higher_versions'),
+    ('/remote/agents/allow_higher_versions', True, 1129, '/remote/agents/allow_higher_versions'),
+])
+def test_protected_change_is_refused_when_knob_is_false(pointer, value, code, protected):
+    with pytest.raises(WazuhError, match=f'.* {code} .*') as exc:
+        check_protected_sections(_changed(pointer, value), CURRENT, upload_configuration=DENY_ALL)
+    assert str(exc.value).endswith(protected)
+
+
+@pytest.mark.parametrize('pointer, value', [
+    ('/indexer/hosts', ['https://10.0.0.2:9200']),
+    ('/auth/agents/allow_higher_versions', True),
+    ('/remote/agents/allow_higher_versions', True),
+])
+def test_protected_change_is_allowed_when_knob_is_true(pointer, value):
+    check_protected_sections(_changed(pointer, value), CURRENT, upload_configuration=ALLOW_ALL)
+
+
+def test_indexer_knob_does_not_protect_agents_and_vice_versa():
+    only_indexer = {'agents': {'allow_higher_versions': {'allow': True}}, 'indexer': {'allow': False}}
+    check_protected_sections(_changed('/auth/agents/allow_higher_versions', True), CURRENT, upload_configuration=only_indexer)
+    with pytest.raises(WazuhError, match='.* 1127 .*'):
+        check_protected_sections(_changed('/indexer/hosts', []), CURRENT, upload_configuration=only_indexer)
+
+
+def test_default_knobs_come_from_api_conf():
+    from api import configuration as api_configuration
+    with_deny = deepcopy(api_configuration.api_conf)
+    with_deny['upload_configuration'] = DENY_ALL
+    from unittest.mock import patch
+    with patch('wazuh.core.manager_conf_policy.api_configuration.api_conf', new=with_deny):
+        with pytest.raises(WazuhError, match='.* 1127 .*'):
+            check_protected_sections(_changed('/indexer/hosts', []), CURRENT)
+
+
+def test_unchanged_secrets_pass_without_read_secrets():
+    check_secret_sections(deepcopy(CURRENT), CURRENT, can_read_secrets=False)
+
+
+def test_cluster_key_change_is_refused_without_read_secrets():
+    with pytest.raises(WazuhError, match='.* 1132 .*') as exc:
+        check_secret_sections(_changed('/cluster/key', 'd4f1e0a57c2b9368a1e4f7c0b2d85e19'), CURRENT,
+                              can_read_secrets=False)
+    assert str(exc.value).endswith('/cluster/key')
+
+
+def test_cluster_key_change_is_allowed_with_read_secrets():
+    check_secret_sections(_changed('/cluster/key', 'd4f1e0a57c2b9368a1e4f7c0b2d85e19'), CURRENT,
+                          can_read_secrets=True)
+
+
+@pytest.mark.parametrize('pointer, value', [
+    ('/indexer/hosts', ['https://attacker.example:9200']),
+    ('/indexer/hosts', ['https://127.0.0.1:9200', 'https://attacker.example:9200']),
+    ('/indexer/ssl/certificate_authorities', ['/etc/ssl/certs/ca-certificates.crt']),
+    ('/indexer/ssl/certificate', 'etc/certs/other.pem'),
+    ('/indexer/ssl/key', 'etc/certs/other-key.pem'),
+])
+def test_indexer_change_is_refused_without_read_secrets(pointer, value):
+    """Every indexer host receives the manager's indexer credential: choosing them is worth reading it."""
+    with pytest.raises(WazuhError, match='.* 1132 .*') as exc:
+        check_secret_sections(_changed(pointer, value), CURRENT, can_read_secrets=False)
+    assert str(exc.value).endswith('/indexer')
+
+
+def test_indexer_change_is_allowed_with_read_secrets():
+    check_secret_sections(_changed('/indexer/hosts', ['https://10.0.0.2:9200']), CURRENT, can_read_secrets=True)
+
+
+def test_indexer_knob_does_not_lift_the_rbac_check():
+    """upload_configuration.indexer.allow (api.yaml, true by default) is an extra lock, never a substitute."""
+    changed = _changed('/indexer/hosts', ['https://attacker.example:9200'])
+    check_protected_sections(changed, CURRENT, upload_configuration=ALLOW_ALL)
+    with pytest.raises(WazuhError, match='.* 1132 .*'):
+        check_secret_sections(changed, CURRENT, can_read_secrets=False)
+
+
+@pytest.mark.parametrize('pointer, value', [
+    ('/cluster/node_type', 'worker'),
+    ('/cluster/nodes', ['10.0.0.2']),
+    ('/cluster/port', 1600),
+    ('/cluster/bind_addr', ['10.0.0.1']),
+])
+def test_cluster_membership_is_not_a_secret(pointer, value):
+    """Without the key a peer cannot join, so the topology stays writable with cluster:update_config alone."""
+    check_secret_sections(_changed(pointer, value), CURRENT, can_read_secrets=False)

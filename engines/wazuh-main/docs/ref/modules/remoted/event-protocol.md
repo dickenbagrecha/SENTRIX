@@ -1,0 +1,237 @@
+# Event Protocol Specification
+
+## Overview
+
+The Wazuh Event Protocol version 1 (x-wev1) defines how enriched events are transmitted from remoted to the engine. This protocol ensures that every event carries complete agent metadata for stateless processing.
+
+## Protocol Identifier
+
+- **Name**: Wazuh Event Protocol v1
+- **Content-Type**: `application/x-wev1` (classic C dispatcher, `src/remoted/src/secure.c`), or
+  `application/x-ndjson` (the HTTPS `remoted_module` ingestion path,
+  `src/remoted/remoted_module/src/endpoints/statelessEndpoint.cpp`) — both carry the same `H`/`E`
+  wire format described below
+
+## Transport
+
+HTTP POST over Unix socket at `/var/wazuh-manager/queue/sockets/engine-ingest-http.sock` with content-type
+`application/x-wev1` (classic C dispatcher) or `application/x-ndjson` (HTTPS `remoted_module`
+ingestion path, forwarding to `POST /events/enriched`).
+
+Both remoted paths also send `X-Wazuh-Agent-Id: <agent id>`. It names the agent the batch belongs to
+outside the `H` line, and remoted always writes it itself:
+
+- The HTTPS `remoted_module` path sends the canonical id of the agent it authenticated (the token's
+  `sub`, e.g. `001`), never a value copied from the agent's request.
+- The classic C dispatcher sends the canonical spelling of the key's id (`1` in `client.keys` is sent
+  as `001`), and its `H` line carries that same spelling.
+- A dispatcher batch whose stored id is not a valid agent id is discarded; warnings are limited to
+  one every 90 seconds across dispatcher threads.
+
+## Message Format
+
+Batch structure:
+```
+H <JSON_HEADER><LF>
+E <EVENT_1><LF>
+E <EVENT_2><LF>
+```
+
+- `H` = Header line (JSON metadata, once per batch)
+- `E` = Event line (raw event data)
+- ` ` = Space character (0x20): the header starts with `H ` and each event starts with `E `.
+  Continuation lines use the indentation below; they do not require an `H`/`E` marker. Extra spaces
+  after the two-byte marker belong to the JSON whitespace or event payload, not the marker.
+- `<LF>` = Line feed (0x0A)
+
+## Header Line (H)
+
+### Format
+
+```
+H <JSON_HEADER><LF>
+```
+
+### Header JSON Schema
+
+The header is a JSON object conforming to Elastic Common Schema (ECS):
+
+```json
+{
+  "wazuh": {
+    "agent": {
+      "id": "string",
+      "name": "string",
+      "version": "string",
+      "groups": ["string"],
+      "host": {
+        "architecture": "string",
+        "hostname": "string",
+        "os": {
+          "name": "string",
+          "version": "string",
+          "platform": "string",
+          "type": "string"
+        }
+      }
+    },
+    "cluster": {
+      "name": "string",
+      "node": "string"
+    }
+  }
+}
+```
+
+### Field Specifications
+
+| Field | Type | Required | Description | Example |
+|-------|------|----------|-------------|---------|
+| `wazuh.agent.id` | string | **Yes** | Canonical uint32 agent ID, zero-padded only to 3 digits | `"001"` |
+| `wazuh.agent.name` | string | No | Agent name | `"web-server-01"` |
+| `wazuh.agent.version` | string | No | Wazuh agent version | `"v5.0.0"` |
+| `wazuh.agent.groups` | array[string] | No | Agent groups | `["web", "production"]` |
+| `wazuh.agent.host.architecture` | string | No | CPU architecture | `"x86_64"` |
+| `wazuh.agent.host.hostname` | string | No | System hostname | `"web-server-01"` |
+| `wazuh.agent.host.os.name` | string | No | OS name | `"Ubuntu"` |
+| `wazuh.agent.host.os.version` | string | No | OS version | `"22.04"` |
+| `wazuh.agent.host.os.platform` | string | No | OS platform | `"ubuntu"` |
+| `wazuh.agent.host.os.type` | string | No | ECS OS type | `"linux"` |
+| `wazuh.cluster.name` | string | No | Cluster name | `"production"` |
+| `wazuh.cluster.node` | string | No | Manager node | `"master-node"` |
+
+### Rules
+
+The engine requires exactly one locally authored `X-Wazuh-Agent-Id`. It must be canonical
+(`000`–`999`, or no leading zero through `4294967295`) and equal to the H-line id. It rejects a
+missing/repeated/malformed carrier or an ambiguous/mismatched H-line identity with HTTP 400.
+On the HTTPS path, remoted verifies the JWT and checks only the literal `H ` prefix and
+8 KiB H-line slice limit before forwarding; it does not parse the JSON. H-line identity validation
+belongs to the engine, with cache hits reusing validation of the same id and exact header bytes.
+The engine does not verify JWTs; it trusts producers that can write to its local socket to supply the authenticated or
+server-side identity. See the [ingestion specification](../engine/spec-events.yaml).
+
+- Exactly one header per batch (first line)
+- JSON must be compact (no newlines)
+- UTF-8 encoding required
+- **The identity path must not be repeated.** Within the header, `wazuh`, `wazuh.agent` and
+  `wazuh.agent.id` must each appear exactly once, and `wazuh` and `wazuh.agent` must be objects.
+  Names are compared after JSON unescaping, so `"wazuh"` and `"\u0077azuh"` are the same name. A header
+  that repeats any of those is rejected with `400 Invalid event batch` and the batch is never
+  ingested — see [HTTPS events API](https-events-api.md#error-responses). Repeating other fields is
+  not rejected, but it is still outside this specification: each field is defined to appear once,
+  and which copy survives is not contractual.
+
+### Example Headers
+
+**Minimal Header** (only required fields):
+```
+H {"wazuh":{"agent":{"id":"001"}}}
+```
+
+**Full Header** (all fields):
+```
+H {"wazuh":{"agent":{"id":"001","name":"web-server-01","version":"v5.0.0","groups":["web","production"],"host":{"architecture":"x86_64","hostname":"web-server-01","os":{"name":"Ubuntu","version":"22.04","platform":"ubuntu","type":"linux"}}},"cluster":{"name":"production","node":"master-node"}}}
+```
+
+## Event Line (E)
+
+Format: `E <EVENT_PAYLOAD><LF>`
+
+Payload is raw event data (JSON or text), UTF-8 encoded.
+
+**Multi-line payloads are supported and are not escaped.** Events are framed by the `\nE `
+delimiter, so a payload containing that sequence would otherwise be read as two events. The sender
+therefore indents every *continuation* line (each line after the first within one event) with a
+single space, and the receiver strips exactly one leading space from each continuation line to
+recover the continuation text. Trailing framing newlines are trimmed before unindenting; a final
+unindented payload newline is not preserved. Quotes, tabs and non-ASCII characters are not escaped
+by this framing layer.
+
+A three-line payload travels as one event, its second and third lines each indented by one space
+(the leading space is protocol framing, not part of the payload):
+
+```
+E java.lang.IllegalStateException: pool closed
+     at com.example.Pool.acquire(Pool.java:88)
+     at com.example.Worker.run(Worker.java:31)
+```
+
+JSON string values must escape newlines, but pretty-printed JSON may contain raw newlines between
+tokens. Both that JSON and plain-text stack traces use the continuation indentation when sent as
+a single multi-line event.
+
+The manager applies no per-event size limit of its own on the HTTPS path; what bounds a request
+there is the whole body: the transport limit is
+[`https.max_body_size`](configuration.md#httpsmax_body_size), 10 MiB by default, and the authentication
+limit is [`remoted.auth_max_body_size`](configuration.md#remotedauth_max_body_size), 5 MiB by default.
+Both limits apply to the bytes received on the wire. For zstd on `/stateless`, the decoded body is
+capped by [`remoted.auth_max_decoded_body_size`](configuration.md#remotedauth_max_decoded_body_size),
+32 MiB by default, and charged to the shared
+[in-flight byte budget](configuration.md#remotedmax_inflight_bytes) and to the agent's
+[share of it](configuration.md#remotedmax_inflight_bytes_per_agent); the decoder also limits its
+window to 8 MiB. `/stateless` separately limits
+the header JSON to 8 KiB. On the legacy
+TCP/UDP channel a single agent message is bounded by the receive buffer, `OS_MAXSTR` (64 KiB).
+
+## Complete Batch Example
+
+### Simple Batch
+
+```
+H {"wazuh":{"agent":{"id":"001","name":"web-01","version":"v5.0.0","groups":["web"],"host":{"os":{"type":"linux"}}}}}
+E 1:syslog:{"timestamp":"2026-01-05T10:00:00Z","log":"Connection from 192.168.1.100"}
+E 1:syslog:{"timestamp":"2026-01-05T10:00:01Z","log":"Authentication successful"}
+```
+
+### Full Batch
+
+```http
+POST /events/enriched HTTP/1.1
+Host: localhost
+Content-Type: application/x-wev1
+X-Wazuh-Agent-Id: 001
+Content-Length: 682
+User-Agent: wazuh-manager-remoted/1.0
+Connection: keep-alive
+
+H {"wazuh":{"agent":{"id":"001","name":"web-server-01","version":"v5.0.0","groups":["web","production"],"host":{"architecture":"x86_64","hostname":"web-server-01","os":{"name":"Ubuntu","version":"22.04","platform":"ubuntu","type":"linux"}}},"cluster":{"name":"production","node":"master-node"}}}
+E 1:syslog:{"timestamp":"2026-01-05T10:00:00.000Z","log":"sshd[1234]: Connection from 192.168.1.100 port 54321"}
+E 1:syslog:{"timestamp":"2026-01-05T10:00:01.123Z","log":"sshd[1234]: Accepted publickey for admin from 192.168.1.100"}
+E 1:syslog:{"timestamp":"2026-01-05T10:00:02.456Z","log":"sudo: admin : TTY=pts/0 ; PWD=/home/admin ; USER=root ; COMMAND=/bin/systemctl restart nginx"}
+```
+
+## Parsing
+
+Read the first line as the header: it must begin with `H ` and the rest of the line is the JSON.
+Then split the remainder on the `\nE ` delimiter rather than on bare newlines, take the payload
+after the leading `E `, and unindent continuation lines by removing one leading space from each.
+Trailing newlines are trimmed from each event; blank lines between events are skipped.
+
+## Engine Responses
+
+- `200`: the batch was parsed and its events queued for processing.
+- `400`: the identity carrier is missing, repeated or noncanonical; the H-line identity is missing,
+  ambiguous, mismatched or has a dotted alias; or the H/E batch is malformed. The response is
+  `{"error": "<validation message>", "code": 400}`. Identity failures are rejected before any event
+  is enqueued and increment `agent.cache.rejected.identity`. Identity and parse warnings are
+  independently throttled to one per 90 seconds; their prefixes are `[API::Event] Identity rejected`
+  and `[API::Event] Failed to parse request`, respectively.
+- `500`: internal error in the engine.
+
+The engine's event server sets no request-size limit of its own. On the HTTPS path, remoted maps these
+answers onto what the agent receives (see [HTTPS Agent API](https-events-api.md#error-responses));
+the legacy dispatcher does not retry a failed batch. For an engine `400`, remoted preserves the
+HTTP status but replaces the body with `{"error":"Invalid event batch","code":400}`.
+
+## Security
+
+Unix socket transport (no network exposure). The engine sets the socket to mode `0660` after binding
+it, so only its owner and the `wazuh-manager` group can post events.
+
+## References
+
+- [Elastic Common Schema (ECS)](https://www.elastic.co/guide/en/ecs/current/)
+- [Stateless Metadata](stateless-metadata.md)
+- [Remoted Architecture](architecture.md)
+- [RFC 7230: HTTP/1.1 Message Syntax](https://tools.ietf.org/html/rfc7230)

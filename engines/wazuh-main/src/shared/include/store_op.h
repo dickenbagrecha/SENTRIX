@@ -1,0 +1,47 @@
+/* Copyright (C) Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
+ * All right reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+/* Common list API */
+
+#ifndef OS_STORE
+#define OS_STORE
+
+/* Store node */
+typedef struct _OSStoreNode {
+    struct _OSStoreNode *next;
+    struct _OSStoreNode *prev;
+    void *data;
+    char *key;
+    size_t key_size;
+} OSStoreNode;
+
+/* Store list */
+typedef struct _OSStore {
+    OSStoreNode *first_node;
+    OSStoreNode *last_node;
+    OSStoreNode *cur_node;
+
+    int currently_size;
+    int max_size;
+
+    pthread_rwlock_t wr_mutex; ///< RW for list (not the data inside the nodes)
+
+    void (*free_data_function)(void *data);
+} OSStore;
+
+OSStore *OSStore_Create(void);
+OSStore *OSStore_Free(OSStore *list) __attribute__((nonnull));
+
+int OSStore_Put(OSStore *list, const char *key, void *data) __attribute__((nonnull(1, 2)));
+int OSStore_GetPosition(OSStore *list, const char *key) __attribute__((nonnull));
+void *OSStore_Get(OSStore *list, const char *key) __attribute__((nonnull));
+OSStoreNode *OSStore_GetFirstNode(OSStore *list) __attribute__((nonnull));
+
+#endif /* OS_STORE */

@@ -1,0 +1,63 @@
+name: Go tests (windows)
+
+on:
+  push:
+    branches:
+      - master
+      - releases/**
+    paths-ignore:
+      - "README.md"
+  pull_request:
+    paths-ignore:
+      - "README.md"
+
+permissions:
+  contents: read
+
+env:
+  CROWDSEC_FEATURE_DISABLE_HTTP_RETRY_BACKOFF: true
+
+jobs:
+  build:
+    name: "Build + tests"
+    runs-on: windows-2025
+
+    steps:
+      - name: Check out CrowdSec repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+
+      - name: "Set up Go"
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          make build BUILD_RE2_WASM=1
+
+      - name: Generate codecov configuration
+        run: |
+          .github/generate-codecov-yml.sh >> .github/codecov.yml
+
+      - name: Unit tests
+        run: |
+          go install gotest.tools/gotestsum@v1.12.3
+          make testcover
+
+      - name: Upload unit coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: coverage.out
+          flags: unit-windows
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13
+          args: --issues-exit-code=1 --timeout 10m
+          only-new-issues: false

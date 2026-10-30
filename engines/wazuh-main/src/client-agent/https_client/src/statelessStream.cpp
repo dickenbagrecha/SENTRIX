@@ -1,0 +1,421 @@
+/*
+ * Wazuh agent HTTPS client (C++ transport module)
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#include "statelessStream.hpp"
+
+#include "external/nlohmann/json.hpp"
+#include "httpsHeaderLine.hpp"
+
+#include <cstddef>
+
+namespace
+{
+    /// Builds the H metadata line that opens every /stateless body (#37732).
+    ///
+    /// Always carries wazuh.agent.id -- the engine compares that identity with
+    /// X-Wazuh-Agent-Id, which remoted authors from the verified JWT, before
+    /// enqueueing the batch. This key must never move or disappear.
+    /// When collectHost is set and returns a parseable
+    /// JSON object (see bridge_on_collect_stateless_host()), its "agent" keys
+    /// (name/version/groups/host, already nested the way the manager's
+    /// strict_allow_templates wazuh.* mapping requires) are merged into
+    /// wazuh.agent alongside "id", and its "cluster" key is copied in as a
+    /// sibling of "agent" -- so cluster_name here is read from the exact same
+    /// agent_metadata_t the Start table's cluster_name comes from on
+    /// /stateful, not re-derived. This nesting is not cosmetic: the indexer
+    /// rejects (strict_dynamic_mapping_exception) any wazuh.* path it doesn't
+    /// already map, so groups/host/os MUST stay nested under agent exactly as
+    /// bridge_on_collect_stateless_host() builds them -- do not "flatten" this
+    /// merge to make it simpler.
+    ///
+    /// Built through the JSON library rather than concatenated, so a value
+    /// carrying a quote, a backslash or a newline cannot escape the string it
+    /// sits in -- controlStream.cpp builds its payloads the same way.
+    std::string buildHeaderLine(const std::string& agentId,
+                                const std::function<std::string()>& collectHost,
+                                HeaderLineTrim& trim)
+    {
+        trim = HeaderLineTrim::None;
+        nlohmann::json extra;
+
+        if (collectHost)
+        {
+            auto parsed = nlohmann::json::parse(collectHost(), nullptr, false);
+
+            if (!parsed.is_discarded() && parsed.is_object())
+            {
+                extra = std::move(parsed);
+            }
+        }
+
+        nlohmann::json agent;
+        agent["id"] = agentId;
+
+        if (const auto it = extra.find("agent"); it != extra.end() && it->is_object())
+        {
+            for (auto& [key, value] : it->items())
+            {
+                agent[key] = std::move(value);
+            }
+        }
+
+        nlohmann::json wazuh;
+        wazuh["agent"] = std::move(agent);
+
+        // cluster is agent's sibling under wazuh, not nested under it -- see
+        // append_header()'s cJSON_AddItemToObject(wazuh, "cluster", cluster)
+        // in remoted/src/secure.c, the shape this mirrors.
+        if (const auto it = extra.find("cluster"); it != extra.end())
+        {
+            wazuh["cluster"] = std::move(*it);
+        }
+
+        nlohmann::json header;
+        header["wazuh"] = std::move(wazuh);
+        auto json = header.dump();
+
+        // A long group list can push the line past remoted's cap. Groups go first,
+        // then everything but the id: events without them still beat no events.
+        if (json.size() > HTTPS_HEADER_LINE_JSON_MAX_BYTES)
+        {
+            header["wazuh"]["agent"].erase("groups");
+            json = header.dump();
+            trim = HeaderLineTrim::Groups;
+        }
+
+        if (json.size() > HTTPS_HEADER_LINE_JSON_MAX_BYTES)
+        {
+            header["wazuh"]["agent"] = {{"id", agentId}};
+            json = header.dump();
+            trim = HeaderLineTrim::AllButId;
+        }
+
+        return "H " + json + "\n";
+    }
+} // namespace
+
+StatelessStream::StatelessStream(const ModuleConfig& config,
+                                 IHttpPerformer& performer,
+                                 const ISigner& signer,
+                                 IClock& clock,
+                                 IRandom& random,
+                                 ICallbackSink& sink,
+                                 AuthGate& authGate,
+                                 CompressionGate& compressionGate,
+                                 std::function<std::string()> collectHost)
+    : m_config(config)
+    , m_signer(signer)
+    , m_clock(clock)
+    , m_authGate(authGate)
+    , m_accumulator(config.batchSizeBytes, config.bufferCapMultiplier, config.batchIntervalMs)
+    , m_payload(config.batchSizeBytes)
+    , m_backoff(config.backoffBaseMs, config.backoffCapMs, random)
+    , m_sender(performer,
+               signer,
+               clock,
+               m_backoff,
+               config.httpsCompressionEnabled,
+               &compressionGate,
+               &authGate,
+               config.serverEndpoint)
+    , m_sink(sink)
+    , m_collectHost(std::move(collectHost))
+    , m_headerLine(buildHeaderLine(signer.agentId(), m_collectHost, m_headerTrim))
+    , m_headerAgentId(signer.agentId())
+    , m_lastFlush(clock.steadyNow())
+    , m_ladder(config.bufferWarnLevel, config.bufferNormalLevel, config.bufferFloodToleranceS)
+    , m_headerTrimLimiter(clock)
+{
+}
+
+StatelessStream::SubmissionResult StatelessStream::submit(const uint8_t* frame, size_t length)
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    const auto eventBudget = eventBytesBudgetLocked();
+    const bool wasFlushDue = m_accumulator.flushDue(0, eventBudget);
+    const bool accepted = m_accumulator.append(frame, length);
+
+    if (!accepted)
+    {
+        m_droppedEvents++;
+    }
+
+    const bool isFlushDue = m_accumulator.flushDue(0, eventBudget);
+    publishLevelLocked(!accepted);
+    return SubmissionResult {accepted, accepted&& !wasFlushDue&& isFlushDue};
+}
+
+std::chrono::milliseconds StatelessStream::tick(Waiter& waiter, bool force)
+{
+    // Paused on a dead credential (401): the accumulator keeps filling (the
+    // drop-newest ladder still applies) but nothing is sent until a new key
+    // clears the pause (#37828).
+    if (m_authGate.paused())
+    {
+        return std::chrono::milliseconds {m_config.batchIntervalMs};
+    }
+
+    // Back-pressure (503/Retry-After) is honored inside RetrySender, which
+    // waits and retries on this stream's own thread; the next flush is thus
+    // naturally deferred while the accumulator (fed by the intake thread) keeps
+    // absorbing (D5/D6).
+    if (flushDue(force))
+    {
+        const auto outcome = flushOnce(waiter, m_config.requestTimeoutMs, m_config.statelessMaxAttempts);
+
+        if (outcome == OutcomeClass::Ok && flushDue(false))
+        {
+            // Keep draining back-to-back while a backlog stays above the threshold.
+            // The size condition is edge-triggered in submit() (it fires once, as
+            // the buffer crosses the mark), so without this a buffer that stays
+            // above the threshold would give up a whole batch interval per request
+            // and cap throughput at one payload per interval regardless of load.
+            return std::chrono::milliseconds::zero();
+        }
+
+        if (outcome == OutcomeClass::AuthFail)
+        {
+            // The manager keeps refusing this credential's signature/shape/timestamp/etc (not
+            // unknown_agent -- that pauses everything via the AuthGate above instead).
+            // RetrySender deliberately returns this outcome unescalated on every call (#39064),
+            // so nothing else slows this stream's own retry cadence: back off on the Backoff
+            // this stream's RetrySender already resets on success, instead of hammering the
+            // manager on the plain batch interval (#39601).
+            return m_backoff.next();
+        }
+
+        // Any other failure falls through to the plain interval, so a rejecting or
+        // back-pressuring manager is never hammered (back-pressure is already paced
+        // inside RetrySender itself).
+    }
+
+    return std::chrono::milliseconds {m_config.batchIntervalMs};
+}
+
+hc_buffer_level_t StatelessStream::level() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    return m_ladder.level();
+}
+
+uint64_t StatelessStream::droppedEvents() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    return m_droppedEvents;
+}
+
+bool StatelessStream::flushDue(bool force) const
+{
+    if (m_accumulator.empty())
+    {
+        return false;
+    }
+
+    if (force)
+    {
+        return true;
+    }
+
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(m_clock.steadyNow() - m_lastFlush).count();
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    return m_accumulator.flushDue(static_cast<uint64_t>(elapsed), eventBytesBudgetLocked());
+}
+
+OutcomeClass StatelessStream::flushOnce(Waiter& waiter, uint32_t timeoutMs, uint32_t maxAttempts)
+{
+    uint64_t eventBudget;
+    std::string headerLine;
+    std::string headerAgentId;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        // Refreshed here, not per event: cluster name and groups can only
+        // arrive after the first /control handshake, which may postdate this
+        // stream's construction. Once per flush is enough to pick that up
+        // without paying a metadata_provider read on every submit().
+        refreshHeaderLineLocked();
+        headerLine = m_headerLine;
+        headerAgentId = m_headerAgentId;
+        eventBudget = eventBytesBudgetLocked();
+    }
+    const auto snapshot = m_accumulator.snapshot(eventBudget);
+
+    HttpRequestSpec spec;
+    spec.target = "/stateless";
+    const std::string body = headerLine + snapshot.body;
+    spec.body = reinterpret_cast<const uint8_t*>(body.data());
+    spec.bodyLength = body.size();
+    spec.maxResponseBytes = SHORT_REPLY_MAX_RESPONSE_BYTES;
+    spec.timeoutMs = timeoutMs;
+
+    // Operational visibility (send-time debug log, mirroring controlStream.cpp's
+    // sendStartup()/sendNotify()/sendShutdown() and configFetcher.cpp's fetch()):
+    // confirms the flush was actually attempted, with the batch size that made
+    // it observable without source-level reasoning.
+    LOGFN_DEBUG2(m_logFn,
+                 "Sending /stateless batch (%llu events, %zu bytes).",
+                 static_cast<unsigned long long>(snapshot.eventCount),
+                 body.size());
+
+    const auto result = m_sender.send(spec, waiter, maxAttempts);
+    m_lastFlush = m_clock.steadyNow();
+
+    if (result.outcome == OutcomeClass::Ok)
+    {
+        LOGFN_DEBUG2(m_logFn, "Stateless batch delivered to the manager.");
+    }
+
+    handleOutcome(result.outcome, snapshot, m_signer.agentId() != headerAgentId);
+    return result.outcome;
+}
+
+void StatelessStream::handleOutcome(OutcomeClass outcome,
+                                    const EventAccumulator::Snapshot& snapshot,
+                                    bool identityChanged)
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+
+    if (outcome == OutcomeClass::Ok)
+    {
+        m_accumulator.consume(snapshot);
+        m_payload.onSuccess();     // Ramp the effective payload back toward the max.
+        m_oversizedWarned = false; // The manager accepts again: re-arm the warning.
+        publishLevelLocked(false);
+        return;
+    }
+
+    if (outcome == OutcomeClass::PayloadTooLarge)
+    {
+        // Split + resend smaller, never drop (#37835). The only exception: a
+        // lone event that already 413s cannot be split, so drop and count it.
+        if (snapshot.eventCount == 1)
+        {
+            m_accumulator.consume(snapshot);
+            m_droppedEvents++;
+
+            // Warn once per incident, then stay at debug. A manager cap below
+            // one event rejects every request, so an unconditional warning here
+            // would log once per dropped event at full intake rate.
+            if (!m_oversizedWarned)
+            {
+                m_oversizedWarned = true;
+                LOGFN_WARN(m_logFn,
+                           "Dropped a single oversized /stateless event the manager "
+                           "rejected with 413 (total dropped: %llu). Further unsplittable "
+                           "drops are logged at debug level until a batch is accepted.",
+                           static_cast<unsigned long long>(m_droppedEvents));
+            }
+            else
+            {
+                LOGFN_DEBUG2(m_logFn,
+                             "Dropped a single oversized /stateless event the "
+                             "manager rejected with 413 (total dropped: %llu).",
+                             static_cast<unsigned long long>(m_droppedEvents));
+            }
+
+            // The batch size was not the cause -- this one event is simply too
+            // big for the manager. Halving the budget again would only cost a
+            // round trip before the next event is tried.
+            publishLevelLocked(false);
+            return;
+        }
+
+        m_payload.onPayloadTooLarge(); // A multi-event batch stays for a smaller retry.
+        return;
+    }
+
+    if (outcome == OutcomeClass::Permanent)
+    {
+        if (identityChanged)
+        {
+            // hc_set_agent_identity() landed while this batch was in flight (the
+            // re-enroll path, #38465): the retry was signed by the new agent but
+            // the H line still named the old one, which the engine rejects with
+            // 400 (relayed by remoted). The events are fine -- keep them and let
+            // the next flush re-stamp the header with the live id.
+            LOGFN_DEBUG2(m_logFn,
+                         "Keeping a /stateless batch rejected with 4xx: the agent identity "
+                         "changed mid-flight; the next flush re-stamps its header.");
+            return;
+        }
+
+        m_accumulator.consume(snapshot); // Non-413 4xx: retrying identical bytes cannot help.
+        m_droppedEvents += snapshot.eventCount;
+        publishLevelLocked(false);
+        return;
+    }
+
+    // BackPressure/Retryable/AuthFail/RouteNotFound/Interrupted: keep the batch for
+    // the next tick. A 404 belongs here rather than with the drop above: it says the
+    // target does not exist, nothing about the payload, so the events are still good
+    // and a routing mistake must not consume them.
+}
+
+void StatelessStream::drain(Waiter& waiter)
+{
+    // Bounded in two directions. Iterations: bufferCapMultiplier + 1 covers a
+    // full buffer at the configured (max) payload; if 413s shrank the effective
+    // size, part of the backlog stays unsent rather than stalling the stop
+    // path. Per flush: the drain window and a single attempt, exactly like
+    // ControlStream::drainStep. This runs on the stop path with a waiter that
+    // is deliberately never stopped, so the full retry ladder (5 attempts,
+    // per-request timeout, back-off up to the cap) would hold process exit for
+    // minutes against a slow or back-pressuring manager -- on Windows from an
+    // atexit handler.
+    for (uint32_t iteration = 0; iteration <= m_config.bufferCapMultiplier; iteration++)
+    {
+        if (m_accumulator.empty() || flushOnce(waiter, m_config.drainTimeoutMs, 1) != OutcomeClass::Ok)
+        {
+            return;
+        }
+    }
+}
+
+void StatelessStream::publishLevelLocked(bool eventDropped)
+{
+    // Steady seconds: the FLOOD dwell must not be perturbed by wall-clock jumps
+    // (buffer.c uses time(0) only because it has no steady clock to hand).
+    const auto nowSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(m_clock.steadyNow().time_since_epoch()).count();
+    const auto transition = m_ladder.observe(m_accumulator.occupancyPercent(), eventDropped, nowSeconds);
+
+    if (transition.announce)
+    {
+        m_sink.onBufferLevel(transition.level);
+    }
+}
+
+uint64_t StatelessStream::eventBytesBudgetLocked() const
+{
+    const uint64_t requestBudget = m_payload.effectiveBytes();
+    const size_t headerBytes = m_headerLine.size();
+    return requestBudget > headerBytes ? requestBudget - headerBytes : 0;
+}
+
+void StatelessStream::refreshHeaderLineLocked()
+{
+    m_headerAgentId = m_signer.agentId();
+    m_headerLine = buildHeaderLine(m_headerAgentId, m_collectHost, m_headerTrim);
+
+    // Events then reach the manager without the agent's groups, which group-scoped rules
+    // and DLS roles depend on: say so, without a line per flush.
+    if (m_headerTrim != HeaderLineTrim::None)
+    {
+        if (const auto decision = m_headerTrimLimiter.record())
+        {
+            LOGFN_DEBUG1(m_logFn,
+                         "The /stateless H line would exceed %zu bytes; sent %llu time(s) %s.",
+                         HTTPS_HEADER_LINE_JSON_MAX_BYTES,
+                         static_cast<unsigned long long>(decision.total),
+                         m_headerTrim == HeaderLineTrim::Groups ? "without the agent groups"
+                         : "with only the agent id");
+        }
+    }
+}

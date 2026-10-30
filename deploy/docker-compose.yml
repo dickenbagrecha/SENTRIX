@@ -1,0 +1,150 @@
+version: '3.8'
+
+networks:
+  sentrix-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  sentrix-shared-logs:
+  crowdsec-data:
+  crowdsec-config:
+  wazuh-etc:
+  wazuh-var:
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. SENTRIX Core: Orchestrator, Unified Gateway & Event Health Hub
+  # ---------------------------------------------------------------------------
+  sentrix-core:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.core
+    container_name: sentrix-core
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"   # Bound to localhost for security
+    environment:
+      - SENTRIX_ENV=development
+      - SENTRIX_BIND_ADDRESS=0.0.0.0
+      - SENTRIX_HTTP_PORT=9000
+      - SENTRIX_LOG_LEVEL=info
+      - SENTRIX_CORAZA_URL=http://sentrix-waf-coraza:8080/healthz
+      - SENTRIX_CROWDSEC_URL=http://sentrix-crowdsec:8085/v1/health
+      - SENTRIX_PROMPTFOO_URL=http://sentrix-promptfoo:15500/healthz
+      - SENTRIX_WAZUH_URL=https://sentrix-wazuh-manager:55000/
+      - SENTRIX_MODSEC_URL=http://sentrix-modsec:8082/healthz
+    volumes:
+      - ./config/core.yaml:/etc/sentrix/core.yaml:ro
+      - sentrix-shared-logs:/var/log/sentrix
+    networks:
+      sentrix-net:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      - sentrix-waf-coraza
+      - sentrix-crowdsec
+
+  # ---------------------------------------------------------------------------
+  # 2. Coraza WAF: Edge Reverse Proxy Middleware
+  # ---------------------------------------------------------------------------
+  sentrix-waf-coraza:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.coraza-waf
+    container_name: sentrix-waf-coraza
+    restart: unless-stopped
+    ports:
+      - "8088:8080"   # HTTP Ingress (remapped to 8088 to avoid host port 8080 collision)
+    environment:
+      - WAF_LISTEN_ADDR=:8080
+      - BACKEND_URL=http://sentrix-core:9000
+      - WAF_RULES_FILE=/etc/coraza/waf.conf
+    volumes:
+      - ./config/coraza/waf.conf:/etc/coraza/waf.conf:ro
+      - sentrix-shared-logs:/var/log/sentrix
+    networks:
+      sentrix-net:
+        ipv4_address: 172.28.0.20
+
+  # ---------------------------------------------------------------------------
+  # 3. CrowdSec: IDS/IPS Engine, Threat Intelligence & LAPI
+  # ---------------------------------------------------------------------------
+  sentrix-crowdsec:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.crowdsec
+    container_name: sentrix-crowdsec
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8085:8085" # Local API (LAPI)
+      - "127.0.0.1:6060:6060" # Prometheus metrics
+    environment:
+      - DISABLE_ONLINE_API=true
+    volumes:
+      - ./config/crowdsec/config.yaml:/etc/crowdsec/config.yaml:ro
+      - ./config/crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro
+      - crowdsec-data:/var/lib/crowdsec/data
+      - sentrix-shared-logs:/var/log/sentrix:ro
+    networks:
+      sentrix-net:
+        ipv4_address: 172.28.0.30
+
+  # ---------------------------------------------------------------------------
+  # 4. Promptfoo: LLM Red Teaming & Guardrail Assessment Server
+  # ---------------------------------------------------------------------------
+  sentrix-promptfoo:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.promptfoo
+    container_name: sentrix-promptfoo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:15500:15500" # Web UI & REST API
+    environment:
+      - PROMPTFOO_DISABLE_TELEMETRY=true
+      - PROMPTFOO_PORT=15500
+    volumes:
+      - ./config/promptfoo/promptfoo.config.yaml:/app/promptfoo.config.yaml:ro
+    networks:
+      sentrix-net:
+        ipv4_address: 172.28.0.40
+
+  # ---------------------------------------------------------------------------
+  # 5. Wazuh Manager: SIEM, XDR, FIM & Compliance Server
+  # ---------------------------------------------------------------------------
+  sentrix-wazuh-manager:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.wazuh-manager
+    container_name: sentrix-wazuh-manager
+    profiles: ["wazuh", "all"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1514:1514/tcp"  # Agent communication
+      - "127.0.0.1:1515:1515/tcp"  # Agent registration
+      - "127.0.0.1:55000:55000"    # Wazuh REST API
+    volumes:
+      - wazuh-etc:/etc/wazuh-manager
+      - wazuh-var:/var/wazuh-manager
+      - sentrix-shared-logs:/var/log/sentrix:ro
+    networks:
+      sentrix-net:
+        ipv4_address: 172.28.0.50
+
+  # ---------------------------------------------------------------------------
+  # 6. ModSecurity 3: Secondary C++ WAF Benchmark & Test Service (Optional)
+  # ---------------------------------------------------------------------------
+  sentrix-modsec:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.modsecurity
+    container_name: sentrix-modsec
+    profiles: ["benchmark", "all"]
+    restart: "no"
+    ports:
+      - "127.0.0.1:8082:8082"
+    networks:
+      sentrix-net:
+        ipv4_address: 172.28.0.60

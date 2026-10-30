@@ -1,0 +1,34 @@
+name: 4.X - Coverity Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Project (use ossec-wazuh for development)"
+        required: true
+        type: choice
+        options:
+          - wazuh
+          - ossec-wazuh
+      threads:
+        description: "Number of threads for make -j (0 = auto)"
+        required: false
+        default: 0
+        type: number
+      docker_image_tag:
+        description: |
+          Tag name of the Docker image to be uploaded.
+          Use only '-', '_', '.' and alphanumeric characters.
+          Default is '4.x'.
+        required: false
+        default: "4.x"
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

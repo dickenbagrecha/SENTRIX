@@ -1,0 +1,91 @@
+# Examples
+
+Self-contained example configurations for `npx promptfoo@latest init --example <name>`.
+
+## CRITICAL: Test with Local Build
+
+```bash
+# Correct - tests your changes
+npm run local -- eval -c examples/my-example/promptfooconfig.yaml
+
+# Wrong - tests published version
+npx promptfoo@latest eval
+```
+
+## Example Structure
+
+Each example needs:
+
+1. Directory with clear name
+2. `README.md` starting with `# folder-name (Human Readable Name)`
+3. `promptfooconfig.yaml` with schema reference
+4. Instructions using `npx promptfoo@latest init --example <name>`
+
+## Configuration Format
+
+```yaml
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: Short description (3-10 words)
+prompts:
+  - ...
+providers:
+  - ...
+tests:
+  - ...
+```
+
+**Field order:** description, env, prompts, providers, defaultTest, scenarios, tests
+
+## Environment Variables in Configs
+
+Use Nunjucks template syntax to reference environment variables:
+
+```yaml
+# ✅ CORRECT - Nunjucks template syntax
+accountId: '{{env.CLOUDFLARE_ACCOUNT_ID}}'
+apiKey: '{{env.OPENAI_API_KEY}}'
+
+# ❌ WRONG - Shell syntax doesn't work in YAML configs
+accountId: ${CLOUDFLARE_ACCOUNT_ID}
+apiKey: $OPENAI_API_KEY
+```
+
+Note: Quotes around `'{{env.VAR}}'` are required in YAML to prevent parsing issues.
+
+## Model Selection
+
+Use current model identifiers (see `site/docs/providers/` for full list):
+
+- OpenAI: `openai:gpt-6-sol`, `openai:gpt-6-luna`, `openai:gpt-6-astra`
+- Anthropic: `anthropic:messages:claude-opus-5-5`, `anthropic:messages:claude-sonnet-5`, `anthropic:messages:claude-haiku-4-5-20251001`
+  - Claude 4.7+ and the Claude 5 family reject `temperature`/`top_p`/`top_k` and `thinking.budget_tokens`. Use `effort` (`low`–`max`) and `thinking: { type: adaptive }` instead.
+- Google: `google:gemini-3.1-pro-preview`, `google:gemini-2.5-flash`
+
+Prefer short IDs such as `openai:gpt-6-sol` for general-purpose examples; GPT-6 IDs default to Responses. Use explicit `openai:responses:<model>` or `openai:chat:<model>` IDs when selecting a different endpoint or comparing APIs. Match reasoning, tools, structured output, and image inputs to the selected endpoint.
+
+## Guidelines
+
+- Keep examples simple while demonstrating the concept
+- Use `file://` prefix for external files
+- Make test cases engaging, not boring
+- Document required environment variables in README
+- Test examples before submitting
+- **If adding example for a new provider**, verify docs exist at `site/docs/providers/<provider>.md`
+
+## Chat Format Prompts
+
+Some providers require specific message structures (e.g., exactly one system + one user message). Use a JSON file instead of inline YAML:
+
+```json
+// prompts/chat.json
+[
+  { "role": "system", "content": "You are a helpful assistant." },
+  { "role": "user", "content": "Help with: {{topic}}" }
+]
+```
+
+```yaml
+# promptfooconfig.yaml
+prompts:
+  - file://prompts/chat.json
+```

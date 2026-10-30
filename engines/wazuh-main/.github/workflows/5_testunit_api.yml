@@ -1,0 +1,110 @@
+name: 5.X - API - Unit tests
+
+on:
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/5_testunit_api.yml'
+      - 'api/**'
+      # The API imports the framework
+      - 'framework/**'
+      # The job builds wazuh-manager-conf, and test_spec_manager_configuration.py reads its schema
+      - 'src/shared_modules/manager_config/**'
+      # ...with the error catalogue on its include path (manager_config/CMakeLists.txt:50), whose
+      # codes framework/wazuh/core/manager_conf.py maps
+      - 'src/shared/include/error_messages/error_messages.h'
+      # Configure (src/CMakeLists.txt:86 includes src/cmake; ext_pugixml/ext_rapidjson are defined in
+      # src/external/CMakeLists.txt) and `make deps` (src/Makefile:708 runs get_git_refs.sh)
+      - 'src/CMakeLists.txt'
+      - 'src/cmake/**'
+      - 'src/external/CMakeLists.txt'
+      - 'src/Makefile'
+      - 'tools/get_git_refs.sh'
+      - 'src/deps.lock.mk'
+      # Tavern suite and its selection (5_testintegration_api-endpoints.yml), the dev environment,
+      # framework unit tests (5_testunit_framework.yml) and manager_config's C++ suites
+      - '!api/test/**'
+      - '!api/tools/**'
+      - '!framework/**/tests/**'
+      - '!src/shared_modules/manager_config/tests/**'
+      # ...except the RBAC bypass the controller tests import (api/api/controllers/test/*:
+      # `from wazuh.tests.util import RBAC_bypasser`)
+      - 'framework/wazuh/tests/util.py'
+      # Neither collected nor imported by `pytest api/api`: the framework CLIs (framework/scripts,
+      # imported by no api/ module), the embedded-Python build, the example, the installer's
+      # wrappers, Makefiles, setup.py and service functions, and the wodles' requirements
+      - '!framework/scripts/**'
+      - '!framework/cpython/**'
+      - '!framework/examples/**'
+      - '!framework/wrappers/**'
+      - '!framework/Makefile'
+      - '!framework/setup.py'
+      - '!framework/requirements-wodles*.txt'
+      # The job pins its interpreter in the matrix; it does not read framework/.python-version
+      - '!framework/.python-version'
+      - '!api/service/**'
+      - '!api/wrappers/**'
+      - '!api/Makefile'
+      - '!api/setup.py'
+      - '!**/*.md'
+  workflow_dispatch:
+    inputs:
+      generate_report:
+        description: 'Generate test report'
+        required: false
+        type: boolean
+        default: false
+      qa_branch:
+        description: 'QA repository branch'
+        required: false
+        default: 'main'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12']
+    env:
+      PYTHONPATH: /home/runner/work/wazuh/wazuh/api:/home/runner/work/wazuh/wazuh/framework
+      TEST_REPORT_PATH: /home/runner/work/test_report.txt
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: 'framework/requirements-dev.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r framework/requirements-dev.txt --no-build-isolation
+
+      - name: Build the manager configuration CLI
+        # wazuh.core.manager_conf consumes bin/wazuh-manager-conf (the daemons' loader); in a
+        # repository checkout it falls back to src/build/bin, so the suites need it built.
+        run: |
+          make -C src deps TARGET=manager -j$(nproc)
+          cmake -S src -B src/build -DTARGET=manager
+          cmake --build src/build --target wazuh-manager-conf -j$(nproc)
+
+      - name: Run API tests
+        run: |
+          set -o pipefail
+          python -m pytest api/api -vv --ignore=test --cov=api | tee ${TEST_REPORT_PATH}
+
+      - name: Generate test report
+        if: inputs.generate_report
+        run: |
+          git clone -b ${{ inputs.qa_branch }} --single-branch https://github.com/wazuh/qa-integration-framework.git
+          python qa-integration-framework/src/wazuh_testing/scripts/pytest_results_parser.py -f ${TEST_REPORT_PATH}

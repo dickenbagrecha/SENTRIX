@@ -1,0 +1,20 @@
+name: 4.X - AWS - Integration tests - Tier 0 and 1
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch"
+        required: true
+        default: "main"
+      base_qa_it_fw_branch:
+        description: "Base qa-integration-framework branch"
+        required: true
+        default: "main"
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

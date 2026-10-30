@@ -1,0 +1,1008 @@
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+import asyncio
+import json
+import jsonschema
+import logging
+import os
+import re
+
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from time import perf_counter
+from typing import Any, Dict, Optional, List, Set
+
+from wazuh.core import common
+from wazuh.core.agent import WazuhDBQueryAgents
+from wazuh.core.cluster.utils import ClusterFilter
+from wazuh.core.exception import WazuhError, WazuhException, IndexerUnavailableError
+from wazuh.core.indexer.indexer import get_indexer_client
+from wazuh.core.task_http import TaskManagerHTTPClient
+
+
+AR_INDEX = "wazuh-active-responses*"
+
+#: How long the event a response references may stay invisible before the response is given up on.
+#: The event is written to a different index by a different pipeline, so a response can be readable
+#: here while its event is not refresh-visible yet. Under this age the page is held and read again
+#: on the next cycle; over it the reference is taken as broken, which is what keeps an event that
+#: never appears from freezing the cursor for the whole fleet.
+EVENT_VISIBILITY_GRACE_SECONDS = 120
+
+#: Documents read per polling cycle. Also the distance between two cursor writes.
+DEFAULT_PAGE_SIZE = 1000
+
+#: `WazuhError` code TaskManagerHTTPClient raises for a non-2xx answer -- the module received the
+#: request and refused it. Distinguished from every transport failure at the dispatch handler
+#: below, because a refusal is terminal for one document while a transport failure is not.
+HTTP_REJECTED_CODE = 2019
+
+#: The indices `event.index` may name. The event is fetched with the manager's own indexer
+#: credentials and merged into a payload delivered to agents, so the name is an allow-list, not a
+#: free target: the event and findings families only, as a concrete index or a data stream's
+#: backing index, and nothing that the indexer would expand (`,`, `*`, `?`, `-` exclusions,
+#: `<date math>`, `cluster:` prefixes) since every character outside [a-z0-9._-] is refused.
+EVENT_INDEX_PATTERN = r"^(?:\.ds-)?wazuh-(?:events|findings)-v5-[a-z0-9][a-z0-9._-]*\Z"
+_EVENT_INDEX_RE = re.compile(EVENT_INDEX_PATTERN)
+
+#: The document contract, as the code depends on it. The readable version is the "Manager-side
+#: ingestion" section of docs/ref/modules/active-response/architecture.md; keep the two aligned.
+AR_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "event": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "string", "pattern": EVENT_INDEX_PATTERN},
+                "doc_id": {"type": "string", "minLength": 1},
+            },
+            "required": ["index", "doc_id"],
+        },
+        "wazuh": {
+            "type": "object",
+            "properties": {
+                "active_response": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": ["string", "null"]},
+                        "executable": {"type": "string"},
+                        "extra_arguments": {"type": ["string", "null"]},
+                        "location": {
+                            "type": "string",
+                            "enum": ["local", "all", "defined-agent"],
+                        },
+                        "name": {"type": "string"},
+                        "stateful_timeout": {"type": ["integer", "null"], "minimum": 0},
+                        "type": {
+                            "type": "string",
+                            "enum": ["stateful", "stateless"],
+                        },
+                    },
+                    "required": [
+                        "executable",
+                        "extra_arguments",
+                        "location",
+                        "name",
+                        "type",
+                    ],
+                    "additionalProperties": False,
+                    "allOf": [
+                        {
+                            "if": {"properties": {"type": {"const": "stateful"}}},
+                            "then": {"required": ["stateful_timeout"]},
+                        },
+                        {
+                            "if": {
+                                "properties": {"location": {"const": "defined-agent"}}
+                            },
+                            "then": {
+                                "required": ["agent_id"],
+                                "properties": {"agent_id": {"type": "string", "minLength": 1}},
+                            },
+                        },
+                    ],
+                }
+            },
+            "required": ["active_response"],
+            "additionalProperties": True,
+        }
+    },
+    "required": ["event", "wazuh"],
+    "additionalProperties": True,
+    # An absent key satisfies a `properties` clause, so the `if` states its own `required` at every
+    # level instead of relying on the ones above.
+    "allOf": [
+        {
+            "if": {
+                "required": ["wazuh"],
+                "properties": {
+                    "wazuh": {
+                        "required": ["active_response"],
+                        "properties": {
+                            "active_response": {
+                                "required": ["location"],
+                                "properties": {"location": {"const": "local"}},
+                            }
+                        },
+                    }
+                },
+            },
+            "then": {
+                "properties": {
+                    "wazuh": {
+                        "required": ["agent"],
+                        "properties": {
+                            "agent": {
+                                "type": "object",
+                                "required": ["id"],
+                                "properties": {"id": {"type": "string", "minLength": 1}},
+                            }
+                        },
+                    }
+                }
+            },
+        }
+    ],
+}
+
+
+def _usable_event_ref(index: Any, doc_id: Any) -> bool:
+    """Whether an `event` reference may be looked up: a permitted index and a non-empty id.
+
+    The single predicate both get_events_by_ar() and enrich_ar_with_events_info() apply, because
+    the two decisions have to agree: a reference refused here can never be "not visible yet". It
+    restates AR_SCHEMA's `event` clause for a caller that skips validation, since the mget it
+    guards runs with the manager's credentials.
+
+    Parameters
+    ----------
+    index : Any
+        The `event.index` value of an active response document.
+    doc_id : Any
+        The `event.doc_id` value of an active response document.
+
+    Returns
+    -------
+    bool
+        True if the reference names an allowed index and a non-empty document id.
+    """
+    return (
+        isinstance(index, str)
+        and _EVENT_INDEX_RE.match(index) is not None
+        and isinstance(doc_id, str)
+        and bool(doc_id)
+    )
+
+
+def _ar_age_seconds(doc_source: Dict[str, Any]) -> Optional[float]:
+    """Age of an active response document, or None when its `@timestamp` cannot be read.
+
+    Parameters
+    ----------
+    doc_source : Dict[str, Any]
+        The `_source` of an active response document.
+
+    Returns
+    -------
+    Optional[float]
+        Seconds since the document was stamped, or None if the field is missing or unparseable.
+    """
+    try:
+        stamped = datetime.fromisoformat(str(doc_source["@timestamp"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    # A stamp without an offset is read as UTC, the same assumption the query's bound makes.
+    if stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=timezone.utc)
+
+    return (datetime.now(timezone.utc) - stamped).total_seconds()
+
+
+@dataclass
+class ActiveResponseBookmark:
+    sort: list[Any] = field(default_factory=list)
+    sort_fields: list[str] = field(default_factory=lambda: ["@timestamp", "_id"])
+    only_events_after: int | None = None
+    #: How far the last page read reached, whatever happened to each of its documents. Not
+    #: persisted: it is the input to the single `update()` the caller makes once the page is
+    #: processed. See the cursor contract in ActiveResponseBuilder.dispatch().
+    page_end_sort: list[Any] | None = None
+
+    def build_sort(self) -> List[Dict[str, str]]:
+        """Build the sort structure for OpenSearch queries.
+
+        Returns
+        -------
+        List[Dict[str, str]]
+            List of dictionaries defining the sort order.
+        """
+        return [{field: "asc"} for field in self.sort_fields]
+
+    def to_search_after(self) -> Optional[List[Any]]:
+        """Return the search_after parameter if sort data exists.
+
+        Returns
+        -------
+        Optional[List[Any]]
+            Sort values for pagination or None if empty.
+        """
+        return self.sort if self.sort else None
+
+    def update(self, sort: List[Any]) -> None:
+        """Update the internal sort state.
+
+        Parameters
+        ----------
+        sort : List[Any]
+            New sort values to store.
+        """
+        self.sort = sort
+
+
+class ActiveResponseBookmarkFile(ActiveResponseBookmark):
+    def __init__(self, path: str = common.AR_BOOKMARK_FILEPATH, **kwargs: Any):
+        """Initialize the bookmark file handler.
+
+        Parameters
+        ----------
+        path : str, optional
+            Path to the bookmark JSON file.
+        **kwargs : Any
+            Additional arguments for the base class.
+        """
+        super().__init__(**kwargs)
+        self.path = path
+        self._load()
+
+    def _load(self) -> None:
+        """Load bookmark data from the JSON file."""
+        if not os.path.exists(self.path):
+            return
+
+        try:
+            with open(self.path, "r") as f:
+                data = json.load(f)
+                if data:
+                    self.sort = data.get("sort", [])
+                    self.sort_fields = data.get("sort_fields", self.sort_fields)
+                    self.only_events_after = data.get("only_events_after")
+        except (json.JSONDecodeError, IOError):
+            return
+
+        self._clamp_sort_to_present()
+
+    def _clamp_sort_to_present(self) -> None:
+        """Cap the loaded cursor's `@timestamp` at the present instant and persist the cap."""
+        # A cursor written by a version that advanced it once per delivered response can hold a
+        # future `@timestamp`: nothing upstream validates the field, and clock skew on the node
+        # that stamped the document is enough to produce one. search_after would then ask for
+        # documents sorting after an instant the query's own `lte: now` ceiling excludes, so every
+        # cycle reads zero hits until wall-clock time catches up and the only recovery is deleting
+        # this file by hand. Capping unfreezes the stream; it does not recover the responses that
+        # cursor already skipped. Persisted right here, because a cycle that reads no hits writes
+        # no cursor, which would leave the bad value on disk for the next restart to load again.
+        if not self.sort or isinstance(self.sort[0], bool) or not isinstance(self.sort[0], (int, float)):
+            return
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        if self.sort[0] <= now_ms:
+            return
+
+        ActiveResponseHelpers.logger.warning(
+            f"Active response bookmark `{self.path}` points at {self.sort[0]}, ahead of the "
+            f"present instant. Capping it at {now_ms}; delivery would otherwise stay frozen until "
+            f"wall-clock time reached it. Responses stamped before that point were already skipped."
+        )
+        self.sort = [now_ms, *self.sort[1:]]
+        self._save()
+
+    def _save(self) -> None:
+        """Persist current bookmark data to the JSON file."""
+        data = {
+            "sort": self.sort,
+            "sort_fields": self.sort_fields,
+            "only_events_after": self.only_events_after,
+        }
+        with open(self.path, "w") as f:
+            json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def ensure_only_events_after(self) -> int:
+        """Set and save initial timestamp if not present.
+
+        Returns
+        -------
+        int
+            The UTC timestamp in milliseconds.
+        """
+        if self.only_events_after is None:
+            self.only_events_after = int(datetime.now(timezone.utc).timestamp() * 1000)
+            self._save()
+        return self.only_events_after
+
+    def update(self, sort: List[Any]) -> None:
+        """Update the sort state and persist changes to disk.
+
+        Parameters
+        ----------
+        sort : List[Any]
+            New sort values to store and save.
+        """
+        if self.sort != sort:
+            self.sort = sort
+            self._save()
+
+
+@dataclass
+class ActiveResponse:
+    """Represents a single Active Response with its associated data."""
+
+    doc_source: Dict[str, Any]
+    bookmark: ActiveResponseBookmark
+    event: Optional[Dict[str, Any]] = None
+    doc_id: Optional[str] = None  # Indexer document _id (for task source_id)
+
+    def target_agents(self, all_agents: List[str]) -> List[str]:
+        """Determine target agent IDs based on AR location.
+
+        Parameters
+        ----------
+        all_agents : List[str]
+            List of all agent IDs (used for "all" location only).
+
+        Returns
+        -------
+        List[str]
+            List of agent IDs that should receive the AR.
+        """
+        location = self.doc_source["wazuh"]["active_response"]["location"]
+
+        match location:
+            case "all":
+                return all_agents
+
+            case "local":
+                agent_id = self.doc_source["wazuh"]["agent"]["id"]
+                # HTTPS: Create task regardless of connection status
+                return [agent_id] if agent_id else []
+
+            case "defined-agent":
+                agent_id = self.doc_source["wazuh"]["active_response"]["agent_id"]
+                # HTTPS: Create task regardless of connection status
+                return [agent_id] if agent_id else []
+
+        return []
+
+
+class ActiveResponseHelpers:
+    logger = logging.getLogger("wazuh")
+
+    @staticmethod
+    def get_all_agents() -> List[str]:
+        """Retrieve the list of all agents (HTTPS: no status/node filtering).
+
+        Returns
+        -------
+        List[str]
+            List of all agent IDs.
+        """
+
+        agents = []
+
+        # HTTPS: No status or node filtering - tasks stored in DB until agent polls
+        filters = {}
+
+        try:
+            with WazuhDBQueryAgents(
+                limit=None, select=["id"], filters=filters
+            ) as db_query:
+                data = db_query.run()
+
+            agents = [data["id"] for data in data["items"]]
+        except WazuhError as e:
+            ActiveResponseHelpers.logger.error(f"Error fetching agents: {e}")
+
+        return agents
+
+    @staticmethod
+    async def fetch_active_response_docs(
+        bookmark: ActiveResponseBookmark,
+        validate: bool = False,
+        max: int = DEFAULT_PAGE_SIZE,
+        discards: Optional[Counter] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch active response documents incrementally from OpenSearch.
+
+        Parameters
+        ----------
+        bookmark : ActiveResponseBookmark
+            Object containing pagination and filtering state.
+        validate : bool, optional
+            Whether to validate documents against the JSON schema, by default False.
+        max : int, optional
+            Maximum number of documents to retrieve, by default DEFAULT_PAGE_SIZE.
+        discards : Optional[Counter], optional
+            Incremented under `invalid_schema` for every document validation rejects.
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of OpenSearch hits matching the query.
+        """
+
+        query = {
+            "size": max,
+            "sort": bookmark.build_sort(),
+            "query": {
+                "bool": {
+                    "filter": [],
+                    "must_not": [{ "regexp": {"wazuh.agent.version": "v[0-4]\\..*" }}],
+                }
+            },
+        }
+
+        search_after = bookmark.to_search_after()
+
+        # Never read past the present. The cursor pages `@timestamp` ascending and is written from
+        # the last document processed, so a single document stamped in the future would move it
+        # beyond every active response created before that instant and stop delivery for the whole
+        # fleet until wall-clock time catches up. Nothing upstream validates the field, and clock
+        # skew on the node that stamped it is enough to produce one.
+        #
+        # Bounding the read rather than the write is what keeps this from trading one failure for
+        # another: such a document is simply not returned until its own time arrives, so the cursor
+        # never has to refuse to advance, and the document is not re-fetched and re-dispatched on
+        # every polling cycle in the meantime.
+        #
+        # The bound is this node's wall clock, so a clock stepped backwards past the cursor returns
+        # nothing until it catches up: delivery stalls for the length of the step and then resumes
+        # on its own. That is the accepted cost of bounding the read.
+        timestamp_range: Dict[str, int] = {}
+
+        if search_after:
+            query["search_after"] = search_after
+        else:
+            timestamp_range["gte"] = bookmark.ensure_only_events_after()
+
+        # Read after the lower bound is resolved, never before: on the first run ever
+        # ensure_only_events_after() stamps its own now(), and taking this one first would put the
+        # ceiling below the floor and return an empty first page.
+        timestamp_range["lte"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        query["query"]["bool"]["filter"].append({"range": {"@timestamp": timestamp_range}})
+
+        ActiveResponseHelpers.logger.debug(f"Documents retrieval query: {query}")
+
+        # Execute search
+        async with get_indexer_client() as client:
+            resp = await client.search(index=AR_INDEX, body=query)
+
+        docs = []
+        hits = resp["hits"]["hits"]
+
+        # Recorded before anything is filtered out below: the cursor is a high-water mark of what
+        # was READ, so a document this loop discards (invalid schema) must not hold it back.
+        if hits:
+            bookmark.page_end_sort = hits[-1]["sort"]
+
+        ActiveResponseHelpers.logger.debug(
+            f"{ len(hits) or  'No' } active reponse documents fetched."
+        )
+
+        for doc in hits:
+            try:
+                if validate:
+                    jsonschema.validate(instance=doc["_source"], schema=AR_SCHEMA)
+                docs.append(doc)
+            except jsonschema.ValidationError as e:
+                if discards is not None:
+                    discards["invalid_schema"] += 1
+                # Terminal: the document will never validate, so the page moves past it and the
+                # response is lost. Above debug level because that loss is silent otherwise.
+                # One line: the exception itself carries the whole schema and instance, up to 63
+                # lines for a failure at the root, and json_path is what names the field.
+                ActiveResponseHelpers.logger.warning(
+                    f"Discarding active response document `{doc['_id']}` (`{doc['_index']}`). "
+                    f"Reason: {e.json_path}: {e.message}"
+                )
+                ActiveResponseHelpers.logger.debug(
+                    f"Validation report for `{doc['_id']}` (`{doc['_index']}`): {e}"
+                )
+
+        return docs
+
+    @staticmethod
+    async def get_events_by_ar(ars: List[ActiveResponse]) -> Dict[str, Dict[str, Any]]:
+        """Retrieve the events associated with the given active responses.
+
+        Parameters
+        ----------
+        ars : List[ActiveResponse]
+            List of active response objects to enrich.
+
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            Dictionary structured as {index: {doc_id: event_source}}.
+        """
+
+        # Group by index
+        docs_by_index: Dict[str, Set[str]] = {}
+
+        for ar in ars:
+            try:
+                index = ar.doc_source["event"]["index"]
+                doc_id = ar.doc_source["event"]["doc_id"]
+            except (KeyError, TypeError):
+                index = doc_id = None
+
+            # Without AR_SCHEMA, `event` and both of these can be any JSON value. Checked before the
+            # insert rather than caught after it: a null index is hashable, so it raises nothing
+            # here and comes back as a 400 from mget instead, aborting the whole page. And the index
+            # is an allow-list, not a free target: the mget below reads with the manager's
+            # credentials and its result is delivered to agents.
+            if not _usable_event_ref(index, doc_id):
+                ActiveResponseHelpers.logger.warning(f"Active response `{ar.doc_id}` carries no usable event reference. Discarding it.")
+                continue
+
+            docs_by_index.setdefault(index, set()).add(doc_id)
+
+        events = {}
+
+        if docs_by_index:
+            ActiveResponseHelpers.logger.debug(f"Fetching events: {docs_by_index}")
+
+        async with get_indexer_client() as client:
+            for index, doc_ids in docs_by_index.items():
+                resp = await client.mget(index=index, body={"ids": list(doc_ids)})
+                for event in resp.get("docs", []):
+                    # `found` without `_source` is an index that does not store it: the reference
+                    # then reads as not visible and expires with the grace window.
+                    if event.get("found") and "_source" in event:
+                        idx = event["_index"]
+                        doc_id = event["_id"]
+                        events.setdefault(idx, {})[doc_id] = event["_source"]
+
+        return events
+
+
+class ActiveResponseBuilder:
+    def __init__(
+        self,
+        logger: logging.Logger,
+        all_agents: Optional[List[str]] = None,
+        bookmark_file: Optional[ActiveResponseBookmarkFile] = None,
+        page_size: Optional[int] = None,
+        event_grace: Optional[int] = None,
+    ):
+        """Initialize the AR builder.
+
+        Parameters
+        ----------
+        logger : logging.Logger
+            Logger instance for reporting.
+        all_agents : Optional[List[str]], optional
+            List of all agent IDs, by default None (retrieves automatically).
+        bookmark_file : Optional[ActiveResponseBookmarkFile], optional
+            Bookmark handler, by default None (creates new).
+        page_size : Optional[int], optional
+            Documents read per cycle, by default DEFAULT_PAGE_SIZE.
+        event_grace : Optional[int], optional
+            Seconds a response may wait for its event to become visible, by default
+            EVENT_VISIBILITY_GRACE_SECONDS.
+        """
+        self.logger = logger
+        self._page_size = page_size if page_size is not None else DEFAULT_PAGE_SIZE
+        self._event_grace = (
+            event_grace if event_grace is not None else EVENT_VISIBILITY_GRACE_SECONDS
+        )
+        self._all_agents = (
+            all_agents
+            if all_agents is not None
+            else ActiveResponseHelpers.get_all_agents()
+        )
+        self._ars: List[ActiveResponse] = []
+        #: Per-cycle accounting: every response read ends in exactly one of these, so
+        #: read == dispatched + held + sum(discards.values()).
+        self.read: Optional[int] = None
+        self.dispatched = 0
+        self.held = 0
+        self.discards: Counter = Counter()
+        self._bookmark_file = (
+            bookmark_file if bookmark_file is not None else ActiveResponseBookmarkFile()
+        )
+
+    async def fetch_ars(self, validate: bool = True) -> "ActiveResponseBuilder":
+        """Fetch AR documents and initialize objects.
+
+        Parameters
+        ----------
+        validate : bool, optional
+            Whether to validate docs against schema, by default True.
+
+        Returns
+        -------
+        ActiveResponseBuilder
+            The builder instance.
+        """
+        docs = await ActiveResponseHelpers.fetch_active_response_docs(
+            self._bookmark_file, validate=validate, max=self._page_size, discards=self.discards
+        )
+        self.read = len(docs) + self.discards["invalid_schema"]
+        self._ars = [
+            ActiveResponse(
+                doc_source=doc["_source"],
+                bookmark=ActiveResponseBookmark(doc["sort"]),
+                doc_id=doc.get("_id")
+            )
+            for doc in docs
+        ]
+        return self
+
+    async def enrich_ar_with_events_info(
+        self, allow_empty_event: bool = False
+    ) -> "ActiveResponseBuilder":
+        """Enrich active responses with their associated event data.
+
+        Parameters
+        ----------
+        allow_empty_event : bool, optional
+            Whether to keep ARs when the event is missing, by default False.
+
+        Returns
+        -------
+        ActiveResponseBuilder
+            The builder instance.
+        """
+
+        events = await ActiveResponseHelpers.get_events_by_ar(self._ars)
+
+        ars_with_events = []
+
+        # How far the cursor may reach if the page has to be held: the last response resolved
+        # before the first one that was not. See the cursor contract in dispatch().
+        resolved_through: Optional[List[Any]] = None
+        holding = False
+
+        for ar in self._ars:
+            # Bound before the try: the handler's message reads both. isinstance, not `or {}`:
+            # a non-empty string `event` is truthy and has no .get().
+            event_ref = ar.doc_source.get("event")
+            event_ref = event_ref if isinstance(event_ref, dict) else {}
+            index_id = event_ref.get("index")
+            event_id = event_ref.get("doc_id")
+            # Same predicate get_events_by_ar() applies before the mget, because the two decisions
+            # have to agree: a reference it refused to look up can never be "not visible yet".
+            usable = _usable_event_ref(index_id, event_id)
+
+            try:
+                ar.event = events[index_id][event_id]
+                keep = True
+            except (KeyError, TypeError):
+                keep = allow_empty_event
+                if keep:
+                    self.logger.debug(f"Expected event `{event_id}` (`{index_id}`) not found.")
+
+            if keep:
+                ars_with_events.append(ar)
+                if not holding:
+                    resolved_through = ar.bookmark.sort
+                continue
+
+            if not usable:
+                # Terminal, and already reported at WARNING by get_events_by_ar(), which dropped the
+                # reference before the mget rather than asking the indexer about a null index.
+                self.logger.debug(
+                    f"Discarding active response `{ar.doc_id}`: its event reference is unusable."
+                )
+                self.discards["unusable_event_reference"] += 1
+                continue
+
+            age = _ar_age_seconds(ar.doc_source)
+
+            # Two different failures reach here in the same shape. An event written moments ago may
+            # simply not be refresh-visible yet, and the response is still deliverable on the next
+            # cycle: hold the cursor short of it instead of losing it, which is what the per-response
+            # cursor used to do by accident whenever the discard happened to be last on the page. An
+            # event still missing after the grace window is not coming, and holding the cursor for it
+            # would stop delivery for the whole fleet, so that one is dropped and said out loud. A
+            # negative age is a document stamped ahead of this node's clock, which the query's upper
+            # bound already excludes: it is not "written moments ago" and must not hold.
+            if age is not None and 0 <= age < self._event_grace:
+                if not holding:
+                    holding = True
+                    # One high-water mark cannot both hold here and clear the terminal documents
+                    # earlier on this page, so those are read again every cycle the hold lasts and
+                    # their discard is reported again with them. Bounded by the grace window, and
+                    # the alternative is the per-document state this cursor exists to avoid.
+                    self._bookmark_file.page_end_sort = resolved_through
+                self.logger.debug(
+                    f"Expected event `{event_id}` (`{index_id}`) is not visible yet. "
+                    f"Holding active response `{ar.doc_id}` and the rest of the page."
+                )
+                self.held += 1
+                continue
+
+            reason = (
+                f"not found after {self._event_grace}s"
+                if age is not None
+                else "not found, and the response carries no readable @timestamp"
+            )
+            self.logger.warning(
+                f"Expected event `{event_id}` (`{index_id}`) {reason}. "
+                f"Discarding active response `{ar.doc_id}`."
+            )
+            self.discards["event_not_visible_expired"] += 1
+
+        self._ars = ars_with_events
+
+        return self
+
+    def dispatch(self) -> "ActiveResponseBuilder":
+        """Dispatch active responses to their target agents via Task Manager.
+
+        Returns
+        -------
+        ActiveResponseBuilder
+            The builder instance.
+        """
+        msgs_sent = 0
+        # Set by the WazuhException handler below, and the reason the cursor write at the end is
+        # conditional: a Task Manager that cannot be reached is transient and page-wide.
+        transport_failed = False
+
+        # One client for the whole pass. Each request still gets its own connection -- the Task
+        # Manager answers one request per connection and closes it -- but the client, and the
+        # transport it holds, are built once instead of once per agent.
+        with TaskManagerHTTPClient() as task_client:
+            for ar in self._ars:
+                try:
+                    # Extract timestamp from AR document (for deterministic task ID)
+                    timestamp_str = ar.doc_source.get("@timestamp")
+                    if not timestamp_str:
+                        self.logger.warning(
+                            f"AR document {ar.doc_id} missing @timestamp, skipping"
+                        )
+                        self.discards["unparseable_timestamp"] += 1
+                        continue
+
+                    # Convert ISO8601 timestamp to Unix timestamp
+                    try:
+                        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        create_time = int(dt.timestamp())
+                    except (ValueError, AttributeError) as e:
+                        self.logger.error(
+                            f"Failed to parse @timestamp '{timestamp_str}' from AR {ar.doc_id}: {e}"
+                        )
+                        self.discards["unparseable_timestamp"] += 1
+                        continue
+
+                    # Build payload (merge AR source with event if available)
+                    payload = dict(ar.doc_source)
+                    if ar.event:
+                        wazuh = ar.doc_source.get("wazuh", {}).copy()
+                        event_wazuh = ar.event.get("wazuh", {})
+                        payload = {**ar.doc_source, **ar.event}
+                        payload["wazuh"] = {**event_wazuh, **wazuh}
+
+                    # Dispatch to each target agent
+                    targets = ar.target_agents(self._all_agents)
+                    if not targets:
+                        self.logger.warning(
+                            f"Active response `{ar.doc_id}` targets no agent. Discarding it."
+                        )
+                        self.discards["zero_targets"] += 1
+                        continue
+
+                    created = 0
+                    unreachable = False
+                    for agent_id in targets:
+                        try:
+                            self.logger.debug(
+                                f"Creating task for agent `{agent_id}` (AR {ar.doc_id})"
+                            )
+
+                            # The Task Manager answers 2xx with a task id and raises on anything else, so
+                            # there is no status member to inspect: reaching the next line means the row
+                            # exists. source_id is the AR document id, mixed into the deterministic task id
+                            # so the same alert produces the same task on any cluster node.
+                            response = task_client.create_task(
+                                agent_id=agent_id,
+                                task_type="active_response",
+                                create_time=create_time,
+                                payload=payload,
+                                source_id=ar.doc_id,
+                            )
+
+                            self.logger.debug(
+                                f"Created task {response.get('task_id')} for agent {agent_id}"
+                            )
+                            created += 1
+
+                        # WazuhException, not WazuhError: the two are siblings under it, and the
+                        # client raises both. Catching the narrow one let a dead Task Manager escape
+                        # the whole loop, which aborted the cycle from that response on.
+                        #
+                        # THE SPLIT BELOW IS THE CURSOR CONTRACT'S HALF OF THE WORK, and it had to be
+                        # rewritten when this stopped being a framed socket. WazuhSocketJSON with
+                        # receive(raw=True) never raised for a task the module REFUSED -- that arrived
+                        # as `status != "ok"` in the body -- so everything reaching the handler was
+                        # transport and a blanket `transport_failed = True` was right.
+                        # TaskManagerHTTPClient raises on a non-2xx instead, so a permanently invalid
+                        # document (a payload over the cap, a timestamp outside the admission window)
+                        # now lands here too. Holding the page for one of those would freeze the cursor
+                        # on it for as long as the document exists -- the exact failure the contract
+                        # below says was already fixed once.
+                        #
+                        # So: 2019 is the module answering and refusing, which is terminal for THIS
+                        # document and must let the page advance past it. Everything else -- every
+                        # WazuhInternalError (2018 construct, 2020 timeout, 2021 connect, 2022
+                        # unparseable) and WazuhError 2013 (send failed) -- says nothing about this
+                        # response and will resolve on its own, so the page is held and read again.
+                        except WazuhException as e:
+                            if isinstance(e, WazuhError) and e.code == HTTP_REJECTED_CODE:
+                                self.logger.error(
+                                    f"Task Manager refused the task for agent `{agent_id}`: {e}"
+                                )
+                            else:
+                                transport_failed = True
+                                unreachable = True
+                                self.logger.error(
+                                    f"Failed to create task for agent `{agent_id}`: {e}"
+                                )
+
+                    msgs_sent += created
+                    if created:
+                        self.dispatched += 1
+                    elif unreachable:
+                        self.held += 1
+                    else:
+                        self.discards["task_manager_refused"] += 1
+                # Terminal: the document raised on its own shape, so it can never succeed and the
+                # page advances past it. Cannot mask transport_failed: the handler above does not
+                # re-raise, so nothing from create_task() reaches here.
+                except Exception as e:
+                    self.logger.warning(
+                        f"Discarding active response document `{ar.doc_id}`: unusable shape "
+                        f"({type(e).__name__}: {e})."
+                    )
+                    self.discards["unusable_shape"] += 1
+
+        read = self.read if self.read is not None else len(self._ars)
+        summary = f"Created {msgs_sent} task(s) for {self.dispatched} of {read} active response(s) read."
+        if self.held:
+            summary += f" Held: {self.held}."
+        if self.discards:
+            losses = ", ".join(f"{reason}={n}" for reason, n in sorted(self.discards.items()))
+            summary += f" Discarded: {losses}."
+        self.logger.info(summary)
+
+        # THE CURSOR CONTRACT, in one place. The bookmark is a high-water mark of what was READ,
+        # not of what was delivered, and it moves once per page rather than once per active
+        # response. Two failures follow from getting this wrong, and the code used to have both:
+        #
+        #  - Advancing per delivered response skipped the rest of the stream whenever the cursor
+        #    could jump (a document stamped in the future). The read is bounded at the present
+        #    instant now, so a task Task Manager rejects loses exactly that document, reported by
+        #    the ERROR that branch writes. A Task Manager that cannot be reached at all is not
+        #    that case: nothing was decided about any response on this page, so the page is held
+        #    and read again, and the repeated create_task calls are absorbed by the same
+        #    deterministic task id that makes one write per page safe.
+        #  - Never advancing for a document that did not reach this loop (invalid schema, unusable
+        #    event reference, unparseable @timestamp) froze the cursor on its page, which was then
+        #    re-read every polling cycle for as long as the document existed. Those three are
+        #    terminal: the document can never become valid, so the page moves past it, and each is
+        #    reported at WARNING where it is discarded rather than left to debug level.
+        #
+        # The one discard that is not terminal is an event that is not visible yet, and
+        # enrich_ar_with_events_info() holds page_end_sort short of it instead of losing a response
+        # that is still deliverable. That hold expires with EVENT_VISIBILITY_GRACE_SECONDS, so a
+        # reference that never resolves cannot freeze the cursor either. While it lasts, the
+        # responses after it are dispatched again each cycle, absorbed by the same deterministic
+        # task id that makes one write per page safe.
+        #
+        # A crash between the page and this write re-reads the page: the duplicate create_task
+        # calls are absorbed by the deterministic task id, which is what makes one write per page
+        # safe (and saves one fsync per response).
+        if transport_failed:
+            self.logger.warning(
+                "Task Manager was unreachable for at least one active response. Holding the "
+                "cursor so this page is read again on the next cycle."
+            )
+        elif self._bookmark_file.page_end_sort is not None:
+            self._bookmark_file.update(self._bookmark_file.page_end_sort)
+
+        return self
+
+
+class ActiveResponseFetchTask:
+    DEFAULT_POLLING_INTERVAL = 30
+
+    def __init__(self, server: Any):
+        """Initialize the AR fetch task.
+
+        Parameters
+        ----------
+        server : Any
+            The server instance containing configuration.
+        """
+        self.logger = server.logger.getChild("ar")
+        self.logger.addFilter(ClusterFilter(tag=server.tag, subtag="Active Response"))
+
+        common = server.cluster_items.get("intervals", {}).get("common", {})
+        defaults = {
+            "active_response_polling": self.DEFAULT_POLLING_INTERVAL,
+            "active_response_page_size": DEFAULT_PAGE_SIZE,
+            "active_response_event_grace": EVENT_VISIBILITY_GRACE_SECONDS,
+        }
+        missing = [key for key in defaults if key not in common]
+        if missing:
+            self.logger.warning(
+                f"Missing in cluster configuration (intervals.common): {', '.join(missing)}. "
+                f"Using defaults: {', '.join(f'{key}={defaults[key]}' for key in missing)}."
+            )
+        settings = {**defaults, **{key: common[key] for key in defaults if key in common}}
+
+        def bounded(key: str, valid, what: str) -> int:
+            value = settings[key]
+            if valid(value):
+                return value
+            self.logger.warning(
+                f"{key} must be {what}, got {value!r}. Using default: {defaults[key]}."
+            )
+            return defaults[key]
+
+        self.polling_interval: int = bounded(
+            "active_response_polling", lambda v: isinstance(v, int) and v >= 1, "a positive integer"
+        )
+        self.page_size: int = bounded(
+            "active_response_page_size", lambda v: isinstance(v, int) and v >= 1, "a positive integer"
+        )
+        self.event_grace: int = bounded(
+            "active_response_event_grace",
+            lambda v: isinstance(v, int) and v >= 0,
+            "a non-negative integer",
+        )
+        ActiveResponseHelpers.logger = self.logger
+
+    async def active_response_processing(self) -> None:
+        """Execute one full cycle of AR processing.
+
+        Raises
+        ------
+        WazuhException
+            If there is a connection issue with the indexer.
+        """
+        try:
+            builder = ActiveResponseBuilder(
+                logger=self.logger, page_size=self.page_size, event_grace=self.event_grace
+            )
+            await builder.fetch_ars(validate=True)
+            await builder.enrich_ar_with_events_info()
+            builder.dispatch()
+        except IndexerUnavailableError:
+            self.logger.warning("Cannot connect to Wazuh Indexer")
+
+    async def run(self) -> None:
+        """Run the task loop indefinitely."""
+        while True:
+            before = perf_counter()
+            self.logger.info("Starting")
+            try:
+                await self.active_response_processing()
+            except Exception as e:
+                self.logger.error(
+                    f"Error during active response processing: {e}.",
+                )
+            finally:
+                after = perf_counter()
+                self.logger.info(f"Finished in {(after - before):.3f}s.")
+
+            await asyncio.sleep(self.polling_interval)

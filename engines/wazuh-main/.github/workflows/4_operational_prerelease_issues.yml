@@ -1,0 +1,40 @@
+name: Create Release Suite Issues
+
+permissions:
+  issues: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      main_issue:
+        description: "Main issue number"
+        required: true
+        type: string
+      prev_ut:
+        description: "Previous Unit Tests issue number (or blank)"
+        required: false
+        type: string
+        default: ""
+      prev_cov:
+        description: "Previous Coverity issue number (or blank)"
+        required: false
+        type: string
+        default: ""
+      prev_it:
+        description: "Previous Integration Tests issue number (or blank)"
+        required: false
+        type: string
+        default: ""
+      prev_wpk:
+        description: "Previous WPK Tests issue number (or blank)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

@@ -1,0 +1,15 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "input_text",
+        "text": "{{question}}"
+      },
+      {
+        "type": "input_image",
+        "image_url": "{{url}}"
+      }
+    ]
+  }
+]

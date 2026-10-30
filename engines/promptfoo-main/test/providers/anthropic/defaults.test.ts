@@ -1,0 +1,157 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { clearCache } from '../../../src/cache';
+import {
+  AnthropicLlmRubricProvider,
+  DEFAULT_ANTHROPIC_MODEL,
+  getAnthropicProviders,
+} from '../../../src/providers/anthropic/defaults';
+import { AnthropicMessagesProvider } from '../../../src/providers/anthropic/messages';
+import { createPassingGrade } from '../../factories/literalFixtures';
+import type Anthropic from '@anthropic-ai/sdk';
+
+vi.mock('proxy-agent', async (importOriginal) => {
+  return {
+    ...(await importOriginal()),
+
+    ProxyAgent: vi.fn().mockImplementation(function () {
+      return {};
+    }),
+  };
+});
+
+describe('Anthropic Default Providers', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await clearCache();
+  });
+
+  describe('getAnthropicProviders', () => {
+    it('should return all provider implementations', () => {
+      const providers = getAnthropicProviders();
+
+      expect(providers.gradingJsonProvider).toBeInstanceOf(AnthropicMessagesProvider);
+      expect(providers.gradingProvider).toBeInstanceOf(AnthropicMessagesProvider);
+      expect(providers.llmRubricProvider).toBeInstanceOf(AnthropicLlmRubricProvider);
+      expect(providers.suggestionsProvider).toBeInstanceOf(AnthropicMessagesProvider);
+      expect(providers.synthesizeProvider).toBeInstanceOf(AnthropicMessagesProvider);
+      expect(providers.webSearchProvider).toBeInstanceOf(AnthropicMessagesProvider);
+      for (const provider of Object.values(providers)) {
+        expect(provider.id()).toBe('anthropic:claude-sonnet-5');
+      }
+    });
+
+    it('should create independent clients on repeated calls', () => {
+      const providers1 = getAnthropicProviders();
+      const providers2 = getAnthropicProviders();
+
+      expect(providers1.gradingProvider).not.toBe(providers2.gradingProvider);
+      expect(providers1.gradingJsonProvider).not.toBe(providers2.gradingJsonProvider);
+      expect(providers1.llmRubricProvider).not.toBe(providers2.llmRubricProvider);
+    });
+
+    it('should share the grading instance only within a bundle', () => {
+      const providers = getAnthropicProviders();
+      const gradingProvider = providers.gradingProvider;
+      expect(gradingProvider).toBeInstanceOf(AnthropicMessagesProvider);
+
+      // Access multiple times should return the same instance
+      const sameGradingProvider = providers.gradingProvider;
+      expect(sameGradingProvider).toBe(gradingProvider);
+    });
+  });
+
+  describe('AnthropicLlmRubricProvider', () => {
+    let provider: AnthropicLlmRubricProvider;
+
+    beforeEach(() => {
+      provider = new AnthropicLlmRubricProvider('claude-3-5-sonnet-20241022');
+    });
+
+    it('should initialize with forced tool configuration', () => {
+      expect(provider.modelName).toBe('claude-3-5-sonnet-20241022');
+      expect(provider.config.tool_choice).toEqual({ type: 'tool', name: 'grade_output' });
+    });
+
+    it('should call API and parse the result correctly', async () => {
+      const mockApiResponse = {
+        output: JSON.stringify({
+          type: 'tool_use',
+          id: 'test-id',
+          name: 'grade_output',
+          input: createPassingGrade(0.85, 'The output meets the criteria.'),
+        }),
+      };
+
+      vi.spyOn(AnthropicMessagesProvider.prototype, 'callApi').mockResolvedValue(mockApiResponse);
+
+      const result = await provider.callApi('Test prompt');
+
+      expect(result).toEqual({
+        output: {
+          pass: true,
+          score: 0.85,
+          reason: 'The output meets the criteria.',
+        },
+      });
+    });
+
+    it.each([undefined, true])(
+      'should parse grades with thinking blocks when showThinking is %s',
+      async (showThinking) => {
+        const provider = new AnthropicLlmRubricProvider(DEFAULT_ANTHROPIC_MODEL, {
+          config: showThinking === undefined ? {} : { showThinking },
+        });
+        const grade = createPassingGrade(0.85, 'The output meets the criteria.');
+        const create = vi.spyOn(provider.anthropic.messages, 'create').mockResolvedValue({
+          content: [
+            { type: 'thinking', thinking: 'Checking the criteria.', signature: 'signature' },
+            { type: 'redacted_thinking', data: 'redacted' },
+            { type: 'tool_use', id: 'grade-id', name: 'grade_output', input: grade },
+          ],
+          stop_reason: 'tool_use',
+          usage: { input_tokens: 10, output_tokens: 20 },
+        } as Anthropic.Messages.Message);
+
+        await expect(provider.callApi('Grade this output')).resolves.toEqual({ output: grade });
+        expect(create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            model: DEFAULT_ANTHROPIC_MODEL,
+            tool_choice: { type: 'tool', name: 'grade_output' },
+          }),
+          expect.anything(),
+        );
+      },
+    );
+
+    it('should handle non-string API response', async () => {
+      const mockApiResponse = {
+        output: { confession: 'I am not a string' },
+      };
+
+      vi.spyOn(AnthropicMessagesProvider.prototype, 'callApi').mockResolvedValue(mockApiResponse);
+
+      const result = await provider.callApi('Test prompt');
+
+      expect(result.error).toContain('Anthropic LLM rubric grader - malformed non-string output');
+    });
+
+    it('should handle malformed API response', async () => {
+      const mockApiResponse = {
+        output: 'Invalid JSON',
+      };
+
+      vi.spyOn(AnthropicMessagesProvider.prototype, 'callApi').mockResolvedValue(mockApiResponse);
+
+      const result = await provider.callApi('Test prompt');
+
+      expect(result.error).toContain('Anthropic LLM rubric grader - invalid JSON');
+    });
+
+    it('should handle API errors', async () => {
+      const mockError = new Error('API Error');
+      vi.spyOn(AnthropicMessagesProvider.prototype, 'callApi').mockRejectedValue(mockError);
+
+      await expect(provider.callApi('Test prompt')).rejects.toThrow('API Error');
+    });
+  });
+});

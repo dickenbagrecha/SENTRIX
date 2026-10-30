@@ -1,0 +1,50 @@
+/*
+ * Wazuh Shared Configuration Manager
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef REM_STATE_WRAPPERS_H
+#define REM_STATE_WRAPPERS_H
+
+#include <cJSON.h>
+
+void __wrap_rem_add_recv(unsigned long bytes);
+
+void __wrap_rem_inc_tcp();
+
+void __wrap_rem_dec_tcp();
+
+void __wrap_rem_inc_recv_events();
+
+void __wrap_rem_inc_recv_ctrl();
+
+void __wrap_rem_inc_recv_upgrade_ack();
+
+void __wrap_rem_inc_recv_discarded();
+
+void __wrap_rem_inc_recv_events_failed();
+
+void __wrap_rem_inc_recv_ctrl_request();
+
+void __wrap_rem_inc_recv_ctrl_startup();
+
+void __wrap_rem_inc_recv_ctrl_shutdown();
+
+void __wrap_rem_inc_recv_ctrl_keepalive();
+
+void __wrap_rem_inc_recv_unknown();
+
+void __wrap_rem_add_send(unsigned long bytes);
+
+void __wrap_rem_inc_send_ack();
+
+void __wrap_rem_inc_send_discarded();
+
+cJSON* __wrap_rem_create_state_json();
+
+#endif /* REM_STATE_WRAPPERS_H */

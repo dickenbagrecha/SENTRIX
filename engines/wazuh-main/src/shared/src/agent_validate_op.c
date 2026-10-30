@@ -1,0 +1,497 @@
+/* Copyright (C) Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+#include "cJSON.h"
+#include "agent_validate_op.h"
+#include "os_err.h"
+#include "wdb.h"
+#include <openssl/rand.h>
+#include <time.h>
+
+#define str_startwith(x, y) strncmp(x, y, strlen(y))
+#define str_endwith(x, y) (strlen(x) < strlen(y) || strcmp(x + strlen(x) - strlen(y), y))
+
+#ifdef WIN32
+    #define fchmod(x,y) 0
+    #define mkdir(x,y) 0
+    #define link(x,y) 0
+    #define difftime(x,y) 0
+    #define mkstemp(x) 0
+    #define chown(x,y,z) 0
+    #define Privsep_GetUser(x) -1
+    #define Privsep_GetGroup(x) -1
+    #define localtime_r(x, y) localtime_s(y, x)
+#endif
+
+/* Global variables */
+fpos_t fp_pos;
+
+/* The agent key is the agent's HS256 secret (remoted's wazuh-agent+jwt bearer profile): exactly
+ * AGENT_KEY_BYTES bytes from the CSPRNG, stored in client.keys as AGENT_KEY_HEX_CHARS lowercase hex
+ * chars. remoted decodes those hex chars back into the 32 raw key bytes; nothing else is accepted. */
+
+int OS_IsValidAgentKey(const char *key)
+{
+    size_t i;
+
+    if (!key || strlen(key) != AGENT_KEY_HEX_CHARS) {
+        return (0);
+    }
+    for (i = 0; i < AGENT_KEY_HEX_CHARS; i++) {
+        const char c = key[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return (0);
+        }
+    }
+    return (1);
+}
+
+int OS_IsValidReenrollSecret(const char *secret)
+{
+    size_t i;
+
+    if (!secret || strlen(secret) != AGENT_REENROLL_SECRET_HEX_CHARS) {
+        return (0);
+    }
+    for (i = 0; i < AGENT_REENROLL_SECRET_HEX_CHARS; i++) {
+        const char c = secret[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return (0);
+        }
+    }
+    return (1);
+}
+
+int OS_NewReenrollSecret(char *out, size_t out_size)
+{
+    static const char HEX[] = "0123456789abcdef";
+    unsigned char rnd[AGENT_REENROLL_SECRET_BYTES];
+    size_t i;
+
+    if (!out || out_size < AGENT_REENROLL_SECRET_HEX_CHARS + 1) {
+        return (-1);
+    }
+    out[0] = '\0';
+
+    /* Straight from the CSPRNG, like the agent key above: a secret the agent will re-enroll with for
+     * years is worth refusing the enrollment over. */
+    if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+        merror("Unable to generate a re-enrollment secret: the CSPRNG (RAND_bytes) failed.");
+        return (-1);
+    }
+    for (i = 0; i < sizeof(rnd); i++) {
+        out[2 * i] = HEX[rnd[i] >> 4];
+        out[2 * i + 1] = HEX[rnd[i] & 0x0f];
+    }
+    out[AGENT_REENROLL_SECRET_HEX_CHARS] = '\0';
+    OPENSSL_cleanse(rnd, sizeof(rnd));
+    return (0);
+}
+
+int OS_NewAgentKey(char *out, size_t out_size)
+{
+    static const char HEX[] = "0123456789abcdef";
+    unsigned char rnd[AGENT_KEY_BYTES];
+    size_t i;
+
+    if (!out || out_size < AGENT_KEY_HEX_CHARS + 1) {
+        return (-1);
+    }
+    out[0] = '\0';
+
+    /* 32 bytes straight from the CSPRNG. Never fall back to a weaker generator: a key the agent
+     * will authenticate with for years is worth refusing the enrollment over. */
+    if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+        return (-1);
+    }
+    for (i = 0; i < sizeof(rnd); i++) {
+        out[2 * i] = HEX[rnd[i] >> 4];
+        out[2 * i + 1] = HEX[rnd[i] & 0x0f];
+    }
+    out[AGENT_KEY_HEX_CHARS] = '\0';
+    OPENSSL_cleanse(rnd, sizeof(rnd));
+    return (0);
+}
+
+int OS_AddNewAgent(keystore *keys,
+                   const char *id,
+                   const char *name,
+                   const char *ip,
+                   const char *key,
+                   unsigned int max_agents)
+{
+    char _id[12] = { '\0' };
+    char buffer[KEYSIZE] = { '\0' };
+
+    if (max_agents > 0 && keys->keysize >= max_agents) {
+        return OS_ADDAGENT_LIMIT_REACHED;
+    }
+
+    if (!id) {
+        if (keys->id_counter >= INT_MAX) {
+            return OS_ADDAGENT_LIMIT_REACHED;
+        }
+        snprintf(_id,sizeof(_id), "%03d", ++keys->id_counter);
+        id = _id;
+    }
+    else {
+        char *endptr;
+        int id_number = strtol(id, &endptr, 10);
+
+        if ('\0' == *endptr && id_number > keys->id_counter)
+            keys->id_counter = id_number;
+    }
+
+    if (!key) {
+        if (OS_NewAgentKey(buffer, sizeof(buffer)) != 0) {
+            merror("Unable to generate a key for agent '%s': the CSPRNG (RAND_bytes) failed.", name);
+            return OS_INVALID;
+        }
+        key = buffer;
+    }
+
+    return OS_AddKey(keys, id, name, ip ? ip : "any", key, time(NULL));
+}
+
+int OS_IsValidID(const char *id)
+{
+    size_t id_len, i;
+
+    /* ID must not be null */
+    if (!id) {
+        return (0);
+    }
+
+    id_len = strlen(id);
+
+    /* Check ID length, it should contain max. 8 characters */
+    if (id_len > 8) {
+        return (0);
+    }
+
+    /* Check ID if it contains only numeric characters [0-9] */
+    for (i = 0; i < id_len; i++) {
+        if (!(isdigit((int)id[i]))) {
+            return (0);
+        }
+    }
+
+    return (1);
+}
+
+int OS_IsValidAgentInsertID(const char *id)
+{
+    char *endptr;
+    long value;
+
+    if (!id || !*id) {
+        return (0);
+    }
+    for (const char *p = id; *p; p++) {
+        if (!isdigit((int)(unsigned char)*p)) {
+            return (0);
+        }
+    }
+
+    errno = 0;
+    value = strtol(id, &endptr, 10);
+    return errno == 0 && '\0' == *endptr && value > 0 && value <= INT32_MAX;
+}
+
+int OS_CanonicalAgentInsertID(const char *id, char *out, size_t size)
+{
+    int written;
+
+    if (!out || size == 0 || !OS_IsValidAgentInsertID(id)) {
+        return -1;
+    }
+
+    written = snprintf(out, size, "%03ld", strtol(id, NULL, 10));
+    return written > 0 && (size_t)written < size ? 0 : -1;
+}
+
+/* Get agent name of ID */
+char *getNameById(const char *id)
+{
+    FILE *fp;
+    char line_read[FILE_SIZE + 1];
+    line_read[FILE_SIZE] = '\0';
+
+    /* ID must not be null */
+    if (!id) {
+        return (NULL);
+    }
+
+    fp = wfopen(KEYS_FILE, "r");
+    if (!fp) {
+        return (NULL);
+    }
+
+    while (fgets(line_read, FILE_SIZE - 1, fp) != NULL) {
+        char *name;
+        char *tmp_str;
+
+        if (line_read[0] == '#') {
+            continue;
+        }
+
+        name = strchr(line_read, ' ');
+        if (name) {
+            *name = '\0';
+            /* Didn't match */
+            if (strcmp(line_read, id) != 0) {
+                continue;
+            }
+
+            name++;
+
+            /* Removed entry */
+            if (*name == '#' || *name == '!') {
+                continue;
+            }
+
+            /* Clean up name */
+            tmp_str = strchr(name, ' ');
+            if (tmp_str) {
+                char *final_str;
+                *tmp_str = '\0';
+
+                /* If we reached here, we found the name */
+                os_calloc(1, FILE_SIZE, final_str);
+                snprintf(final_str, FILE_SIZE - 1, "%s", name);
+
+                fclose(fp);
+                return (final_str);
+            }
+        }
+    }
+
+    fclose(fp);
+    return (NULL);
+}
+
+/* Validate agent name */
+int OS_IsValidName(const char *u_name)
+{
+    /* Name must not be null */
+    if (!u_name) {
+        return (0);
+    }
+
+    size_t i, uname_length = strlen(u_name);
+
+    /* We must have something in the name */
+    if (uname_length < 2 || uname_length > 128) {
+        return (0);
+    }
+
+    /* Reject names starting with "." */
+    if (u_name[0] == '.') {
+        return (0);
+    }
+
+    /* Check if it contains any non-alphanumeric characters */
+    for (i = 0; i < uname_length; i++) {
+        if (!isalnum((int)u_name[i]) && (u_name[i] != '-') &&
+                (u_name[i] != '_') && (u_name[i] != '.')) {
+            return (0);
+        }
+    }
+
+    return (1);
+}
+
+void OS_ConvertToValidAgentName(char *u_name) {
+    size_t i, uname_length = strlen(u_name);
+    while((i = strspn(u_name, VALID_AGENT_NAME_CHARS)), i < uname_length )
+    {
+        // Invalid character detected, delete it
+        memmove(u_name + i, u_name + i + 1, uname_length - i);
+        uname_length--;
+    }
+}
+
+int NameExist(const char *u_name)
+{
+    FILE *fp;
+    char line_read[FILE_SIZE + 1];
+    line_read[FILE_SIZE] = '\0';
+
+    if ((!u_name) ||
+            (*u_name == '\0') ||
+            (*u_name == '\r') ||
+            (*u_name == '\n')) {
+        return (0);
+    }
+
+    fp = wfopen(KEYS_FILE, "r");
+
+    if (!fp) {
+        return (0);
+    }
+
+    fseek(fp, 0, SEEK_SET);
+    fgetpos(fp, &fp_pos);
+
+    while (fgets(line_read, FILE_SIZE - 1, fp) != NULL) {
+        char *name;
+
+        if (line_read[0] == '#') {
+            continue;
+        }
+
+        name = strchr(line_read, ' ');
+        if (name) {
+            char *ip;
+            name++;
+
+            if (*name == '#' || *name == '!') {
+                continue;
+            }
+
+            ip = strchr(name, ' ');
+            if (ip) {
+                *ip = '\0';
+                if (strcmp(u_name, name) == 0) {
+                    fclose(fp);
+                    return (1);
+                }
+            }
+        }
+        fgetpos(fp, &fp_pos);
+    }
+
+    fclose(fp);
+    return (0);
+}
+
+/* Returns the ID of an agent, or NULL if not found */
+char *IPExist(const char *u_ip)
+{
+    FILE *fp;
+    char *name, *ip, *pass;
+    char line_read[FILE_SIZE + 1];
+    line_read[FILE_SIZE] = '\0';
+
+    if (!(u_ip && strncmp(u_ip, "any", 3)) || strchr(u_ip, '/'))
+        return NULL;
+
+    fp = wfopen(KEYS_FILE, "r");
+
+    if (!fp)
+        return NULL;
+
+    fseek(fp, 0, SEEK_SET);
+    fgetpos(fp, &fp_pos);
+
+    while (fgets(line_read, FILE_SIZE - 1, fp) != NULL) {
+        if (line_read[0] == '#') {
+            continue;
+        }
+
+        name = strchr(line_read, ' ');
+        if (name) {
+            name++;
+
+            if (*name == '#' || *name == '!') {
+                continue;
+            }
+
+            ip = strchr(name, ' ');
+            if (ip) {
+                ip++;
+
+                pass = strchr(ip, ' ');
+                if (pass) {
+                    *pass = '\0';
+                    if (strcmp(u_ip, ip) == 0) {
+                        fclose(fp);
+                        name[-1] = '\0';
+                        return strdup(line_read);
+                    }
+                }
+            }
+        }
+
+        fgetpos(fp, &fp_pos);
+    }
+
+    fclose(fp);
+    return NULL;
+}
+
+/* Copy every line of the timestamp file but the one for id. Returns 0, or -1 when either stream
+ * failed, which is logged. */
+static int copy_timestamps_without(FILE *fp, FILE *out, const char *id)
+{
+    char line[OS_BUFFER_SIZE];
+    char * sep;
+
+    while (fgets(line, OS_BUFFER_SIZE, fp)) {
+        if (sep = strchr(line, ' '), sep) {
+            *sep = '\0';
+        } else {
+            continue;
+        }
+
+        if (strcmp(id, line) != 0) {
+            *sep = ' ';
+            fputs(line, out);
+        }
+    }
+
+    if (ferror(fp)) {
+        merror(FREAD_ERROR, TIMESTAMP_FILE, errno, strerror(errno));
+        return -1;
+    }
+
+    if (fflush(out) != 0 || ferror(out)) {
+        merror(FWRITE_ERROR, TIMESTAMP_FILE, errno, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+void OS_RemoveAgentTimestamp(const char *id)
+{
+    FILE *fp;
+    File file;
+    int copied;
+
+    fp = wfopen(TIMESTAMP_FILE, "r");
+
+    if (!fp) {
+        return;
+    }
+
+    if (TempFile(&file, TIMESTAMP_FILE, 0) < 0) {
+        merror("Couldn't open timestamp file.");
+        fclose(fp);
+        return;
+    }
+
+    copied = copy_timestamps_without(fp, file.fp, id);
+    fclose(fp);
+
+    if (fclose(file.fp) != 0 && copied == 0) {
+        merror(FWRITE_ERROR, TIMESTAMP_FILE, errno, strerror(errno));
+        copied = -1;
+    }
+
+    /* Only a complete copy replaces the file: a short read or write would drop every remaining
+     * agent's timestamp. OS_MoveFile() says itself why it failed; on some of its failures the
+     * staged copy is still there, and nothing else would ever remove it. */
+    if (copied != 0 || OS_MoveFile(file.name, TIMESTAMP_FILE) < 0) {
+        unlink(file.name);
+    }
+
+    free(file.name);
+}

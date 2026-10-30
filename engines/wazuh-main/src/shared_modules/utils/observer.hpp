@@ -1,0 +1,101 @@
+/*
+ * Wazuh Utils
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of either the GNU General Public License, version 2, or
+ * the GNU Affero General Public License, version 3 or (at your option) any
+ * later version, both as published by the Free Software Foundation.
+ *
+ * SPDX-License-Identifier: GPL-2.0-only OR AGPL-3.0-or-later
+ */
+
+#ifndef _OBSERVER_HPP
+#define _OBSERVER_HPP
+
+#include <algorithm>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+template<typename T>
+class Observer
+{
+protected:
+    std::string m_observerId;
+
+public:
+    explicit Observer(std::string observerId)
+        : m_observerId {std::move(observerId)}
+    {
+    }
+
+    const std::string& observerId() const
+    {
+        return m_observerId;
+    }
+
+    virtual void update(T data) = 0;
+    // LCOV_EXCL_START
+    virtual ~Observer() = default;
+    // LCOV_EXCL_STOP
+};
+
+template<typename T>
+class Subject
+{
+private:
+    std::vector<std::shared_ptr<Observer<T>>> observers;
+    std::mutex mutex;
+
+public:
+    virtual ~Subject() = default;
+    Subject() = default;
+
+    void attach(std::shared_ptr<Observer<T>> observer)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = std::find_if(observers.begin(),
+                               observers.end(),
+                               [observer](const auto& obs) { return obs->observerId() == observer->observerId(); });
+
+        if (it != observers.end())
+        {
+            *it = std::move(observer);
+        }
+        else
+        {
+            observers.push_back(observer);
+        }
+    }
+
+    void detach(const std::string& observerId)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = std::find_if(observers.begin(),
+                               observers.end(),
+                               [observerId](const auto& obs) { return obs->observerId() == observerId; });
+        if (it == observers.end())
+        {
+            throw std::runtime_error("Observer not found");
+        }
+        observers.erase(it);
+    }
+
+    void setData(T newData)
+    {
+        notifyObservers(newData);
+    }
+
+    void notifyObservers(T data)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto& observer : observers)
+        {
+            observer->update(data);
+        }
+    }
+};
+
+#endif // _OBSERVER_HPP

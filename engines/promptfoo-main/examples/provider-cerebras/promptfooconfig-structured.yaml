@@ -1,0 +1,72 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: Schema-enforced JSON recipe generation with GPT OSS
+prompts:
+  - file://structured_prompts.txt
+providers:
+  - id: cerebras:gpt-oss-120b
+    config:
+      temperature: 0.7
+      max_completion_tokens: 1024
+      response_format:
+        type: 'json_schema'
+        json_schema:
+          name: 'recipe_schema'
+          strict: true
+          schema: &recipeSchema
+            type: 'object'
+            properties:
+              name: { 'type': 'string' }
+              cuisine: { 'type': 'string' }
+              difficulty:
+                type: 'string'
+                enum: ['easy', 'medium', 'hard']
+              prepTime: { 'type': 'integer' }
+              cookTime: { 'type': 'integer' }
+              ingredients:
+                type: 'array'
+                items:
+                  type: 'object'
+                  properties:
+                    name: { 'type': 'string' }
+                    amount: { 'type': 'string' }
+                  required: ['name', 'amount']
+                  additionalProperties: false
+              instructions:
+                type: 'array'
+                items: { 'type': 'string' }
+            required:
+              [
+                'name',
+                'cuisine',
+                'difficulty',
+                'prepTime',
+                'cookTime',
+                'ingredients',
+                'instructions',
+              ]
+            additionalProperties: false
+defaultTest:
+  assert:
+    - type: is-json
+      value: *recipeSchema
+
+tests:
+  - vars:
+      cuisine: Italian
+      dish: Cacio e Pepe
+  - vars:
+      cuisine: Japanese
+      dish: Okonomiyaki
+    assert:
+      - type: javascript
+        value: |
+          const recipe = typeof output === 'string' ? JSON.parse(output) : output;
+          return recipe.ingredients.length >= 5;
+  - vars:
+      cuisine: Mexican
+      dish: Chiles en Nogada
+    assert:
+      - type: javascript
+        value: |
+          const recipe = typeof output === 'string' ? JSON.parse(output) : output;
+          return recipe.instructions.length >= 3;

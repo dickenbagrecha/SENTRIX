@@ -1,0 +1,22 @@
+# Multi-stage Docker build for Standalone Coraza WAF Proxy
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /src
+
+COPY core/go.mod core/go.sum* ./
+COPY core/ ./
+
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/sentrix-waf ./cmd/sentrix-waf
+
+# Runtime Stage
+FROM alpine:3.20
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /app
+
+COPY --from=builder /bin/sentrix-waf /app/sentrix-waf
+
+EXPOSE 8080 8443
+
+ENTRYPOINT ["/app/sentrix-waf"]

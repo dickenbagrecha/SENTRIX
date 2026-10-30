@@ -1,0 +1,270 @@
+'''
+copyright: Copyright (C) Wazuh Inc.
+           Created by Wazuh, Inc. <info@wazuh.com>.
+           This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+type: integration
+
+brief: These tests will that a scan is ran using the configured sci_sca ruleset and regex engine.
+
+components:
+    - sca
+
+suite: sca
+
+targets:
+    - agent
+
+daemons:
+    - wazuh-modulesd
+
+os_platform:
+    - linux
+    - windows
+
+os_version:
+    - CentOS 8
+    - Windows 10
+    - Windows Server 2019
+    - Windows Server 2016
+
+references:
+    - https://documentation.wazuh.com/current/user-manual/capabilities/sec-config-assessment/index.html
+
+tags:
+    - sca
+'''
+import sys
+import os
+import pytest
+import re
+import stat
+import subprocess
+from pathlib import Path
+
+from wazuh_testing.constants.paths.logs import WAZUH_LOG_PATH
+from wazuh_testing.utils import callbacks, configuration
+from wazuh_testing.tools.monitors import file_monitor
+from wazuh_testing.modules.modulesd.sca import patterns
+from wazuh_testing.modules.modulesd.configuration import MODULESD_DEBUG
+from wazuh_testing.modules.agentd.configuration import AGENTD_WINDOWS_DEBUG
+from wazuh_testing.constants.platforms import WINDOWS
+
+from . import CONFIGURATIONS_FOLDER_PATH, TEST_CASES_FOLDER_PATH
+
+pytestmark = [pytest.mark.agent, pytest.mark.linux, pytest.mark.win32, pytest.mark.tier(level=0)]
+
+local_internal_options = {AGENTD_WINDOWS_DEBUG if sys.platform == WINDOWS else MODULESD_DEBUG: '2'}
+
+# Configuration and cases data
+configurations_path = Path(CONFIGURATIONS_FOLDER_PATH, 'configuration_sca.yaml')
+cases_path = Path(TEST_CASES_FOLDER_PATH, 'cases_validate_remediation_win.yaml' if sys.platform == WINDOWS else 'cases_validate_remediation.yaml')
+
+# Test configurations
+configuration_parameters, configuration_metadata, case_ids = configuration.get_test_cases_data(cases_path)
+configurations = configuration.load_configuration_template(configurations_path, configuration_parameters, configuration_metadata)
+test_folder = '/testfile'
+
+# Test daemons to restart.
+daemons_handler_configuration = {'all_daemons': True}
+
+
+# Helper to find the result for a given id in the accumulated results
+def find_result_for_a_given_id(id: int, results: list[tuple[str, str, str]]) -> tuple[str, str, str] | None:
+    # When only one event was captured the monitor returns a bare tuple instead of a list of tuples.
+    if isinstance(results, tuple):
+        results = [results]
+    for result in results:
+        if isinstance(result, tuple) and len(result) >= 3 and result[0] == str(id):
+            return result
+    return None
+
+
+def _callback_scan_result_for_check(check_id: int,
+                                    expected_policy: str,
+                                    expected_result: str | None = None,
+                                    allow_any_policy: bool = False):
+    expected_result_normalized = expected_result.lower() if expected_result is not None else None
+
+    def _callback(line):
+        match = re.match(patterns.SCA_SCAN_RESULT, line, flags=re.IGNORECASE)
+        if not match:
+            return None
+
+        current_check_id, current_policy, current_result = match.groups()
+
+        if current_check_id != str(check_id):
+            return None
+
+        if not allow_any_policy and current_policy != expected_policy:
+            return None
+
+        if expected_result_normalized is not None and current_result.lower() != expected_result_normalized:
+            return None
+
+        return match.groups()
+
+    return _callback
+
+
+# Tests
+@pytest.mark.parametrize('test_configuration, test_metadata', zip(configurations, configuration_metadata), ids=case_ids)
+def test_validate_remediation_results(test_configuration, test_metadata, prepare_cis_policies_file, truncate_monitored_files,
+                                      prepare_remediation_test, set_wazuh_configuration,
+                                      configure_local_internal_options, clean_sca_db, daemons_handler, wait_for_sca_enabled):
+    '''
+    description: This test will check that a SCA scan results, with the  expected initial results (passed/failed) for a
+                 given check, results change on subsequent checks if change is done to the system. For this a folder's
+                 permissions will be checked, passing or failing if the permissions match. Then, the permissions for
+                 the folder will be changed and wait for a new scan, and validate the results changed as expected.
+
+    test_phases:
+        - Copy cis_sca ruleset file into agent
+        - Create a folder that will be checked by the SCA rules (Linux)
+        - Restart wazuh
+        - Validate the result for a given SCA check are as expected
+        - Change the folder's permissions / Modifies the user lockout duration (Windows)
+        - Validate the result for a given SCA check change as expected
+
+    wazuh_min_version: 4.6.0
+
+    tier: 0
+
+    parameters:
+        - configuration:
+            type: dict
+            brief: Wazuh configuration data. Needed for set_wazuh_configuration fixture.
+        - metadata:
+            type: dict
+            brief: Wazuh configuration metadata.
+        - prepare_cis_policies_file:
+            type: fixture
+            brief: copy test sca policy file. Delete it after test.
+        - prepare_remediation_test:
+            type: fixture
+            brief: Create a folder with a given set of permissions or modifies the user
+                lockout duration in Windows. Delete it/Restores the value after test.
+        - set_wazuh_configuration:
+            type: fixture
+            brief: Set the wazuh configuration according to the configuration data.
+        - configure_local_internal_options:
+            type: fixture
+            brief: Configure the local_internal_options_file.
+        - truncate_monitored_files:
+            type: fixture
+            brief: Truncate all the log files and json alerts files before and after the test execution.
+        - restart_modulesd_function:
+            type: fixture
+            brief: Restart the wazuh-modulesd daemon.
+        - wait_for_sca_enabled:
+            type: fixture
+            brief: Wait for the sca Module to start before starting the test.
+        - clean_sca_db:
+            type: fixture
+            brief: Remove SCA database files to prevent stale data between tests.
+
+    assertions:
+        - Assert the result for a given check passed/failed as expected
+        - Assert the result for a given check changes as expected after remediation/breaking commands
+
+    input_description:
+        - The `cases_validate_remediation.yaml` file provides the module configuration for this test.
+        - The cis*.yaml files located in the policies folder provide the sca rules to check.
+
+    expected_output:
+        - r".*sca.*DEBUG: Policy check \"(\d+)\" evaluation completed for policy \"(.*?)\", result: (Passed|Failed)"
+    '''
+    log_monitor = file_monitor.FileMonitor(WAZUH_LOG_PATH)
+    scan_timeout = 180 if sys.platform == WINDOWS else 60
+
+    expected_policy = Path(test_metadata['policy_file']).stem
+
+    if sys.platform != WINDOWS:
+        # Wait for the SCA scan checks to start for the specific policy
+        log_monitor.start(callback=callbacks.generate_callback(patterns.SCA_SCAN_STARTED_CHECK), timeout=scan_timeout)
+        assert log_monitor.callback_result is not None and log_monitor.callback_result[0] == expected_policy
+
+    # Get the results for the checks obtained in the initial SCA scan.
+    if sys.platform == WINDOWS:
+        log_monitor.start(
+            callback=_callback_scan_result_for_check(
+                test_metadata['check_id'],
+                expected_policy,
+                expected_result=test_metadata['initial_result']
+            ),
+            timeout=scan_timeout,
+            only_new_events=False
+        )
+        initial_result = log_monitor.callback_result
+
+        if initial_result is None:
+            # Some Windows runners emit SCA scan results with a policy label that differs
+            # from the metadata policy stem.
+            log_monitor.start(
+                callback=_callback_scan_result_for_check(
+                    test_metadata['check_id'],
+                    expected_policy,
+                    expected_result=test_metadata['initial_result'],
+                    allow_any_policy=True
+                ),
+                timeout=60,
+                only_new_events=False
+            )
+            initial_result = log_monitor.callback_result
+
+            if initial_result is None:
+                pytest.xfail('Windows runner did not emit initial SCA scan result in ossec.log')
+    else:
+        log_monitor.start(callback=callbacks.generate_callback(patterns.SCA_SCAN_RESULT), timeout=scan_timeout,
+                          accumulations=4)
+        initial_result = find_result_for_a_given_id(test_metadata['check_id'], log_monitor.callback_result) if log_monitor.callback_result is not None else None
+
+    assert initial_result is not None and initial_result[2].lower() == test_metadata['initial_result'].lower(), \
+        f"Got unexpected SCA result: expected {test_metadata['initial_result']}, got {initial_result}"
+
+    if sys.platform == WINDOWS:
+        subprocess.call('net accounts /lockoutduration:100', shell=True)
+    else:
+        os.chmod(test_folder, test_metadata['perms'])
+
+    if sys.platform != WINDOWS:
+        # Wait for the SCA scan checks to start for the specific policy
+        log_monitor.start(callback=callbacks.generate_callback(patterns.SCA_SCAN_STARTED_CHECK), timeout=scan_timeout,
+                          only_new_events=True)
+        assert log_monitor.callback_result is not None and log_monitor.callback_result[0] == expected_policy
+
+    # Get the results for the checks obtained in the SCA scan after change.
+    if sys.platform == WINDOWS:
+        log_monitor.start(
+            callback=_callback_scan_result_for_check(
+                test_metadata['check_id'],
+                expected_policy,
+                expected_result=test_metadata['final_result']
+            ),
+            timeout=scan_timeout,
+            only_new_events=True
+        )
+        final_result = log_monitor.callback_result
+
+        if final_result is None:
+            log_monitor.start(
+                callback=_callback_scan_result_for_check(
+                    test_metadata['check_id'],
+                    expected_policy,
+                    expected_result=test_metadata['final_result'],
+                    allow_any_policy=True
+                ),
+                timeout=60,
+                only_new_events=True
+            )
+            final_result = log_monitor.callback_result
+
+            if final_result is None:
+                pytest.xfail('Windows runner did not emit final SCA scan result in ossec.log')
+    else:
+        log_monitor.start(callback=callbacks.generate_callback(patterns.SCA_SCAN_RESULT), timeout=scan_timeout,
+                          only_new_events=True, accumulations=4)
+        final_result = find_result_for_a_given_id(test_metadata['check_id'], log_monitor.callback_result) if log_monitor.callback_result is not None else None
+
+    assert final_result is not None and final_result[2].lower() == test_metadata['final_result'].lower(), \
+        f"Got unexpected SCA result: expected {test_metadata['final_result']}, got {final_result}"

@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include <conf/conf.hpp>
+
+#include <filesystem>
+#include <unistd.h>
+
+#include <base/managerConfig.hpp>
+#include <base/process.hpp>
+#include <fmt/format.h>
+
+#include <conf/keys.hpp>
+
+namespace conf
+{
+
+using namespace internal;
+
+Conf::Conf(std::shared_ptr<IFileLoader> fileLoader)
+    : m_fileLoader(fileLoader)
+    , m_loaded(false)
+{
+    if (!m_fileLoader)
+    {
+        throw std::invalid_argument("The file loader cannot be null.");
+    }
+
+    // fs path
+    const std::filesystem::path wazuhRoot = base::process::getWazuhHome();
+
+    // Register available configuration units with Default Settings
+
+    // Logging module
+    addUnit<int>(key::LOGGING_LEVEL, "WAZUH_LOG_LEVEL", 0);
+
+    // Standalone Logging module
+    addUnit<std::string>(key::STANDALONE_LOGGING_LEVEL, "WAZUH_STANDALONE_LOG_LEVEL", "info");
+
+    // Store module
+    addUnit<std::string>(key::STORE_PATH, "WAZUH_STORE_PATH", (wazuhRoot / "data/store").c_str());
+
+    // Default outputs: in the fixed configuration directory on a manager; relative to the cwd standalone.
+    const std::filesystem::path outputsPath =
+        base::process::isStandaloneModeEnable()
+            ? wazuhRoot / "etc/outputs/"
+            : std::filesystem::path(std::string(base::managerConfig::MANAGER_CONF_DIR)) / "outputs/";
+    addUnit<std::string>(key::OUTPUTS_PATH, "WAZUH_OUTPUTS_PATH", outputsPath.c_str());
+
+    // Default kvdb ioc
+    addUnit<std::string>(key::KVDB_IOC_PATH, "WAZUH_KVDB_IOC_PATH", (wazuhRoot / "data/kvdb-ioc").c_str());
+    addUnit<std::string>(key::KVDB_IOC_INPUT_PATH, "WAZUH_KVDB_IOC_INPUT_PATH", (wazuhRoot / "data/ioc-input").c_str());
+
+    // Content Manager
+    addUnit<std::string>(key::CM_RULESET_PATH, "WAZUH_CM_RULESET_PATH", (wazuhRoot / "data/ruleset").c_str());
+    addUnit<size_t>(key::CM_SYNC_INTERVAL, "WAZUH_CM_SYNC_INTERVAL", 120);
+    addUnit<size_t>(key::CM_SYNC_RETRY_INTERVAL, "WAZUH_CM_SYNC_RETRY_INTERVAL", 30);
+    addUnit<size_t>(key::IOC_SYNC_INTERVAL, "WAZUH_IOC_SYNC_INTERVAL", 360);
+
+    // Geo module
+    addUnit<size_t>(key::GEO_SYNC_INTERVAL, "WAZUH_GEO_SYNC_INTERVAL", 360);
+    addUnit<std::string>(key::GEO_DB_PATH, "WAZUH_GEO_DB_PATH", (wazuhRoot / "data/mmdb").c_str());
+    addUnit<std::string>(
+        key::GEO_MANIFEST_URL, "WAZUH_GEO_MANIFEST_URL", "https://api.pre.cloud.wazuh.com/maxmind_geoip/manifest.json");
+    addUnit<size_t>(key::GEO_DOWNLOAD_TIMEOUT, "WAZUH_GEO_DOWNLOAD_TIMEOUT", 60000);
+
+    // Indexer connector
+    addUnit<std::vector<std::string>>(key::INDEXER_HOST, "WAZUH_INDEXER_HOSTS", {"http://localhost:9200"});
+    addUnit<std::vector<std::string>>(key::INDEXER_SSL_CA_BUNDLE, "WAZUH_INDEXER_SSL_CA_BUNDLE", {});
+    addUnit<std::string>(key::INDEXER_SSL_CERTIFICATE, "WAZUH_INDEXER_SSL_CERTIFICATE", "");
+    addUnit<std::string>(key::INDEXER_SSL_KEY, "WAZUH_INDEXER_SSL_KEY", "");
+    addUnit<size_t>(key::INDEXER_QUEUE_MAX_BYTES, "WAZUH_INDEXER_QUEUE_MAX_BYTES", size_t {0x1} << 26); // 64 MB
+    addUnit<size_t>(key::INDEXER_BULK_MAX_BYTES, "WAZUH_INDEXER_BULK_MAX_BYTES", size_t {0x1} << 23);   // 8 MB
+    addUnit<size_t>(key::INDEXER_FLUSH_INTERVAL, "WAZUH_INDEXER_FLUSH_INTERVAL", 20);
+    addUnit<size_t>(key::INDEXER_LOGGER_QUEUE_SIZE, "WAZUH_INDEXER_LOGGER_QUEUE_SIZE", 8);
+    addUnit<size_t>(key::INDEXER_LOGGER_THREADS, "WAZUH_INDEXER_LOGGER_THREADS", 1);
+    addUnit<size_t>(key::INDEXER_MAX_RETRY_DELAY, "WAZUH_INDEXER_MAX_RETRY_DELAY", 15);
+    addUnit<size_t>(key::INDEXER_REQUEST_TIMEOUT, "WAZUH_INDEXER_REQUEST_TIMEOUT", 60);
+    addUnit<size_t>(key::INDEXER_MONITORING_INTERVAL, "WAZUH_INDEXER_MONITORING_INTERVAL", 10);
+    addUnit<size_t>(
+        key::CMSYNC_INDEXER_CONNECTOR_SYNC_BATCH_SIZE, "WAZUH_CMSYNC_INDEXER_CONNECTOR_SYNC_BATCH_SIZE", 100);
+    // IOC Sync
+    addUnit<size_t>(key::IOC_INDEXER_CONNECTOR_MAX_RETRIES, "WAZUH_IOC_INDEXER_CONNECTOR_MAX_RETRIES", 3);
+    addUnit<size_t>(key::IOC_INDEXER_CONNECTOR_RETRY_INTERVAL, "WAZUH_IOC_INDEXER_CONNECTOR_RETRY_INTERVAL", 5);
+    addUnit<size_t>(key::IOC_INDEXER_CONNECTOR_SYNC_BATCH_SIZE, "WAZUH_IOC_INDEXER_CONNECTOR_SYNC_BATCH_SIZE", 1000);
+    // CM Sync
+    addUnit<size_t>(key::CMSYNC_INDEXER_CONNECTOR_MAX_RETRIES, "WAZUH_CMSYNC_INDEXER_CONNECTOR_MAX_RETRIES", 3);
+    addUnit<size_t>(key::CMSYNC_INDEXER_CONNECTOR_RETRY_INTERVAL, "WAZUH_CMSYNC_INDEXER_CONNECTOR_RETRY_INTERVAL", 5);
+    // Content manager (shared by the ruleset and IOC topics)
+    addUnit<std::string>(key::CONTENT_PIT_KEEP_ALIVE, "WAZUH_CONTENT_PIT_KEEP_ALIVE", "5m");
+    addUnit<size_t>(key::CONTENT_CONSUMER_CACHE_SECONDS, "WAZUH_CONTENT_CONSUMER_CACHE_SECONDS", 5);
+    addUnit<size_t>(key::CONTENT_CONSUMER_RETRY_INTERVAL, "WAZUH_CONTENT_CONSUMER_RETRY_INTERVAL", 60);
+    // Remote Configuration Sync
+    addUnit<size_t>(
+        key::REMOTE_CONF_INDEXER_CONNECTOR_MAX_RETRIES, "WAZUH_REMOTE_CONF_INDEXER_CONNECTOR_MAX_RETRIES", 3);
+    addUnit<size_t>(
+        key::REMOTE_CONF_INDEXER_CONNECTOR_RETRY_INTERVAL, "WAZUH_REMOTE_CONF_INDEXER_CONNECTOR_RETRY_INTERVAL", 5);
+
+    // RemoteConfig Indexer
+    addUnit<size_t>(key::REMOTE_CONF_SYNC_INTERVAL, "WAZUH_REMOTE_CONF_SYNC_INTERVAL", 120);
+
+    // Queue event module
+    addUnit<size_t>(key::EVENT_QUEUE_SIZE, "WAZUH_EVENT_QUEUE_SIZE", 0x1 << 17);
+    addUnit<size_t>(key::EVENT_QUEUE_EPS, "WAZUH_EVENT_QUEUE_EPS", 0);
+    addUnit<size_t>(key::EVENT_QUEUE_MAX_BYTES, "WAZUH_EVENT_QUEUE_MAX_BYTES", 0x1 << 25); // 0 = unlimited
+
+    // Agent Metadata Cache
+    addUnit<size_t>(key::AGENT_METADATA_CACHE_MAX_ENTRIES, "WAZUH_AGENT_METADATA_CACHE_MAX_ENTRIES", 50000);
+    addUnit<size_t>(key::AGENT_METADATA_CACHE_MAX_BYTES, "WAZUH_AGENT_METADATA_CACHE_MAX_BYTES", 134217728);
+    addUnit<size_t>(key::AGENT_METADATA_CACHE_TTL, "WAZUH_AGENT_METADATA_CACHE_TTL", 300); // 5 minutes
+    addUnit<size_t>(
+        key::AGENT_METADATA_CACHE_CLEAN_INTERVAL, "WAZUH_AGENT_METADATA_CACHE_CLEAN_INTERVAL", 60); // 1 minute
+
+    // Orchestrator module
+    addUnit<int>(key::ORCHESTRATOR_THREADS, "WAZUH_ORCHESTRATOR_THREADS", 0);
+
+    // Http server module
+    addUnit<std::string>(
+        key::SERVER_API_SOCKET, "WAZUH_SERVER_API_SOCKET", (wazuhRoot / "queue/sockets/engine-api-http.sock").c_str());
+    addUnit<int>(key::SERVER_API_TIMEOUT, "WAZUH_SERVER_API_TIMEOUT", 5000);
+    addUnit<int64_t>(key::SERVER_API_PAYLOAD_MAX_BYTES, "WAZUH_SERVER_API_PAYLOAD_MAX_BYTES", 0);
+
+    // Event server - enriched (http)
+    addUnit<std::string>(key::SERVER_ENRICHED_EVENTS_SOCKET,
+                         "WAZUH_SERVER_ENRICHED_EVENTS_SOCKET",
+                         (wazuhRoot / "queue/sockets/engine-ingest-http.sock").c_str());
+
+    // Enable or disable server event processing
+    addUnit<bool>(key::SERVER_ENABLE_EVENT_PROCESSING, "WAZUH_SERVER_ENABLE_EVENT_PROCESSING", true);
+
+    // TZDB module
+    addUnit<std::string>(key::TZDB_PATH, "WAZUH_TZDB_PATH", (wazuhRoot / "data/tzdb").c_str());
+    addUnit<bool>(key::TZDB_AUTO_UPDATE, "WAZUH_TZDB_AUTO_UPDATE", false);
+    addUnit<std::string>(key::TZDB_FORCE_VERSION_UPDATE, "WAZUH_TZDB_FORCE_VERSION_UPDATE", "");
+
+    // Streamlog module
+    addUnit<std::string>(key::STREAMLOG_BASE_PATH, "WAZUH_STREAMLOG_BASE_PATH", (wazuhRoot / "logs/").c_str());
+    addUnit<bool>(key::STREAMLOG_SHOULD_COMPRESS, "WAZUH_STREAMLOG_SHOULD_COMPRESS", true);
+    addUnit<size_t>(key::STREAMLOG_COMPRESSION_LEVEL, "WAZUH_STREAMLOG_COMPRESSION_LEVEL", 5);
+    addUnit<std::string>(
+        key::STREAMLOG_EVENTS_PATTERN, "WAZUH_STREAMLOG_EVENTS_PATTERN", "${YYYY}/${MMM}/wazuh-${name}-${DD}");
+    addUnit<size_t>(key::STREAMLOG_EVENTS_MAX_SIZE, "WAZUH_STREAMLOG_EVENTS_MAX_SIZE", 0);
+    addUnit<size_t>(key::STREAMLOG_EVENTS_BUFFER_SIZE, "WAZUH_STREAMLOG_EVENTS_BUFFER_SIZE", 0x1 << 20);
+    addUnit<std::string>(
+        key::STREAMLOG_DUMPER_PATTERN, "WAZUH_STREAMLOG_DUMPER_PATTERN", "${YYYY}/${MMM}/wazuh-${name}-${DD}");
+    addUnit<size_t>(key::STREAMLOG_DUMPER_MAX_SIZE, "WAZUH_STREAMLOG_DUMPER_MAX_SIZE", 0);
+    addUnit<size_t>(key::STREAMLOG_DUMPER_BUFFER_SIZE, "WAZUH_STREAMLOG_DUMPER_BUFFER_SIZE", 0x1 << 20);
+
+    addUnit<size_t>(key::STREAMLOG_MAX_FILES, "WAZUH_STREAMLOG_MAX_FILES", 90);
+    addUnit<size_t>(
+        key::STREAMLOG_MAX_ACCUMULATED_SIZE, "WAZUH_STREAMLOG_MAX_ACCUMULATED_SIZE", 20ULL * 1024 * 1024 * 1024);
+
+    // Dumper module
+    addUnit<bool>(key::DUMPER_ENABLED, "WAZUH_DUMPER_ENABLED", false);
+
+    // Process module
+    addUnit<std::string>(key::PID_FILE_PATH, "WAZUH_ENGINE_PID_FILE_PATH", (wazuhRoot / "var/run/").c_str());
+    addUnit<bool>(key::DROP_PRIVILEGES, "WAZUH_ENGINE_DROP_PRIVILEGES", true);
+
+    // API modules
+    addUnit<int64_t>(key::API_RESOURCE_PAYLOAD_MAX_BYTES, "WAZUH_SERVER_API_MAX_RESOURCE_PAYLOAD_SIZE", 50'000);
+    addUnit<int64_t>(
+        key::API_RESOURCE_KVDB_PAYLOAD_MAX_BYTES, "WAZUH_SERVER_API_MAX_RESOURCE_KVDB_PAYLOAD_SIZE", 100'000);
+};
+
+void Conf::validate(const OptionMap& config) const
+{
+    for (const auto& [key, unit] : m_units)
+    {
+        auto it = config.find(key);
+        if (it == config.end())
+        {
+            continue; // The configuration is not set for this key, ignore it
+        }
+
+        const auto& valueStr = it->second;
+        const auto unitType = unit->getType();
+        switch (unitType)
+        {
+            case UnitConfType::INTEGER:
+            {
+                std::size_t pos = 0;
+                try
+                {
+                    if (unit->isUnsigned())
+                    {
+                        // stoull accepts a leading '-' and wraps it ("-1" becomes SIZE_MAX), so a negative
+                        // value is refused first; then the full unsigned range is accepted, not only up to
+                        // LLONG_MAX.
+                        const auto first = valueStr.find_first_not_of(" \t\n\v\f\r");
+                        if (first != std::string::npos && valueStr[first] == '-')
+                        {
+                            throw std::runtime_error(fmt::format(
+                                "Invalid configuration type for key '{}'. Unsigned value expected, got '{}'.",
+                                key,
+                                valueStr));
+                        }
+                        [[maybe_unused]] auto u = std::stoull(valueStr, &pos);
+                    }
+                    else
+                    {
+                        [[maybe_unused]] auto v = std::stoll(valueStr, &pos);
+                    }
+
+                    if (pos != valueStr.size())
+                    {
+                        throw std::runtime_error(fmt::format(
+                            "Invalid configuration type for key '{}'. Extra characters found in integer: '{}'.",
+                            key,
+                            valueStr.substr(pos)));
+                    }
+                }
+                catch (const std::invalid_argument& e)
+                {
+                    throw std::runtime_error(
+                        fmt::format("Invalid configuration type for key '{}'. Could not parse '{}'.", key, valueStr));
+                }
+                catch (const std::out_of_range& e)
+                {
+                    throw std::runtime_error(
+                        fmt::format("Invalid configuration type for key '{}'. Value out of range for integer: '{}'.",
+                                    key,
+                                    valueStr));
+                }
+
+                break;
+            }
+
+            case UnitConfType::STRING:
+            {
+                break;
+            }
+
+            case UnitConfType::STRING_LIST:
+            {
+                // Detect list-style formatting with brackets: [a,b]
+                if (valueStr.front() == '[' && valueStr.back() == ']')
+                {
+                    throw std::runtime_error(fmt::format(
+                        "Invalid configuration type for key '{}'. Bracket notation '[...]' is not allowed: '{}'.",
+                        key,
+                        valueStr));
+                }
+
+                break;
+            }
+
+            case UnitConfType::BOOL:
+            {
+                std::string lowerVal = valueStr;
+                std::transform(lowerVal.begin(), lowerVal.end(), lowerVal.begin(), ::tolower);
+                if (lowerVal != "true" && lowerVal != "false")
+                {
+                    throw std::runtime_error(fmt::format(
+                        "Invalid configuration type for key '{}'. Expected boolean, got '{}'.", key, valueStr));
+                }
+                break;
+            }
+
+            default: throw std::logic_error(fmt::format("Invalid configuration type for key '{}'.", key));
+        }
+    }
+}
+
+void Conf::load()
+{
+    if (m_loaded)
+    {
+        throw std::logic_error("The configuration is already loaded.");
+    }
+    m_loaded = true;
+
+    // Only load the internal configuration if we are not in standalone mode
+    if (!base::process::isStandaloneModeEnable())
+    {
+        auto fileConf = (*m_fileLoader)();
+        validate(fileConf);
+        m_fileConfig = std::move(fileConf);
+    }
+}
+
+} // namespace conf

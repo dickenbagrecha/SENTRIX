@@ -1,0 +1,116 @@
+name: 5.X - MsGraph on Linux - Integration tests - Tier 0 and 1
+
+on:
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+    paths:
+        - ".github/workflows/5_testintegration_msgraph-tier-0-1-lin.yml"
+        - "src/config/src/wmodules-ms-graph.c"
+        - "src/wazuh_modules/src/wm_ms_graph.h"
+        - "src/wazuh_modules/src/wm_ms_graph.c"
+        - "src/Makefile"
+        - "src/deps.lock.mk"
+        - "tests/integration/conftest.py"
+        # pytest configuration of every tests/integration suite, read by the run below
+        - "tests/integration/pytest.ini"
+        - "tests/integration/test_msgraph/**"
+        - ".github/actions/reinstall_cmake/**"
+        # Interpreter the suite runs under (actions/setup-python python-version-file)
+        - ".github/workflows/.python-version-it"
+        # .github/actions/upload_s3_artifact only uploads results on failure: it tests nothing, and a
+        # broken upload fails the job visibly; 5_builderpackage_manager-multiples.yml exercises it on every pull request it runs.
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: 'Base branch'
+        required: true
+        default: 'main'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    env:
+      BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+      BRANCH_BASE: ${{ github.base_ref || inputs.base_branch }}
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version-file: ".github/workflows/.python-version-it"
+          architecture: x64
+      # Setup MSGraph Proxy
+      - name: Download m365proxy and config http for msgraph module
+        run: |
+          sed -i 's/https:\/\/%s\/%s/http:\/\/%s\/%s/g' src/wazuh_modules/src/wm_ms_graph.h
+          curl -L http://packages.wazuh.com/utils/m365proxy/m365proxy.tar.gz | \
+          tar zvx -C /tmp/
+      - name: "Install a compatible CMake"
+        uses: ./.github/actions/reinstall_cmake
+      # Build wazuh agent for linux.
+      - name: Build wazuh agent for linux
+        run: |
+          make deps -C src TARGET=agent -j2
+          make -C src TARGET=agent -j2
+      # Install wazuh agent for linux.
+      - name: Install wazuh agent for linux
+        run: |
+          echo 'USER_LANGUAGE="en"' > ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          echo 'USER_AGENT_MANAGER_IP="127.0.0.1"' >> ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          echo 'USER_INSTALL_TYPE="agent"' >> ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          echo "USER_DIR=/var/ossec" >> ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          echo 'USER_ENABLE_SYSCHECK="n"' >> ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          echo 'USER_ENABLE_ROOTCHECK="n"' >> ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          echo 'USER_ENABLE_SYSCOLLECTOR="n"' >> ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          echo 'USER_ENABLE_SCA="n"' >> ./etc/preloaded-vars.conf
+          echo "" >> ./etc/preloaded-vars.conf
+          sudo sh install.sh
+          rm ./etc/preloaded-vars.conf
+      # Download and install integration tests framework.
+      - name: Download and install integration tests framework
+        run: |
+          VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' VERSION.json)"
+          if [ "X`git ls-remote https://github.com/wazuh/qa-integration-framework.git ${BRANCH_NAME}`" != "X" ]; then
+              QA_BRANCH=${BRANCH_NAME}
+          elif [ "X`git ls-remote https://github.com/wazuh/qa-integration-framework.git ${BRANCH_BASE}`" != "X" ]; then
+              QA_BRANCH=${BRANCH_BASE}
+          elif [ "X`git ls-remote https://github.com/wazuh/qa-integration-framework.git ${VERSION}`" != "X" ]; then
+              QA_BRANCH=${VERSION}
+          else
+              QA_BRANCH="main"
+          fi
+          git clone -b ${QA_BRANCH} --single-branch https://github.com/wazuh/qa-integration-framework.git
+          sudo python3 -m pip install --break-system-packages qa-integration-framework/
+          sudo rm -rf qa-integration-framework/
+      # Run msgraph integration tests.
+      - name: Run msgraph integration tests
+        run: |
+          cd tests/integration
+          sudo -E GITHUB_SHA="${{ github.sha }}" GITHUB_REF_NAME="${BRANCH_NAME}" python -m pytest --tier 0 --tier 1 test_msgraph/ --html=results.html --self-contained-html
+      # Upload the tests result html as an artifact
+      - name: Upload failed test results
+        if: failure()
+        uses: ./.github/actions/upload_s3_artifact
+        with:
+          name: msgraph-tier-0-1-lin-test-results-${{ github.run_id }}
+          path: ./tests/integration/results.html
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws_region: ${{ secrets.CI_AWS_REGION }}

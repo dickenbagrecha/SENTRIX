@@ -1,0 +1,655 @@
+import React, { useEffect, useMemo, useState } from 'react';
+
+import { Alert, AlertContent, AlertDescription } from '@app/components/ui/alert';
+import { Button } from '@app/components/ui/button';
+import Editor from '@app/components/ui/code-editor';
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@app/components/ui/collapsible';
+import { Input } from '@app/components/ui/input';
+import { Label } from '@app/components/ui/label';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@app/components/ui/tooltip';
+import { highlightJSON } from '@app/lib/codeHighlight';
+import { cn } from '@app/lib/utils';
+import deepEqual from 'fast-deep-equal';
+import {
+  AlertCircle,
+  AlignLeft,
+  ChevronDown,
+  Cloud,
+  Code2,
+  FileCode2,
+  Server,
+  Terminal,
+} from 'lucide-react';
+import { withLocalProviderType } from './helpers';
+import { createDefaultProvider } from './providerCatalog';
+import { getProviderDocumentationUrl } from './providerDocumentationMap';
+
+import type { ProviderOptions } from '../../types';
+
+interface CustomTargetConfigurationProps {
+  selectedTarget: ProviderOptions;
+  updateCustomTarget: (field: string, value: unknown) => void;
+  rawConfigJson: string;
+  setRawConfigJson: (value: string) => void;
+  bodyError: string | React.ReactNode | null;
+  providerType?: string;
+  onConfigErrorChange?: (error: string | null, expectedTarget?: ProviderOptions) => void;
+  preserveConfigErrorOnUnchangedConfig?: boolean;
+}
+
+interface ProviderConfig {
+  title: string;
+  icon: React.ReactNode;
+  targetIdLabel: string;
+  targetIdPlaceholder: string;
+  helpText: React.ReactNode;
+  docUrl: string;
+  examples: {
+    title: string;
+    items: Array<{ code: string; description: string }>;
+  };
+  configExample: Record<string, unknown>;
+  configDescription: string;
+}
+
+const getProviderConfig = (providerType?: string): ProviderConfig => {
+  const initialConfig = providerType ? createDefaultProvider(providerType) : undefined;
+  const initialGuidance: Record<string, { title: string; helpText: string }> = {
+    together: {
+      title: 'Together AI',
+      helpText: 'Use a Together-hosted model ID. Configure TOGETHER_API_KEY.',
+    },
+    huggingface: {
+      title: 'Hugging Face',
+      helpText:
+        'Use a chat model hosted by an Inference Provider with HF_TOKEN. Hub artifacts alone do not guarantee hosted inference. You can append :provider to select a host or set apiBaseUrl for your own compatible endpoint.',
+    },
+    'bedrock-agent': {
+      title: 'AWS Bedrock Agents',
+      helpText:
+        'Replace the agent ID and agentAliasId with your deployed agent and alias. Configure AWS credentials and the agent region.',
+    },
+    fal: {
+      title: 'fal.ai Images',
+      helpText:
+        'Use an image model ID with the fal:image: prefix. Set FAL_KEY on the Promptfoo server.',
+    },
+    'cloudflare-ai': {
+      title: 'Cloudflare Workers AI',
+      helpText:
+        'Use a Workers AI chat model. Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_KEY on the Promptfoo server.',
+    },
+    'llama.cpp': {
+      title: 'llama.cpp',
+      helpText:
+        'Start the native llama.cpp server. The target ID is a label for the loaded model. Set LLAMA_BASE_URL on the Promptfoo server to change http://localhost:8080; apiBaseUrl in this JSON is not used by the native adapter.',
+    },
+    llamafile: {
+      title: 'Llamafile',
+      helpText:
+        'Start the llamafile server and use its OpenAI-compatible chat API. Keep the openai:chat: prefix before the served model name, or use openai:chat with config.model. Set apiBaseUrl including /v1. Authentication is disabled by default. If your server requires a key, set the key in an environment variable on the Promptfoo server and set apiKeyEnvar to that variable name.',
+    },
+    vllm: {
+      title: 'vLLM',
+      helpText:
+        'Keep the openai:chat: prefix before the exact model name exposed by your vLLM server, including any namespace, path, or custom served-model-name. Alternatively, use openai:chat with config.model. Set apiBaseUrl including /v1. Authentication is disabled by default. If your server requires a key, set the key in an environment variable on the Promptfoo server and set apiKeyEnvar to that variable name.',
+    },
+    'text-generation-webui': {
+      title: 'Text Generation WebUI',
+      helpText:
+        'Start the server with its OpenAI-compatible API enabled. Keep the openai:chat: prefix before the served model name, or use openai:chat with config.model. Set apiBaseUrl including /v1. Authentication is disabled by default. If your server requires a key, set the key in an environment variable on the Promptfoo server and set apiKeyEnvar to that variable name.',
+    },
+    ollama: {
+      title: 'Ollama',
+      helpText:
+        'Start Ollama and pull llama3.2:3b, or replace the model name with an installed model. This target uses the completion API; use ollama:chat: for chat. Set OLLAMA_BASE_URL on the Promptfoo server to change the server URL.',
+    },
+    databricks: {
+      title: 'Databricks',
+      helpText:
+        'Use a chat serving endpoint available in your Databricks workspace. You can replace the managed endpoint name with your own deployment name. Set DATABRICKS_WORKSPACE_URL and DATABRICKS_TOKEN on the Promptfoo server.',
+    },
+    deepseek: {
+      title: 'DeepSeek',
+      helpText:
+        'Use a DeepSeek model ID and set DEEPSEEK_API_KEY on the Promptfoo server. This example disables thinking for a non-reasoning chat target.',
+    },
+    cerebras: {
+      title: 'Cerebras',
+      helpText: 'Use a Cerebras-hosted model ID. Configure CEREBRAS_API_KEY.',
+    },
+    groq: {
+      title: 'Groq',
+      helpText: 'Use a Groq-hosted model ID. Set GROQ_API_KEY on the Promptfoo server.',
+    },
+  };
+  const guidance = providerType ? initialGuidance[providerType] : undefined;
+  if (initialConfig && guidance && providerType) {
+    return {
+      title: guidance.title,
+      icon: <Server className="size-5 text-primary" />,
+      targetIdLabel: 'Target ID',
+      targetIdPlaceholder: initialConfig.id,
+      helpText: guidance.helpText,
+      docUrl: getProviderDocumentationUrl(providerType),
+      examples: {
+        title: `${guidance.title} Target Example`,
+        items: [{ code: initialConfig.id, description: 'Initial target configuration' }],
+      },
+      configExample: initialConfig.config,
+      configDescription: 'Provider connection settings and model parameters',
+    };
+  }
+
+  switch (providerType) {
+    case 'python':
+      return {
+        title: 'Python Provider',
+        icon: <FileCode2 className="size-5 text-primary" />,
+        targetIdLabel: 'Python File Path',
+        targetIdPlaceholder: './my_provider.py or ./my_provider.py:call_api',
+        helpText: (
+          <>
+            Path to your Python file that implements the provider. Optionally specify a function
+            name after a colon.
+          </>
+        ),
+        docUrl: 'https://www.promptfoo.dev/docs/providers/python/',
+        examples: {
+          title: 'Python Provider Examples',
+          items: [
+            { code: './provider.py', description: 'Uses default call_api function' },
+            { code: './provider.py:my_function', description: 'Uses custom function name' },
+            { code: '/absolute/path/to/provider.py', description: 'Absolute path' },
+          ],
+        },
+        configExample: {
+          pythonExecutable: '/usr/bin/python3',
+          timeout: 30000,
+        },
+        configDescription: 'Python executable path and timeout settings',
+      };
+
+    case 'javascript':
+      return {
+        title: 'JavaScript Provider',
+        icon: <FileCode2 className="size-5 text-primary" />,
+        targetIdLabel: 'JavaScript File Path',
+        targetIdPlaceholder: './my_provider.js or ./my_provider.js:callApi',
+        helpText: (
+          <>
+            Path to your JavaScript/TypeScript file that exports a provider function. Optionally
+            specify an export name after a colon.
+          </>
+        ),
+        docUrl: 'https://www.promptfoo.dev/docs/providers/custom-api/',
+        examples: {
+          title: 'JavaScript Provider Examples',
+          items: [
+            { code: './provider.js', description: 'Uses default export' },
+            { code: './provider.js:callApi', description: 'Uses named export' },
+            { code: './provider.ts', description: 'TypeScript file' },
+          ],
+        },
+        configExample: {
+          timeout: 30000,
+          env: {
+            API_KEY: '{{MY_API_KEY}}',
+          },
+        },
+        configDescription: 'Environment variables and timeout settings',
+      };
+
+    case 'go':
+      return {
+        title: 'Go Provider',
+        icon: <FileCode2 className="size-5 text-primary" />,
+        targetIdLabel: 'Go Executable Path',
+        targetIdPlaceholder: './my_provider (compiled Go binary)',
+        helpText: (
+          <>
+            Path to your compiled Go binary that implements the provider interface. The binary
+            should accept prompts via stdin and output responses to stdout.
+          </>
+        ),
+        docUrl: 'https://www.promptfoo.dev/docs/providers/custom-api/',
+        examples: {
+          title: 'Go Provider Examples',
+          items: [
+            { code: './my-provider', description: 'Compiled Go binary' },
+            { code: '/usr/local/bin/my-provider', description: 'Absolute path to binary' },
+          ],
+        },
+        configExample: {
+          timeout: 30000,
+          args: ['--model', 'gpt-4'],
+        },
+        configDescription: 'Command-line arguments and timeout',
+      };
+
+    case 'exec':
+      return {
+        title: 'Executable Provider',
+        icon: <Terminal className="size-5 text-primary" />,
+        targetIdLabel: 'Command',
+        targetIdPlaceholder: 'exec:./my_script.sh or exec:python script.py',
+        helpText: (
+          <>
+            Execute any command as a provider. The command receives the prompt via stdin and should
+            output the response to stdout.
+          </>
+        ),
+        docUrl: 'https://www.promptfoo.dev/docs/providers/custom-script/',
+        examples: {
+          title: 'Exec Provider Examples',
+          items: [
+            { code: 'exec:./my_script.sh', description: 'Shell script' },
+            { code: 'exec:python3 inference.py', description: 'Python script with interpreter' },
+            { code: 'exec:node handler.js', description: 'Node.js script' },
+          ],
+        },
+        configExample: {
+          timeout: 60000,
+          env: {
+            MODEL_PATH: '/models/llama',
+          },
+        },
+        configDescription: 'Environment variables and timeout for the command',
+      };
+
+    case 'mcp':
+      return {
+        title: 'MCP Provider',
+        icon: <Server className="size-5 text-primary" />,
+        targetIdLabel: 'MCP Server Configuration',
+        targetIdPlaceholder: 'mcp:server-name',
+        helpText: (
+          <>
+            Model Context Protocol (MCP) server configuration. Connect to MCP-compatible servers for
+            tool use and context management.
+          </>
+        ),
+        docUrl: 'https://www.promptfoo.dev/docs/providers/mcp/',
+        examples: {
+          title: 'MCP Provider Examples',
+          items: [
+            { code: 'mcp:my-server', description: 'Connect to MCP server' },
+            { code: 'mcp:filesystem', description: 'Filesystem MCP server' },
+          ],
+        },
+        configExample: {
+          serverPath: './mcp-server',
+          args: ['--port', '3000'],
+        },
+        configDescription: 'MCP server path and arguments',
+      };
+
+    // Cloud providers
+    case 'bedrock':
+      return {
+        title: 'AWS Bedrock',
+        icon: <Cloud className="size-5 text-primary" />,
+        targetIdLabel: 'Model ID',
+        targetIdPlaceholder: 'bedrock:global.anthropic.claude-sonnet-5',
+        helpText: <>AWS Bedrock model identifier. Requires AWS credentials configured.</>,
+        docUrl: 'https://www.promptfoo.dev/docs/providers/aws-bedrock/',
+        examples: {
+          title: 'Bedrock Model Examples',
+          items: [
+            {
+              code: 'bedrock:global.anthropic.claude-sonnet-5',
+              description: 'Claude Sonnet 5',
+            },
+            { code: 'bedrock:amazon.nova-lite-v1:0', description: 'Amazon Nova Lite' },
+            { code: 'bedrock:meta.llama3-70b-instruct-v1:0', description: 'Llama 3' },
+          ],
+        },
+        configExample: {
+          region: 'us-east-1',
+          temperature: 0.7,
+          max_tokens: 1024,
+        },
+        configDescription: 'AWS region and model parameters',
+      };
+
+    case 'sagemaker':
+      return {
+        title: 'AWS SageMaker',
+        icon: <Cloud className="size-5 text-primary" />,
+        targetIdLabel: 'Endpoint Name',
+        targetIdPlaceholder: 'sagemaker:my-endpoint-name',
+        helpText: <>SageMaker endpoint name. Requires AWS credentials configured.</>,
+        docUrl: 'https://www.promptfoo.dev/docs/providers/aws-bedrock/#sagemaker',
+        examples: {
+          title: 'SageMaker Examples',
+          items: [
+            { code: 'sagemaker:my-llm-endpoint', description: 'Custom endpoint' },
+            { code: 'sagemaker:huggingface-llm', description: 'HuggingFace endpoint' },
+          ],
+        },
+        configExample: {
+          region: 'us-west-2',
+          modelKwargs: {
+            temperature: 0.7,
+          },
+        },
+        configDescription: 'AWS region and model parameters',
+      };
+
+    // Local model providers
+    case 'localai':
+      return {
+        title: 'LocalAI',
+        icon: <Server className="size-5 text-primary" />,
+        targetIdLabel: 'Model Name',
+        targetIdPlaceholder: 'localai:gpt4all-j',
+        helpText: <>LocalAI model name. Ensure LocalAI server is running.</>,
+        docUrl: 'https://www.promptfoo.dev/docs/providers/localai/',
+        examples: {
+          title: 'LocalAI Model Examples',
+          items: [
+            { code: 'localai:gpt4all-j', description: 'GPT4All-J' },
+            { code: 'localai:ggml-gpt4all-j', description: 'GGML model' },
+          ],
+        },
+        configExample: {
+          baseUrl: 'http://localhost:8080',
+          temperature: 0.7,
+        },
+        configDescription: 'LocalAI server URL and parameters',
+      };
+
+    // Open Interpreter coding-agent target
+    case 'openinterpreter':
+      return {
+        title: 'Open Interpreter Target',
+        icon: <Terminal className="size-5 text-primary" />,
+        targetIdLabel: 'Target ID',
+        targetIdPlaceholder: 'openinterpreter',
+        helpText: <>Run coding-agent evaluations against an Open Interpreter app-server.</>,
+        docUrl: 'https://www.promptfoo.dev/docs/providers/openinterpreter/',
+        examples: {
+          title: 'Open Interpreter Target Example',
+          items: [{ code: 'openinterpreter', description: 'Open Interpreter app-server target' }],
+        },
+        configExample: {
+          interpreter_path: 'interpreter',
+          working_dir: './workspace',
+          skip_git_repo_check: true,
+          sandbox_mode: 'read-only',
+          turn_timeout_ms: 60000,
+        },
+        configDescription: 'Open Interpreter executable, workspace, sandbox, and timeout options',
+      };
+
+    // Default fallback for custom and other providers
+    default:
+      return {
+        title: 'Custom Target Configuration',
+        icon: <FileCode2 className="size-5 text-primary" />,
+        targetIdLabel: 'Target ID',
+        targetIdPlaceholder: 'e.g., openai:chat:gpt-4o or ./my-provider.py',
+        helpText: (
+          <>
+            The configuration string for your custom target. See{' '}
+            <a
+              href="https://www.promptfoo.dev/docs/red-team/configuration/#custom-providerstargets"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-primary hover:underline"
+            >
+              Custom target documentation
+            </a>{' '}
+            for more information.
+          </>
+        ),
+        docUrl: 'https://www.promptfoo.dev/docs/red-team/configuration/#custom-providerstargets',
+        examples: {
+          title: 'Provider String Examples',
+          items: [
+            { code: 'openai:chat:gpt-4o', description: 'OpenAI model' },
+            { code: './provider.py', description: 'Local Python script' },
+            { code: './provider.js:myFunction', description: 'JavaScript with custom function' },
+          ],
+        },
+        configExample: {
+          temperature: 0.7,
+          max_tokens: 1024,
+          apiKey: '{{OPENAI_API_KEY}}',
+        },
+        configDescription: 'Optional JSON configuration (API keys, model parameters, etc.)',
+      };
+  }
+};
+
+const CustomTargetConfiguration = ({
+  selectedTarget,
+  updateCustomTarget,
+  rawConfigJson,
+  setRawConfigJson,
+  bodyError,
+  providerType,
+  onConfigErrorChange,
+  preserveConfigErrorOnUnchangedConfig = false,
+}: CustomTargetConfigurationProps) => {
+  const [targetId, setTargetId] = useState(selectedTarget.id?.replace('file://', '') || '');
+  const [docsExpanded, setDocsExpanded] = useState(false);
+
+  const config = useMemo(() => getProviderConfig(providerType), [providerType]);
+
+  useEffect(() => {
+    setTargetId(selectedTarget.id?.replace('file://', '') || '');
+  }, [selectedTarget.id]);
+
+  const handleTargetIdChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value;
+    setTargetId(value);
+
+    // A provider ID can contain script extensions in its opaque model name.
+    // Only file paths (optionally with a Windows drive or script function) get a prefix.
+    const isScriptPath = /^(?:[a-z]:[\\/])?[^:]*\.(?:py|js)(?::[^/\\]+)?$/i.test(value);
+    const isConfigPath = /^(?:[a-z]:[\\/])?[^:]*\.(?:json|ya?ml)$/i.test(value);
+    const idToSave = isScriptPath || isConfigPath ? `file://${value}` : value;
+    updateCustomTarget('id', idToSave);
+  };
+
+  const handleConfigChange = (content: string) => {
+    setRawConfigJson(content);
+    try {
+      const parsed = JSON.parse(content);
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        onConfigErrorChange?.('Configuration must be a JSON object');
+        return;
+      }
+
+      const parsedConfig = withLocalProviderType(selectedTarget.id, parsed, providerType);
+
+      if (preserveConfigErrorOnUnchangedConfig && deepEqual(parsedConfig, selectedTarget.config)) {
+        return;
+      }
+
+      updateCustomTarget('config', parsedConfig);
+      onConfigErrorChange?.(null, { ...selectedTarget, config: parsedConfig });
+    } catch {
+      onConfigErrorChange?.('Invalid JSON configuration');
+    }
+  };
+
+  const handleFormatJson = () => {
+    if (rawConfigJson.trim()) {
+      try {
+        const parsed = JSON.parse(rawConfigJson);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          onConfigErrorChange?.('Configuration must be a JSON object');
+          return;
+        }
+
+        const parsedConfig = withLocalProviderType(selectedTarget.id, parsed, providerType);
+        if (
+          preserveConfigErrorOnUnchangedConfig &&
+          deepEqual(parsedConfig, selectedTarget.config)
+        ) {
+          return;
+        }
+
+        const formatted = JSON.stringify(parsedConfig, null, 2);
+        setRawConfigJson(formatted);
+        updateCustomTarget('config', parsedConfig);
+        onConfigErrorChange?.(null, { ...selectedTarget, config: parsedConfig });
+      } catch {
+        onConfigErrorChange?.('Invalid JSON configuration');
+      }
+    }
+  };
+
+  return (
+    <div className="mt-4">
+      <h3 className="mb-4 flex items-center gap-2 text-lg font-semibold">
+        {config.icon}
+        {config.title}
+      </h3>
+
+      <div className="rounded-lg border border-border p-4">
+        {/* Target ID Section */}
+        <div className="space-y-2">
+          <Label htmlFor="target-id">
+            {config.targetIdLabel} <span className="text-destructive">*</span>
+          </Label>
+          <Input
+            id="target-id"
+            value={targetId}
+            onChange={handleTargetIdChange}
+            placeholder={config.targetIdPlaceholder}
+          />
+          <p className="text-sm text-muted-foreground">
+            {config.helpText}{' '}
+            {providerType && providerType !== 'custom' && (
+              <>
+                See{' '}
+                <a
+                  href={config.docUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary hover:underline"
+                >
+                  documentation
+                </a>
+                .
+              </>
+            )}
+          </p>
+        </div>
+
+        {/* Custom Configuration Section */}
+        <div className="mt-6 space-y-2">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="config-json">Configuration (JSON)</Label>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleFormatJson}
+                  disabled={!rawConfigJson.trim() || !!bodyError}
+                  className="h-7 px-2"
+                >
+                  <AlignLeft className="size-4" />
+                  <span className="ml-1 text-xs">Format</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{bodyError ? 'Fix JSON errors first' : 'Format JSON'}</TooltipContent>
+            </Tooltip>
+          </div>
+
+          {/* Documentation Collapsible */}
+          <Collapsible
+            open={docsExpanded}
+            onOpenChange={setDocsExpanded}
+            className="rounded-lg border border-border"
+          >
+            <CollapsibleTrigger className="flex w-full items-center justify-between rounded-lg bg-muted/50 px-3 py-2 text-left transition-colors hover:bg-muted data-[state=open]:rounded-b-none">
+              <span className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Code2 className="size-4" />
+                Examples
+              </span>
+              <ChevronDown
+                className={cn(
+                  'size-4 text-muted-foreground transition-transform',
+                  docsExpanded && 'rotate-180',
+                )}
+              />
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <div className="space-y-3 border-t border-border p-3">
+                <div>
+                  <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    {config.examples.title}
+                  </p>
+                  <ul className="space-y-1 text-sm text-muted-foreground">
+                    {config.examples.items.map((item, index) => (
+                      <li key={index}>
+                        <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{item.code}</code>{' '}
+                        - {item.description}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <div>
+                  <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    JSON Config Example
+                  </p>
+                  <pre className="rounded bg-muted p-2 text-xs">
+                    {JSON.stringify(config.configExample, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+
+          {/* JSON Editor */}
+          <div
+            className={cn(
+              'overflow-hidden rounded-lg border',
+              bodyError ? 'border-destructive' : 'border-border',
+            )}
+          >
+            <div className="flex items-center justify-between border-b border-border bg-muted/50 px-3 py-1.5">
+              <span className="text-xs text-muted-foreground">JSON</span>
+            </div>
+            <div className="bg-white dark:bg-zinc-950">
+              <Editor
+                value={rawConfigJson}
+                onValueChange={handleConfigChange}
+                highlight={highlightJSON}
+                padding={12}
+                placeholder={JSON.stringify(config.configExample, null, 2)}
+                style={{
+                  fontFamily: 'ui-monospace, "Fira Code", monospace',
+                  fontSize: 13,
+                  minHeight: '120px',
+                }}
+              />
+            </div>
+          </div>
+
+          {bodyError ? (
+            <Alert variant="destructive" className="py-2">
+              <AlertCircle className="size-4" />
+              <AlertContent>
+                <AlertDescription>{bodyError}</AlertDescription>
+              </AlertContent>
+            </Alert>
+          ) : (
+            <p className="text-sm text-muted-foreground">{config.configDescription}</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default CustomTargetConfiguration;

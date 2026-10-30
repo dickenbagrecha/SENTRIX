@@ -1,0 +1,110 @@
+/*
+ * Wazuh agent HTTPS client (C++ transport module)
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#include "outcomeClassifier.hpp"
+
+OutcomeClass classifyOutcome(const HttpResponse& response)
+{
+    if (response.status == TransportStatus::Aborted)
+    {
+        return OutcomeClass::Interrupted;
+    }
+
+    if (response.status != TransportStatus::Ok)
+    {
+        // timeout / connect / DNS / TLS / other transport error: no HTTP status
+        // ever arrived, so the manager is not answering at all. This is the one
+        // class that arms the producer pause.
+        return OutcomeClass::Unreachable;
+    }
+
+    const long code = response.httpCode;
+
+    if (code >= 200 && code < 300)
+    {
+        return OutcomeClass::Ok;
+    }
+
+    // 401: the only auth code in the contract. Which of the eight failure classes it is stays out
+    // of OutcomeClass on purpose -- that keeps its "what was observed" contract, and the class is a
+    // property of the body, not of the status. RetrySender reads it with parseAuthFailClass() where
+    // the escalation decision is actually made (#39064).
+    if (code == 401)
+    {
+        return OutcomeClass::AuthFail;
+    }
+
+    // 404: nothing at the target. Split out of Permanent because the two
+    // demand opposite treatment -- Permanent says the payload is unacceptable,
+    // while a 404 says nothing about it, so a batch rejected this way must be
+    // kept rather than dropped.
+    if (code == 404)
+    {
+        return OutcomeClass::RouteNotFound;
+    }
+
+    // 413: the /stateless batch exceeds what the manager accepts; the stream
+    // splits it and resends smaller (#37835), never dropping events.
+    if (code == 413)
+    {
+        return OutcomeClass::PayloadTooLarge;
+    }
+
+    // 409 Conflict: protocol/agent version not supported (the #37733 /control
+    // contract). The client goes REJECTED and re-tries Startup on the slow
+    // cadence.
+    if (code == 409)
+    {
+        return OutcomeClass::VersionRejected;
+    }
+
+    // 415: the manager's BodyDecoder doesn't accept Content-Encoding: zstd
+    // (disabled server-side, or an intermediary stripped/rejected it) --
+    // RetrySender retries once, uncompressed.
+    if (code == 415)
+    {
+        return OutcomeClass::CompressionRejected;
+    }
+
+    if (code == 429 || code == 503)
+    {
+        return OutcomeClass::BackPressure;
+    }
+
+    // 403: the manager's source-address ACL (client.keys) refused this peer, or an intermediary
+    // (reverse proxy, WAF, mTLS gateway) blocked it; 426 only from an intermediary. Transient so the
+    // batch is retried and kept (not dropped) rather than consumed as Permanent, and not Unreachable
+    // because something answered.
+    if (code == 403 || code == 426)
+    {
+        return OutcomeClass::ServerError;
+    }
+
+    // 5xx other than the 503 handled above (500, and 502/504 only when an
+    // intermediary is in the path).
+    return (code >= 500) ? OutcomeClass::ServerError : OutcomeClass::Permanent;
+}
+
+bool isCertificateVerificationFailure(const HttpResponse& response)
+{
+    if (response.status != TransportStatus::TlsFail)
+    {
+        return false;
+    }
+
+    if (response.tlsFailure.kind != TlsFailureKind::None)
+    {
+        // Already classified (and already logged) as a hostname mismatch or a
+        // certificate-date problem by classifyTlsVerifyFailure()'s own lines.
+        return false;
+    }
+
+    return response.tlsFailure.depth0VerificationFailed || response.tlsFailure.chainTrustRejectedAboveDepth0;
+}

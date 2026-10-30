@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: Validate calculator function calls from GPT OSS
+prompts:
+  - file://tool_prompts.txt
+providers:
+  - id: cerebras:gpt-oss-120b
+    config:
+      temperature: 0.7
+      max_completion_tokens: 1024
+      tool_choice:
+        type: function
+        function:
+          name: calculate
+      tools:
+        - type: 'function'
+          function:
+            name: 'calculate'
+            description: 'A calculator that can perform basic arithmetic operations'
+            parameters:
+              type: 'object'
+              properties:
+                expression:
+                  type: 'string'
+                  description: 'The mathematical expression to evaluate'
+              required: ['expression']
+              additionalProperties: false
+            strict: true
+defaultTest:
+  assert:
+    - type: javascript
+      value: |
+        const calls = Array.isArray(output) ? output : output.tool_calls;
+        return calls?.length === 1 &&
+          calls[0].type === 'function' &&
+          calls[0].function.name === 'calculate' &&
+          JSON.parse(calls[0].function.arguments).expression === context.vars.expression;
+
+tests:
+  - vars:
+      expression: '15 * 7'
+  - vars:
+      expression: '(42 * 3) / 6'
+  - vars:
+      expression: 'sqrt(144) + 25 ** 2'

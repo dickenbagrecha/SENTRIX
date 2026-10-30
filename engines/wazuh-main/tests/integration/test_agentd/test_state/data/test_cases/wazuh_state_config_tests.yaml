@@ -1,0 +1,23 @@
+- name: "No_connection_with_remoted"
+  description:
+  configuration_parameters:
+  metadata:
+    remoted: false
+    output:
+    - type: "file"
+      fields:
+        status: "pending"
+        last_keepalive: ""
+        msg_count: ""
+
+- name: "Successful_connection_with_remoted"
+  description:
+  configuration_parameters:
+  metadata:
+    remoted: true
+    output:
+    - type: "file"
+      fields:
+        status: "connected"
+        last_keepalive: true
+        msg_count: true

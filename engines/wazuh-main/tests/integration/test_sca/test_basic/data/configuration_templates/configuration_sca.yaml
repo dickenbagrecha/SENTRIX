@@ -1,0 +1,52 @@
+- sections:
+    - section: sca
+      elements:
+        - enabled:
+            value: ENABLED
+        - scan_on_start:
+            value: 'yes'
+        - interval:
+            value: INTERVAL
+        - synchronization:
+            elements:
+              - response_timeout:
+                  value: 1
+        - policies:
+            elements:
+              - policy:
+                  value: POLICY_FILE
+
+    - section: rootcheck
+      elements:
+        - disabled:
+            value: 'yes'
+
+    - section: syscheck
+      elements:
+        - disabled:
+            value: 'yes'
+
+    - section: wodle
+      attributes:
+        - name: syscollector
+      elements:
+        - disabled:
+            value: 'yes'
+
+    # <agent> is the 5.x name for what 4.x spelled <client> (#38103). <endpoint> carries the
+    # whole target -- host, port and path (#38624) -- which is why <address> and <port> are no
+    # longer written here: they are the deprecated spelling and are ignored outright whenever
+    # <endpoint> is present.
+    - section: agent
+      elements:
+        - manager:
+            elements:
+              - endpoint:
+                  value: '127.0.0.1:1517'
+        # The agent's default verification_mode is now 'system', which
+        # RemotedSimulator's self-signed cert fails -- opt out explicitly since this
+        # suite is not testing TLS trust.
+        - ssl:
+            elements:
+              - verification_mode:
+                  value: none

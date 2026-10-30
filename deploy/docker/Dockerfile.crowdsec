@@ -1,0 +1,34 @@
+# Multi-stage Docker build for CrowdSec Security Engine
+FROM golang:1.24-alpine AS builder
+
+ENV GOTOOLCHAIN=auto
+
+RUN apk add --no-cache git make gcc libc-dev
+
+WORKDIR /src
+
+COPY engines/crowdsec-master/ ./
+
+# Build with pure-Go modernc SQLite and WASM RE2 for maximum portability
+RUN make BUILD_SQLITE=modernc BUILD_RE2_WASM=1 BUILD_VERSION=v1.6.0
+
+# Runtime Stage
+FROM alpine:3.20
+
+RUN apk --no-cache add ca-certificates tzdata
+
+WORKDIR /etc/crowdsec
+
+COPY --from=builder /src/cmd/crowdsec/crowdsec /usr/local/bin/crowdsec
+COPY --from=builder /src/cmd/crowdsec-cli/cscli /usr/local/bin/cscli
+COPY --from=builder /src/config /etc/crowdsec
+
+COPY deploy/docker/docker-entrypoint-crowdsec.sh /docker-entrypoint-crowdsec.sh
+RUN chmod +x /docker-entrypoint-crowdsec.sh
+
+RUN mkdir -p /var/lib/crowdsec/data /var/log/crowdsec /etc/crowdsec/hub /etc/crowdsec/acquis.d
+
+EXPOSE 8085 6060
+
+ENTRYPOINT ["/docker-entrypoint-crowdsec.sh"]
+

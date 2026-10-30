@@ -1,0 +1,992 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { getCache } from '../../../src/cache';
+import * as esm from '../../../src/esm';
+import { ClaudeCodeSDKProvider } from '../../../src/providers/claude-agent-sdk';
+import {
+  transformMCPConfigToClaudeCode,
+  transformMCPToolsToAnthropic,
+  transformMCPToolsToGoogle,
+  transformMCPToolsToOpenAi,
+  validateMCPConfigForClaudeCode,
+} from '../../../src/providers/mcp/transform';
+import * as mcpUtil from '../../../src/providers/mcp/util';
+import { fetchWithProxy } from '../../../src/util/fetch/index';
+import type Anthropic from '@anthropic-ai/sdk';
+
+import type { MCPTool } from '../../../src/providers/mcp/types';
+import type { OpenAiTool } from '../../../src/providers/openai/util';
+
+vi.mock('../../../src/util/fetch/index');
+afterEach(() => vi.resetAllMocks());
+
+const createStringParameterProperties = () => ({
+  param: { type: 'string' as const },
+});
+
+const createStrictEmptyInputSchema = () => ({
+  type: 'object' as const,
+  properties: {},
+  additionalProperties: false,
+  $schema: 'http://json-schema.org/draft-07/schema#',
+});
+
+const createCollidingServerNames = () => ({
+  servers: [
+    { name: 'tools.local', command: 'first' },
+    { name: 'tools_local', command: 'second' },
+  ],
+});
+
+const createExpectedEmptyParameters = () => ({
+  type: 'object' as const,
+  properties: {},
+});
+
+describe('transformMCPToolsToOpenAi', () => {
+  it('should transform MCP tools to OpenAI format', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'test_tool',
+        description: 'A test tool',
+        inputSchema: {
+          properties: {
+            param1: { type: 'string' },
+            param2: { type: 'number' },
+          },
+          required: ['param1'],
+        },
+      },
+    ];
+
+    const expected: OpenAiTool[] = [
+      {
+        type: 'function',
+        function: {
+          name: 'test_tool',
+          description: 'A test tool',
+          parameters: {
+            type: 'object',
+            properties: {
+              param1: { type: 'string' },
+              param2: { type: 'number' },
+            },
+            required: ['param1'],
+          },
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result).toEqual(expected);
+  });
+
+  it('should handle tools without properties in schema', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'simple_tool',
+        description: 'A simple tool',
+        inputSchema: {
+          type: 'string',
+        },
+      },
+    ];
+
+    // When inputSchema has type but no properties field, we should return empty properties
+    // This is a malformed schema - MCP tools should have proper JSON Schema format
+    const expected: OpenAiTool[] = [
+      {
+        type: 'function',
+        function: {
+          name: 'simple_tool',
+          description: 'A simple tool',
+          parameters: createExpectedEmptyParameters(),
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result).toEqual(expected);
+  });
+
+  it('should handle empty input schema', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'empty_tool',
+        description: 'A tool with empty schema',
+        inputSchema: {},
+      },
+    ];
+
+    const expected: OpenAiTool[] = [
+      {
+        type: 'function',
+        function: {
+          name: 'empty_tool',
+          description: 'A tool with empty schema',
+          parameters: createExpectedEmptyParameters(),
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result).toEqual(expected);
+  });
+
+  it('should handle multiple tools', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'tool1',
+        description: 'First tool',
+        inputSchema: {
+          properties: {
+            param1: { type: 'string' },
+          },
+        },
+      },
+      {
+        name: 'tool2',
+        description: 'Second tool',
+        inputSchema: {
+          properties: {
+            param2: { type: 'number' },
+          },
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result).toHaveLength(2);
+    expect(result[0].function.name).toBe('tool1');
+    expect(result[1].function.name).toBe('tool2');
+  });
+
+  it('should remove $schema field from inputSchema', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'tool_with_schema',
+        description: 'Tool with $schema field',
+        inputSchema: {
+          $schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+          properties: createStringParameterProperties(),
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result[0].function.parameters).not.toHaveProperty('$schema');
+    expect(result[0].function.parameters).toEqual({
+      type: 'object',
+      properties: {
+        param: { type: 'string' },
+      },
+    });
+  });
+
+  it('should preserve additionalProperties when present', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'tool_with_additional_props',
+        description: 'Tool with additionalProperties',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result[0].function.parameters).toEqual({
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    });
+  });
+
+  it('should handle schema from MCP SDK with all metadata fields', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'mcp_sdk_tool',
+        description: 'Tool with MCP SDK generated schema',
+        inputSchema: createStrictEmptyInputSchema(),
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    // Should not include $schema but should include additionalProperties
+    expect(result[0].function.parameters).toEqual({
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    });
+    expect(result[0].function.parameters).not.toHaveProperty('$schema');
+  });
+
+  it('should not include required field when empty', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'tool_empty_required',
+        description: 'Tool with empty required array',
+        inputSchema: {
+          properties: createStringParameterProperties(),
+          required: [],
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result[0].function.parameters).not.toHaveProperty('required');
+    expect(result[0].function.parameters).toEqual({
+      type: 'object',
+      properties: {
+        param: { type: 'string' },
+      },
+    });
+  });
+
+  it('should handle schema without properties field', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'tool_no_properties',
+        description: 'Tool without properties field',
+        inputSchema: {
+          type: 'object',
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToOpenAi(mcpTools);
+    expect(result[0].function.parameters).toEqual({
+      type: 'object',
+      properties: {},
+    });
+  });
+});
+
+describe('transformMCPConfigToClaudeCode', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('validates nested auth before converting any server', async () => {
+    await expect(
+      transformMCPConfigToClaudeCode({
+        servers: [
+          { command: 'node' },
+          { url: 'https://mcp.example.test', auth: { type: 'api_key' } },
+        ],
+      }),
+    ).rejects.toThrow('api_key auth requires value or api_key');
+  });
+
+  it('normalizes no-auth and preserves URL precedence for the SDK adapter', async () => {
+    await expect(
+      transformMCPConfigToClaudeCode({
+        server: {
+          name: 'remote',
+          url: 'https://mcp.example.test',
+          command: 'ignored',
+          auth: { type: 'none' },
+        },
+      }),
+    ).resolves.toEqual({
+      remote: { type: 'http', url: 'https://mcp.example.test', headers: {} },
+    });
+  });
+
+  it('returns no servers when MCP is disabled', async () => {
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: false,
+        server: {
+          name: 'disabled',
+          command: 'npx',
+          args: ['disabled-server'],
+        },
+        servers: [{ name: 'disabled', command: 'other-server' }],
+      }),
+    ).resolves.toEqual({});
+  });
+
+  it('rejects duplicate names before any OAuth token is fetched', async () => {
+    const tokenRequest = vi.spyOn(mcpUtil, 'getOAuthTokenWithExpiry').mockResolvedValue({
+      accessToken: 'test-token',
+      expiresAt: Date.now() + 3_600_000,
+    });
+    const oauth = {
+      type: 'oauth' as const,
+      grantType: 'client_credentials' as const,
+      clientId: 'id',
+      clientSecret: 'secret',
+      tokenUrl: 'https://auth.example.com/token',
+    };
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        servers: [
+          { name: 'shared', url: 'https://a.example.com/mcp', auth: oauth },
+          { name: 'shared', url: 'https://b.example.com/mcp', auth: oauth },
+        ],
+      }),
+    ).rejects.toThrow(/MCP servers.*unique `name`/);
+    expect(tokenRequest).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'explicit names',
+      { server: { name: 'npx', command: 'a' }, servers: [{ name: 'npx', command: 'b' }] },
+    ],
+    [
+      'an explicit name and a command',
+      { servers: [{ name: 'npx', command: 'a' }, { command: 'npx' }] },
+    ],
+    ['path servers', { servers: [{ path: 'first.js' }, { path: 'second.js' }] }],
+    [
+      'commands with different args',
+      {
+        servers: [
+          { command: 'npx', args: ['a'] },
+          { command: 'npx', args: ['b'] },
+        ],
+      },
+    ],
+    [
+      'urls',
+      {
+        servers: [
+          { url: 'https://h.example.com/mcp?token=secret' },
+          { url: 'https://h.example.com/mcp?token=secret' },
+        ],
+      },
+    ],
+    [
+      'empty names',
+      {
+        servers: [
+          { name: '', command: 'first' },
+          { name: '', command: 'second' },
+        ],
+      },
+    ],
+    [
+      'prototype-property names',
+      {
+        servers: [
+          { name: '__proto__', command: 'first' },
+          { name: '__proto__', command: 'second' },
+        ],
+      },
+    ],
+    ['names differing only in punctuation', createCollidingServerNames()],
+    [
+      'an explicit name and a normalized URL',
+      {
+        servers: [
+          { url: 'https://mcp.example.com' },
+          { name: 'https___mcp_example_com', command: 'local' },
+        ],
+      },
+    ],
+    [
+      'Claude connector names',
+      {
+        servers: [
+          { name: 'claude.ai  tools ', command: 'first' },
+          { name: 'claude_ai_tools', command: 'second' },
+        ],
+      },
+    ],
+  ])('rejects %s that resolve to the same tool namespace', (_, servers) => {
+    expect(() => validateMCPConfigForClaudeCode({ enabled: true, ...servers })).toThrow(
+      /MCP servers.*unique `name`/,
+    );
+  });
+
+  it.each([false, true])(
+    'does not echo credential-bearing collision keys (reversed: %s)',
+    (reversed) => {
+      const url =
+        'https://user:password@mcp.example.com/path-secret?token=query-secret#fragment-secret';
+      const servers = [{ url }, { name: url, command: 'local' }];
+      if (reversed) {
+        servers.reverse();
+      }
+
+      expect(() => validateMCPConfigForClaudeCode({ servers })).toThrow(
+        'Claude Agent SDK MCP servers 1 and 2 have colliding tool names; give each server a unique `name` using letters, numbers, hyphens, or underscores.',
+      );
+    },
+  );
+
+  it('rejects colliding tool namespaces before a cached provider response can be returned', async () => {
+    const cache = await getCache();
+    const read = vi
+      .spyOn(cache, 'get')
+      .mockResolvedValue(JSON.stringify({ output: 'stale result' }));
+    const sdkImport = vi
+      .spyOn(esm, 'importModule')
+      .mockRejectedValue(new Error('SDK must not load'));
+    const provider = new ClaudeCodeSDKProvider({
+      config: {
+        apiKey: 'test-key',
+        cache_mcp: true,
+        mcp: createCollidingServerNames(),
+      },
+    });
+
+    await expect(provider.callApi('Test prompt')).rejects.toThrow(/MCP servers.*unique `name`/);
+    expect(read).not.toHaveBeenCalled();
+    expect(sdkImport).not.toHaveBeenCalled();
+  });
+
+  it('keeps the existing name for each unnamed server', async () => {
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        servers: [
+          { command: 'npx', args: ['-y', 'some-server'] },
+          { url: 'https://mcp.example.com/v1?token=abc' },
+          { path: 'server.js' },
+          { name: '', command: 'named-empty' },
+        ],
+      }),
+    ).resolves.toEqual({
+      npx: { type: 'stdio', command: 'npx', args: ['-y', 'some-server'] },
+      'https://mcp.example.com/v1?token=abc': {
+        type: 'http',
+        url: 'https://mcp.example.com/v1?token=abc',
+        headers: {},
+      },
+      default: { type: 'stdio', command: process.execPath, args: ['server.js'] },
+      '': { type: 'stdio', command: 'named-empty', args: [] },
+    });
+  });
+
+  it('keeps case and hyphen variants as separate tool namespaces', async () => {
+    const names = ['tools-local', 'tools_local', 'Tools-local'];
+    const servers = await transformMCPConfigToClaudeCode({
+      servers: names.map((name) => ({ name, command: 'mcp-server' })),
+    });
+
+    expect(Object.keys(servers)).toEqual(names);
+  });
+
+  it('rejects a server without a URL, command, or path', async () => {
+    await expect(transformMCPConfigToClaudeCode({ enabled: true, server: {} })).rejects.toThrow(
+      'Either command or path or url must be specified for MCP server',
+    );
+  });
+
+  it('rejects unsupported tool filters instead of silently dropping them', async () => {
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        servers: [{ name: 'filtered', command: 'npx', args: ['filtered-server'] }],
+        tools: ['safe_tool'],
+      }),
+    ).rejects.toThrow(/does not support MCP tool allowlists or/);
+
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        servers: [{ name: 'filtered', command: 'npx', args: ['filtered-server'] }],
+        exclude_tools: ['dangerous_tool'],
+      }),
+    ).rejects.toThrow(/does not support MCP tool allowlists or/);
+
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        servers: [{ name: 'filtered', command: 'npx', args: ['filtered-server'] }],
+        tools: [],
+      }),
+    ).rejects.toThrow(/does not support MCP tool allowlists or/);
+
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        servers: [{ name: 'filtered', command: 'npx', args: ['filtered-server'] }],
+        exclude_tools: [],
+      }),
+    ).resolves.toEqual({
+      filtered: { type: 'stdio', command: 'npx', args: ['filtered-server'] },
+    });
+  });
+
+  it('combines singular and plural server config without mutating the input', async () => {
+    const servers = [{ name: 'plural', command: 'plural-server' }];
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        server: { name: 'single', command: 'single-server' },
+        servers,
+      }),
+    ).resolves.toEqual({
+      plural: { type: 'stdio', command: 'plural-server', args: [] },
+      single: { type: 'stdio', command: 'single-server', args: [] },
+    });
+    expect(servers).toEqual([{ name: 'plural', command: 'plural-server' }]);
+  });
+
+  it('accepts a zero-argument stdio server', async () => {
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        server: { name: 'no-args', command: 'mcp-server' },
+      }),
+    ).resolves.toEqual({
+      'no-args': { type: 'stdio', command: 'mcp-server', args: [] },
+    });
+  });
+
+  it.each(['__proto__', 'constructor', 'toString'])(
+    'preserves %s as an own server entry',
+    async (name) => {
+      const servers = await transformMCPConfigToClaudeCode({
+        enabled: true,
+        server: { name, command: 'mcp-server' },
+      });
+
+      expect(Object.hasOwn(servers, name)).toBe(true);
+      expect(servers[name]).toEqual({ type: 'stdio', command: 'mcp-server', args: [] });
+      expect(Object.getPrototypeOf(servers)).toBe(Object.prototype);
+    },
+  );
+
+  it('preserves per-server env for command-based stdio servers', async () => {
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        server: {
+          name: 'server-with-env',
+          command: 'npx',
+          args: ['-y', 'my-mcp-server'],
+          env: { FOO: 'bar', BAZ: 'qux' },
+        },
+      }),
+    ).resolves.toEqual({
+      'server-with-env': {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', 'my-mcp-server'],
+        env: { FOO: 'bar', BAZ: 'qux' },
+      },
+    });
+  });
+
+  it('preserves per-server env for path-based stdio servers', async () => {
+    const isPy = 'server.py'.endsWith('.py');
+    const expectedCommand = isPy
+      ? process.platform === 'win32'
+        ? 'python'
+        : 'python3'
+      : process.execPath;
+    await expect(
+      transformMCPConfigToClaudeCode({
+        enabled: true,
+        server: {
+          name: 'python-server-with-env',
+          path: 'server.py',
+          env: { PYTHON_VAR: '123' },
+        },
+      }),
+    ).resolves.toEqual({
+      'python-server-with-env': {
+        type: 'stdio',
+        command: expectedCommand,
+        args: ['server.py'],
+        env: { PYTHON_VAR: '123' },
+      },
+    });
+  });
+
+  it.each([{ command: 'npx', args: ['plain-server'] }, { path: 'server.js' }])(
+    'omits absent env from stdio config %j',
+    async (server) => {
+      const servers = await transformMCPConfigToClaudeCode({
+        enabled: true,
+        server: { name: 'plain', ...server },
+      });
+
+      expect(Object.hasOwn(servers.plain, 'env')).toBe(false);
+    },
+  );
+
+  it.each([
+    null,
+    [],
+    { enabled: 'false' },
+    { enabled: true, server: [] },
+    { enabled: true, servers: 'not-an-array' },
+    { enabled: true, servers: [null] },
+    { enabled: true, servers: [[]] },
+    { enabled: true, server: { url: 123 } },
+    { enabled: true, server: { path: 42 } },
+    { enabled: true, server: { command: 'mcp-server', args: 'not-an-array' } },
+    { enabled: true, server: { url: 'https://example.test', headers: 'not-an-object' } },
+    { enabled: true, server: { url: 'https://example.test', auth: [] } },
+    { enabled: true, server: { command: 'mcp-server', env: 'not-an-object' } },
+    { enabled: true, server: { command: 'mcp-server', env: ['array'] } },
+    { enabled: true, server: { command: 'mcp-server', env: { KEY: 123 } } },
+  ])('rejects malformed MCP config %#', async (config) => {
+    await expect(transformMCPConfigToClaudeCode(config as any)).rejects.toThrow(
+      /MCP.*(object|boolean|malformed)/,
+    );
+  });
+});
+
+describe('transformMCPToolsToAnthropic', () => {
+  it('should transform MCP tools to Anthropic format', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'test_tool',
+        description: 'A test tool',
+        inputSchema: {
+          properties: createStringParameterProperties(),
+          required: ['param'],
+        },
+      },
+    ];
+
+    const expected: Anthropic.Tool[] = [
+      {
+        name: 'test_tool',
+        description: 'A test tool',
+        input_schema: {
+          type: 'object',
+          properties: {
+            param: { type: 'string' },
+          },
+          required: ['param'],
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToAnthropic(mcpTools);
+    expect(result).toEqual(expected);
+  });
+
+  it('should remove $schema field from inputSchema', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'tool_with_schema',
+        description: 'Tool with $schema field',
+        inputSchema: {
+          $schema: 'http://json-schema.org/draft-07/schema#',
+          type: 'object',
+          properties: createStringParameterProperties(),
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToAnthropic(mcpTools);
+    expect(result[0].input_schema).not.toHaveProperty('$schema');
+    expect(result[0].input_schema).toEqual({
+      type: 'object',
+      properties: {
+        param: { type: 'string' },
+      },
+    });
+  });
+
+  it('should handle empty input schemas', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'no_input_tool',
+        description: 'Tool with no input parameters',
+        inputSchema: createStrictEmptyInputSchema(),
+      },
+    ];
+
+    const result = transformMCPToolsToAnthropic(mcpTools);
+    expect(result[0].input_schema).not.toHaveProperty('$schema');
+    expect(result[0].input_schema).toEqual({
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    });
+  });
+});
+
+describe('transformMCPToolsToGoogle', () => {
+  it('should transform MCP tools to Google format', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'test_tool',
+        description: 'A test tool',
+        inputSchema: {
+          properties: createStringParameterProperties(),
+          required: ['param'],
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    expect(result).toHaveLength(1);
+    expect(result[0].functionDeclarations).toHaveLength(1);
+    expect(result[0].functionDeclarations?.[0].name).toBe('test_tool');
+    expect(result[0].functionDeclarations?.[0].description).toBe('A test tool');
+    expect(result[0].functionDeclarations?.[0].parameters?.type).toBe('OBJECT');
+  });
+
+  it('should remove $schema field from tool definitions', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'test_tool',
+        description: 'A test tool',
+        inputSchema: {
+          $schema: 'http://json-schema.org/draft-07/schema#',
+          properties: createStringParameterProperties(),
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    const parameters = result[0].functionDeclarations?.[0].parameters;
+
+    expect(parameters).not.toHaveProperty('$schema');
+    // Types should be converted to uppercase for Gemini
+    expect(parameters?.properties?.param).toEqual({ type: 'STRING' });
+  });
+
+  it('should remove additionalProperties from schema (GitHub issue #6902)', () => {
+    // This is the exact issue from GitHub: MCP SDK generates additionalProperties: false
+    // which Gemini does not support
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'test_tool',
+        description: 'Tool with additionalProperties',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+          },
+          additionalProperties: false,
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    const parameters = result[0].functionDeclarations?.[0].parameters;
+
+    expect(parameters).not.toHaveProperty('additionalProperties');
+    expect(parameters).toEqual({
+      type: 'OBJECT',
+      properties: {
+        query: { type: 'STRING' },
+      },
+    });
+  });
+
+  it('should convert lowercase types to uppercase for Gemini', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'type_test_tool',
+        description: 'Tool testing type conversion',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            strParam: { type: 'string' },
+            numParam: { type: 'number' },
+            intParam: { type: 'integer' },
+            boolParam: { type: 'boolean' },
+            arrParam: { type: 'array', items: { type: 'string' } },
+            objParam: { type: 'object', properties: {} },
+          },
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    const parameters = result[0].functionDeclarations?.[0].parameters;
+
+    expect(parameters?.type).toBe('OBJECT');
+    expect(parameters?.properties?.strParam?.type).toBe('STRING');
+    expect(parameters?.properties?.numParam?.type).toBe('NUMBER');
+    expect(parameters?.properties?.intParam?.type).toBe('INTEGER');
+    expect(parameters?.properties?.boolParam?.type).toBe('BOOLEAN');
+    expect(parameters?.properties?.arrParam?.type).toBe('ARRAY');
+    expect(parameters?.properties?.arrParam?.items?.type).toBe('STRING');
+    expect(parameters?.properties?.objParam?.type).toBe('OBJECT');
+  });
+
+  it('should recursively sanitize nested schemas', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'nested_tool',
+        description: 'Tool with nested schema',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            user: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: { type: 'string', default: 'unknown' },
+                address: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    city: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          additionalProperties: false,
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    const parameters = result[0].functionDeclarations?.[0].parameters;
+
+    // Root level
+    expect(parameters).not.toHaveProperty('additionalProperties');
+
+    // Nested user object
+    expect(parameters?.properties?.user).not.toHaveProperty('additionalProperties');
+    expect(parameters?.properties?.user?.properties?.name).not.toHaveProperty('default');
+    expect(parameters?.properties?.user?.type).toBe('OBJECT');
+
+    // Deeply nested address object
+    expect(parameters?.properties?.user?.properties?.address).not.toHaveProperty(
+      'additionalProperties',
+    );
+    expect(parameters?.properties?.user?.properties?.address?.type).toBe('OBJECT');
+    expect(parameters?.properties?.user?.properties?.address?.properties?.city?.type).toBe(
+      'STRING',
+    );
+  });
+
+  it('should handle MCP SDK Zod-generated schema (real-world scenario from issue #6902)', () => {
+    // This represents exactly what the MCP SDK generates when using Zod schemas
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'analyze_prompt',
+        description: 'Analyze a prompt for security issues',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description: 'The prompt to analyze',
+            },
+            categories: {
+              type: 'array',
+              items: {
+                type: 'string',
+              },
+              description: 'Categories to check',
+            },
+            options: {
+              type: 'object',
+              properties: {
+                maxTokens: {
+                  type: 'number',
+                  default: 1000,
+                },
+                strict: {
+                  type: 'boolean',
+                  default: true,
+                },
+              },
+              additionalProperties: false,
+            },
+          },
+          required: ['prompt'],
+          additionalProperties: false,
+          $schema: 'http://json-schema.org/draft-07/schema#',
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    const parameters = result[0].functionDeclarations?.[0].parameters;
+
+    // Verify all unsupported properties are removed
+    expect(parameters).not.toHaveProperty('$schema');
+    expect(parameters).not.toHaveProperty('additionalProperties');
+    expect(parameters?.properties?.options).not.toHaveProperty('additionalProperties');
+    expect(parameters?.properties?.options?.properties?.maxTokens).not.toHaveProperty('default');
+    expect(parameters?.properties?.options?.properties?.strict).not.toHaveProperty('default');
+
+    // Verify types are converted to uppercase
+    expect(parameters?.type).toBe('OBJECT');
+    expect(parameters?.properties?.prompt?.type).toBe('STRING');
+    expect(parameters?.properties?.categories?.type).toBe('ARRAY');
+    expect(parameters?.properties?.categories?.items?.type).toBe('STRING');
+    expect(parameters?.properties?.options?.type).toBe('OBJECT');
+    expect(parameters?.properties?.options?.properties?.maxTokens?.type).toBe('NUMBER');
+    expect(parameters?.properties?.options?.properties?.strict?.type).toBe('BOOLEAN');
+
+    // Verify required is preserved
+    expect(parameters?.required).toEqual(['prompt']);
+  });
+
+  it('should handle empty schema', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'empty_tool',
+        description: 'Tool with empty schema',
+        inputSchema: {},
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    const parameters = result[0].functionDeclarations?.[0].parameters;
+
+    expect(parameters?.type).toBe('OBJECT');
+    expect(parameters?.properties).toEqual({});
+  });
+
+  it('should handle schema with only type field', () => {
+    const mcpTools: MCPTool[] = [
+      {
+        name: 'simple_tool',
+        description: 'Simple tool',
+        inputSchema: {
+          type: 'object',
+        },
+      },
+    ];
+
+    const result = transformMCPToolsToGoogle(mcpTools);
+    const parameters = result[0].functionDeclarations?.[0].parameters;
+
+    expect(parameters?.type).toBe('OBJECT');
+    expect(parameters?.properties).toEqual({});
+  });
+});
+
+describe('Claude MCP OAuth discovery', () => {
+  it('discovers the token endpoint from the remote server URL', async () => {
+    vi.mocked(fetchWithProxy)
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ token_endpoint: 'https://claude-discovery.example.com/token' }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'fixture-token', expires_in: 3600 })),
+      );
+    const result = await transformMCPConfigToClaudeCode({
+      server: {
+        name: 'remote',
+        url: 'https://claude-discovery.example.com/mcp/',
+        auth: { type: 'oauth', clientId: 'fixture-client', clientSecret: 'fixture-secret' },
+      },
+    });
+    expect(fetchWithProxy).toHaveBeenNthCalledWith(
+      1,
+      'https://claude-discovery.example.com/mcp/.well-known/oauth-authorization-server',
+      { redirect: 'error' },
+    );
+    expect(result.remote).toMatchObject({
+      url: 'https://claude-discovery.example.com/mcp/',
+      headers: { Authorization: 'Bearer fixture-token' },
+    });
+  });
+});

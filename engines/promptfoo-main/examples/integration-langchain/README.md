@@ -1,0 +1,35 @@
+# integration-langchain (Langchain Python)
+
+You can run this example with:
+
+```bash
+npx promptfoo@latest init --example integration-langchain
+cd integration-langchain
+```
+
+## Usage
+
+This example shows how to run a Python LangChain Expression Language (LCEL) chain with Promptfoo. It compares GPT-5.4 with a math-focused LangChain prompt-and-output-parser pipeline using `ChatOpenAI(model="gpt-4.1-mini")` and the Chat Completions API.
+
+This example requires Python 3.10 or newer. Create and activate a virtual environment, then
+install the requirements:
+
+```sh
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Set the OpenAI API key used by both providers:
+
+```sh
+export OPENAI_API_KEY=your-api-key
+```
+
+Then run the eval:
+
+```bash
+npx promptfoo@latest eval --no-cache
+```
+
+Keep the virtual environment active when running Promptfoo: the `exec:python` provider uses `python` from your `PATH`. The requirements list only the two LangChain packages imported by this example; the OpenAI SDK is installed by `langchain-openai`.

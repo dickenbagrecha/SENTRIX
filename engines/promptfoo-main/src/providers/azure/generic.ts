@@ -1,0 +1,259 @@
+import { getEnvString, getProviderEnvString } from '../../envars';
+import logger from '../../logger';
+import { resolveProviderApiKey } from '../credentials';
+import { resolveProviderEnv } from '../env';
+import { throwConfigurationError } from './util';
+import type { TokenCredential } from '@azure/identity';
+
+import type { EnvOverrides } from '../../types/env';
+import type {
+  ApiProvider,
+  CallApiContextParams,
+  CallApiOptionsParams,
+  ProviderResponse,
+} from '../../types/index';
+import type { AzureCompletionOptions, AzureProviderOptions, AzureResponsesOptions } from './types';
+
+export class AzureGenericProvider<
+  TConfig extends AzureCompletionOptions | AzureResponsesOptions = AzureCompletionOptions,
+> implements ApiProvider
+{
+  deploymentName: string;
+  apiHost?: string;
+  apiBaseUrl?: string;
+
+  config: Partial<TConfig>;
+  env?: EnvOverrides;
+
+  authHeaders?: Record<string, string>;
+
+  protected initializationPromise: Promise<void> | null = null;
+  private authenticationPromise: Promise<void> | null = null;
+
+  /**
+   * Cached Entra ID credential initialization. Held as a promise so concurrent
+   * requests share one credential and @azure/identity can manage its own token
+   * cache; a failed initialization is evicted so the next request can retry.
+   */
+  private cachedCredential?: Promise<TokenCredential>;
+  #warnedPartialServicePrincipal = false;
+  /** Expiry of the currently cached Entra ID bearer token (ms epoch), if token auth is in use. */
+  private authTokenExpiresOnTimestamp?: number;
+  /** Refresh the bearer token when it is within this window of expiring. */
+  private static readonly TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+
+  constructor(deploymentName: string, options: AzureProviderOptions<TConfig> = {}) {
+    const { config, id, env } = options;
+    this.env = env;
+
+    this.deploymentName = deploymentName;
+
+    if (config?.apiBaseUrl || config?.apiHost) {
+      this.apiBaseUrl = config.apiBaseUrl;
+      this.apiHost = config.apiHost;
+    } else {
+      // Keep the legacy Azure aliases within the scope that selected the endpoint.
+      const endpoint = resolveProviderEnv(env, [
+        'AZURE_API_BASE_URL',
+        'AZURE_OPENAI_API_BASE_URL',
+        'AZURE_OPENAI_BASE_URL',
+        'AZURE_API_HOST',
+        'AZURE_OPENAI_API_HOST',
+      ]);
+      if (endpoint?.name.endsWith('_HOST')) {
+        this.apiHost = endpoint.value;
+      } else {
+        this.apiBaseUrl = endpoint?.value;
+      }
+    }
+
+    this.config = config || {};
+    this.id = id ? () => id : this.id;
+
+    const initialization = this.initialize();
+    this.initializationPromise = initialization;
+    // Authentication starts eagerly, but a failure must not poison later
+    // requests or become an unhandled rejection before the first request.
+    void initialization.catch(() => {
+      if (this.initializationPromise === initialization) {
+        this.initializationPromise = null;
+      }
+    });
+  }
+
+  initialize(): Promise<void> {
+    this.authenticationPromise ??= this.getAuthHeaders()
+      .then((headers) => {
+        this.authHeaders = headers;
+      })
+      .finally(() => {
+        this.authenticationPromise = null;
+      });
+    return this.authenticationPromise;
+  }
+
+  async ensureInitialized() {
+    if (this.initializationPromise != null) {
+      await this.initializationPromise;
+    }
+    // Subclasses can use initializationPromise for other setup (such as MCP).
+    // Always finish authentication, including a retry after an earlier failure.
+    if (!this.authHeaders) {
+      await this.initialize();
+    }
+    await this.refreshAuthTokenIfNeeded();
+  }
+
+  /**
+   * Re-mint the Entra ID bearer token when it is at/near expiry. Subclasses call
+   * ensureInitialized() at the start of every request, so this keeps long-running evals from
+   * failing with 401 once the initial token (cached once in initialize()) expires. No-op for
+   * api-key auth, and conservative when the token expiry is unknown.
+   */
+  private async refreshAuthTokenIfNeeded(): Promise<void> {
+    if (!this.authHeaders?.Authorization) {
+      return; // api-key auth (or not yet initialized) — nothing to refresh
+    }
+    const expiresAt = this.authTokenExpiresOnTimestamp;
+    if (expiresAt === undefined) {
+      return; // expiry unknown — preserve prior behavior rather than force a refetch
+    }
+    if (Date.now() < expiresAt - AzureGenericProvider.TOKEN_REFRESH_WINDOW_MS) {
+      return; // still valid
+    }
+    await this.initialize();
+  }
+
+  getApiKey(): string | undefined {
+    return resolveProviderApiKey(this.config, this.env, ['AZURE_API_KEY', 'AZURE_OPENAI_API_KEY']);
+  }
+
+  getApiKeyOrThrow(): string {
+    const apiKey = this.getApiKey();
+    if (!apiKey) {
+      throwConfigurationError('Azure API key must be set.');
+    }
+    return apiKey;
+  }
+
+  getAzureTokenCredential(): Promise<TokenCredential> {
+    this.cachedCredential ??= this.createTokenCredential().catch((err) => {
+      this.cachedCredential = undefined;
+      throw err;
+    });
+    return this.cachedCredential;
+  }
+
+  private async createTokenCredential(): Promise<TokenCredential> {
+    const clientSecret =
+      this.config?.azureClientSecret ||
+      (getProviderEnvString(this.env, 'AZURE_CLIENT_SECRET') ??
+        getEnvString('AZURE_CLIENT_SECRET'));
+    const clientId =
+      this.config?.azureClientId ||
+      (getProviderEnvString(this.env, 'AZURE_CLIENT_ID') ?? getEnvString('AZURE_CLIENT_ID'));
+    const tenantId =
+      this.config?.azureTenantId ||
+      (getProviderEnvString(this.env, 'AZURE_TENANT_ID') ?? getEnvString('AZURE_TENANT_ID'));
+    const authorityHost =
+      this.config?.azureAuthorityHost ||
+      (getProviderEnvString(this.env, 'AZURE_AUTHORITY_HOST') ??
+        getEnvString('AZURE_AUTHORITY_HOST'));
+
+    try {
+      const { ClientSecretCredential, AzureCliCredential } = await import('@azure/identity');
+
+      if (clientSecret && clientId && tenantId) {
+        logger.debug('[Azure] Using service principal credentials');
+        return new ClientSecretCredential(tenantId, clientId, clientSecret, {
+          authorityHost: authorityHost || 'https://login.microsoftonline.com',
+        });
+      }
+
+      if (!clientId && !clientSecret && !tenantId) {
+        logger.debug('[Azure] Using Azure CLI credentials');
+      } else if (!this.#warnedPartialServicePrincipal) {
+        this.#warnedPartialServicePrincipal = true;
+        const missing = [
+          !clientId && 'azureClientId (AZURE_CLIENT_ID)',
+          !clientSecret && 'azureClientSecret (AZURE_CLIENT_SECRET)',
+          !tenantId && 'azureTenantId (AZURE_TENANT_ID)',
+        ].filter(Boolean);
+        logger.warn(
+          `[Azure] Service principal configuration is incomplete, missing ${missing.join(', ')}. Falling back to Azure CLI credentials.`,
+          { missing },
+        );
+      }
+
+      return new AzureCliCredential();
+    } catch (err) {
+      logger.error(`Error loading @azure/identity: ${err}`);
+      throw new Error(
+        'The @azure/identity package is required for Azure authentication. Please install it with: npm install @azure/identity',
+      );
+    }
+  }
+
+  async getAccessToken() {
+    const credential = await this.getAzureTokenCredential();
+    const tokenScope =
+      this.config?.azureTokenScope ||
+      (getProviderEnvString(this.env, 'AZURE_TOKEN_SCOPE') ?? getEnvString('AZURE_TOKEN_SCOPE'));
+    const tokenResponse = await credential.getToken(
+      tokenScope || 'https://cognitiveservices.azure.com/.default',
+    );
+    if (!tokenResponse) {
+      throwConfigurationError('Failed to retrieve access token.');
+    }
+    this.authTokenExpiresOnTimestamp = tokenResponse.expiresOnTimestamp;
+    return tokenResponse.token;
+  }
+
+  async getAuthHeaders(): Promise<Record<string, string>> {
+    const apiKey = this.getApiKey();
+    if (apiKey) {
+      return { 'api-key': apiKey };
+    } else {
+      try {
+        const token = await this.getAccessToken();
+        return { Authorization: 'Bearer ' + token };
+      } catch (err) {
+        logger.info(`Azure Authentication failed. Please check your credentials: ${err}`);
+        throw new Error(`Azure Authentication failed. 
+Please choose one of the following options:
+  1. Set an API key via the AZURE_API_KEY environment variable.
+  2. Provide client credentials (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID).
+  3. Authenticate with Azure CLI using az login.
+    `);
+      }
+    }
+  }
+
+  getApiBaseUrl(): string | undefined {
+    if (this.apiBaseUrl) {
+      return this.apiBaseUrl.replace(/\/$/, '');
+    }
+    const host = this.apiHost?.replace(/^(https?:\/\/)/, '').replace(/\/$/, '');
+    if (!host) {
+      return undefined;
+    }
+    return `https://${host}`;
+  }
+
+  id(): string {
+    return `azure:${this.deploymentName}`;
+  }
+
+  toString(): string {
+    return `[Azure Provider ${this.deploymentName}]`;
+  }
+
+  // @ts-ignore: Params are not used in this implementation
+  async callApi(
+    _prompt: string,
+    _context?: CallApiContextParams,
+    _callApiOptions?: CallApiOptionsParams,
+  ): Promise<ProviderResponse> {
+    throw new Error('Not implemented');
+  }
+}

@@ -1,0 +1,34 @@
+    - sections:
+      - section: agent
+        elements:
+            - notify_time:
+                value: 10
+            - auto_restart:
+                value: 'yes'
+            - manager:
+                elements:
+                - endpoint:
+                    value: '127.0.0.1:1517'
+            # The agent's default verification_mode is now 'system', which
+            # RemotedSimulator's self-signed cert fails -- opt out explicitly since this
+            # suite tests the enrollment message/retry protocol, not TLS trust.
+            - ssl:
+                elements:
+                - verification_mode:
+                    value: none
+            - enrollment:
+                elements:
+                - enabled:
+                    value: ENABLED
+                - agent_address:
+                    value: AGENT_ADDRESS
+                - manager_address:
+                    value: MANAGER_ADDRESS
+                - groups:
+                    value: GROUPS
+                - agent_name:
+                    value: AGENT_NAME
+                - use_source_ip:
+                    value: USE_SOURCE_IP
+                - port:
+                    value: PORT

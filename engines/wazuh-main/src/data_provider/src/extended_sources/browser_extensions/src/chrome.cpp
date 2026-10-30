@@ -1,0 +1,794 @@
+/* Copyright (C) Wazuh Inc.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifdef _WIN32
+#include "windowsHelper.h"
+#endif
+#include "chrome.hpp"
+#include <iostream>
+#include <fstream>
+#include <algorithm>
+#include <limits>
+#include <openssl/evp.h>
+#include <vector>
+#include <string>
+#include "stringHelper.h"
+#include "wazuhCommon.hpp"
+#include "safe_file_reader.hpp"
+#include "json_field_helpers.hpp"
+
+#include <filesystem_wrapper.hpp>
+
+#define MAX_PATH_LENGTH 4096
+
+using JsonFieldHelpers::getBoolField;
+using JsonFieldHelpers::getObjectField;
+using JsonFieldHelpers::getStringField;
+
+namespace chrome
+{
+    ChromeExtensionsProvider::ChromeExtensionsProvider(
+        std::shared_ptr<IBrowserExtensionsWrapper> chromeExtensionsWrapper,
+        std::unique_ptr<IFileSystemWrapper> fileSystemWrapper)
+        : m_chromeExtensionsWrapper(std::move(chromeExtensionsWrapper))
+        , m_fileSystemWrapper(fileSystemWrapper ? std::move(fileSystemWrapper) : std::make_unique<file_system::FileSystemWrapper>())
+    {
+    }
+
+    ChromeExtensionsProvider::ChromeExtensionsProvider()
+        : m_chromeExtensionsWrapper(std::make_shared<BrowserExtensionsWrapper>())
+        , m_fileSystemWrapper(std::make_unique<file_system::FileSystemWrapper>())
+    {
+    }
+
+    bool ChromeExtensionsProvider::isValidChromeProfile(const std::string& profilePath)
+    {
+        if (profilePath.empty() ||
+                profilePath.find("..") != std::string::npos ||
+                profilePath.length() > MAX_PATH_LENGTH
+           )
+        {
+            return false;
+        }
+
+        return m_fileSystemWrapper->is_regular_file(std::filesystem::path(profilePath) / PREFERENCES_FILE) ||
+               m_fileSystemWrapper->is_regular_file(std::filesystem::path(profilePath) / SECURE_PREFERENCES_FILE);
+    }
+
+    std::string ChromeExtensionsProvider::jsonArrayToString(const nlohmann::json& jsonArray)
+    {
+        std::string result;
+
+        for (const auto& item : jsonArray)
+        {
+            if (item.is_string())
+            {
+                result += item.get<std::string>() + ", ";
+            }
+        }
+
+        if (!result.empty() && result.back() == ' ')
+        {
+            result.pop_back(); // Remove trailing space
+
+            if (!result.empty() && result.back() == ',')
+            {
+                result.pop_back(); // Remove trailing comma
+            }
+        }
+
+        return result;
+    }
+
+    bool ChromeExtensionsProvider::isSnakeCase(const std::string& s)
+    {
+        if (s.empty() || s.front() == '_' || s.back() == '_') return false;
+
+        bool has_underscore = false;
+        bool last_was_underscore = false;
+
+        for (char c : s)
+        {
+            if (c == '_')
+            {
+                if (last_was_underscore) return false; // no double underscores
+
+                has_underscore = true;
+                last_was_underscore = true;
+            }
+            else
+            {
+                if (!std::isalnum(static_cast<unsigned char>(c))) return false;
+
+                last_was_underscore = false;
+            }
+        }
+
+        return has_underscore; // must contain at least one underscore
+    }
+
+    bool ChromeExtensionsProvider::isValidLocaleName(const std::string& locale)
+    {
+        return !locale.empty() && std::all_of(locale.begin(), locale.end(), [](unsigned char c)
+        {
+            return std::isalnum(c) || c == '_' || c == '-';
+        });
+    }
+
+    void ChromeExtensionsProvider::localizeParameters(ChromeExtension& extension)
+    {
+        if (!isValidLocaleName(extension.default_locale))
+        {
+            return;
+        }
+
+        const std::string& extensionPath = extension.path;
+        const std::string& defaultLocale = extension.default_locale;
+
+        // The locale is a single directory name inside the extension
+        if (defaultLocale.find_first_of("/\\") != std::string::npos || defaultLocale.find("..") != std::string::npos)
+        {
+            return;
+        }
+
+        std::filesystem::path localesPath = std::filesystem::path(extensionPath) / EXTENSION_LOCALES_DIR;
+        std::filesystem::path defaultLocalePath = localesPath / defaultLocale;
+        std::filesystem::path messagesFilePath = defaultLocalePath / EXTENSION_LOCALES_MESSAGES_FILE;
+
+        if (m_fileSystemWrapper->is_regular_file(messagesFilePath))
+        {
+            std::string nameKey = Utils::rightTrim(Utils::leftTrim(extension.name, "__MSG_"), "__");
+            std::string descriptionKey = Utils::rightTrim(Utils::leftTrim(extension.description, "__MSG_"), "__");;
+
+            if (isSnakeCase(nameKey))
+            {
+                nameKey = Utils::toLowerCase(nameKey);
+            }
+
+            if (isSnakeCase(descriptionKey))
+            {
+                descriptionKey = Utils::toLowerCase(descriptionKey);
+            }
+
+            std::string messagesContent;
+
+            if (!browser_extensions::readRegularFile(messagesFilePath.string(), messagesContent, m_currentOwnerUid))
+            {
+                return;
+            }
+
+            const nlohmann::json messagesJson = nlohmann::json::parse(messagesContent, nullptr, false, true);
+
+            if (messagesJson.is_discarded())
+            {
+                return;
+            }
+
+            const auto localize = [&messagesJson](const std::string & key, std::string & field)
+            {
+                const auto& entry = getObjectField(messagesJson, key.c_str());
+                const auto it = entry.find("message");
+
+                if (it != entry.end() && it->is_string())
+                {
+                    field = it->get<std::string>();
+                }
+            };
+
+            localize(nameKey, extension.name);
+            localize(descriptionKey, extension.description);
+        }
+    }
+
+    std::string ChromeExtensionsProvider::hashToLetterString(const uint8_t* hash, size_t length)
+    {
+        std::string result;
+        result.reserve(length * 2); // two letters per byte (high and low nibble)
+
+        for (size_t i = 0; i < length; ++i)
+        {
+            uint8_t byte = hash[i];
+            // high nibble
+            result.push_back('a' + ((byte >> 4) & 0x0F));
+            // low nibble
+            result.push_back('a' + (byte & 0x0F));
+        }
+
+        return result;
+    }
+
+    std::string ChromeExtensionsProvider::base64Decode(const std::string& input)
+    {
+        static const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string decoded;
+        std::vector<int> T(256, -1);
+
+        // Build lookup table
+        for (int i = 0; i < 64; i++) T[chars[i]] = i;
+
+        unsigned int val = 0;
+        int valb = -8;
+
+        for (unsigned char c : input)
+        {
+            if (T[c] == -1) break;
+
+            val = (val << 6) + T[c];
+            valb += 6;
+
+            if (valb >= 0)
+            {
+                decoded.push_back(char((val >> valb) & 0xFF));
+                valb -= 8;
+            }
+        }
+
+        return decoded;
+    }
+
+    std::string ChromeExtensionsProvider::generateIdentifier(const std::string& key)
+    {
+        // Decode to string first
+        std::string decodedString = base64Decode(key);
+
+        if (decodedString.empty())
+        {
+            return "";
+        }
+
+        // Convert to vector<uint8_t> to match original behavior exactly
+        std::vector<uint8_t> decodedVector(decodedString.begin(), decodedString.end());
+
+        EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+
+        if (!mdctx)
+        {
+            return "";
+        }
+
+        if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) != 1)
+        {
+            EVP_MD_CTX_free(mdctx);
+            return "";
+        }
+
+        if (EVP_DigestUpdate(mdctx, decodedVector.data(), decodedVector.size()) != 1)
+        {
+            EVP_MD_CTX_free(mdctx);
+            return "";
+        }
+
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int hashLen = 0;
+
+        if (EVP_DigestFinal_ex(mdctx, hash, &hashLen) != 1)
+        {
+            EVP_MD_CTX_free(mdctx);
+            return "";
+        }
+
+        EVP_MD_CTX_free(mdctx);
+
+        std::string letters_string = hashToLetterString(hash, hashLen);
+        return letters_string.substr(0, 32);
+    }
+
+    std::string ChromeExtensionsProvider::sha256Content(const std::string& content)
+    {
+        EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+
+        if (!mdctx)
+        {
+            return "";
+        }
+
+        if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) != 1)
+        {
+            EVP_MD_CTX_free(mdctx);
+            return "";
+        }
+
+        if (EVP_DigestUpdate(mdctx, content.data(), content.size()) != 1)
+        {
+            EVP_MD_CTX_free(mdctx);
+            return "";
+        }
+
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int length = 0;
+
+        if (EVP_DigestFinal_ex(mdctx, hash, &length) != 1)
+        {
+            EVP_MD_CTX_free(mdctx);
+            return "";
+        }
+
+        EVP_MD_CTX_free(mdctx);
+
+        return wazuh::hex_encode(hash, length);
+    }
+
+    std::string ChromeExtensionsProvider::webkitToUnixTime(std::string webkit_timestamp)
+    {
+        try
+        {
+            if (webkit_timestamp.empty() || !std::all_of(webkit_timestamp.begin(), webkit_timestamp.end(), ::isdigit))
+            {
+                return "";
+            }
+
+            int64_t timestamp = std::stoll(webkit_timestamp);
+
+            if (timestamp < 11644473600000000LL || timestamp > 253402300799000000LL)
+            {
+                return "";
+            }
+
+            std::time_t unix_timestamp = (timestamp - 11644473600000000LL) / 1000000;
+            return std::to_string(unix_timestamp);
+        }
+        catch (const std::exception& e)
+        {
+            return "";
+        }
+    }
+
+    void ChromeExtensionsProvider::parseManifest(nlohmann::json& manifestJson, ChromeExtension& extension)
+    {
+        extension.name = getStringField(manifestJson, "name");
+        extension.update_url = getStringField(manifestJson, "update_url");
+        extension.version = getStringField(manifestJson, "version");
+        extension.author = getStringField(manifestJson, "author");
+        extension.default_locale = getStringField(manifestJson, "default_locale");
+        extension.current_locale = getStringField(manifestJson, "current_locale");
+        extension.persistent = getBoolField(getObjectField(manifestJson, "background"), "persistent", false) ? "1" : "0";
+        extension.description = getStringField(manifestJson, "description");
+        extension.permissions = manifestJson.contains("permissions") ? jsonArrayToString(manifestJson["permissions"]) : "";
+        extension.optional_permissions = manifestJson.contains("optional_permissions") ? jsonArrayToString(manifestJson["optional_permissions"]) : "";
+        extension.key = getStringField(manifestJson, "key");
+
+        localizeParameters(extension);
+    }
+
+    void ChromeExtensionsProvider::parsePreferenceSettings(ChromeExtension& extension, const std::string& key, const nlohmann::json& value)
+    {
+        const auto stateIt = value.find("state");
+        extension.state = "1";
+
+        if (stateIt != value.end() && stateIt->is_number_integer())
+        {
+            extension.state = std::to_string(stateIt->get<int>());
+        }
+        else if (stateIt != value.end() && stateIt->is_number_float())
+        {
+            const auto state = stateIt->get<double>();
+
+            if (state >= std::numeric_limits<int>::min() && state <= std::numeric_limits<int>::max())
+            {
+                extension.state = std::to_string(static_cast<int>(state));
+            }
+        }
+
+        extension.from_webstore = getBoolField(value, "from_webstore", false) ? "1" : "0";
+        extension.install_time = getStringField(value, "first_install_time");
+        extension.install_timestamp = webkitToUnixTime(extension.install_time);
+        extension.referenced_identifier = key;
+    }
+
+    void ChromeExtensionsProvider::getCommonSettings(ChromeExtension& extension, const std::string& manifestContent)
+    {
+        extension.browser_type = m_currentBrowserType;
+        extension.uid = m_currentUid;
+        extension.manifest_hash = sha256Content(manifestContent);
+    }
+
+    ChromeExtensionList ChromeExtensionsProvider::getExtensionsFromPreferences(const std::string& profilePath, const std::string& preferencesFilePath, const std::string& profileName)
+    {
+        if (!m_fileSystemWrapper->is_regular_file(preferencesFilePath))
+        {
+            // TODO: Improve handling this error.
+            // std::cerr << "Preferences file does not exist: " << preferencesFilePath << std::endl;
+            return ChromeExtensionList();
+        }
+
+        std::string preferencesContent;
+
+        if (!browser_extensions::readRegularFile(preferencesFilePath, preferencesContent, m_currentOwnerUid))
+        {
+            return ChromeExtensionList();
+        }
+
+        nlohmann::json preferencesJson;
+
+        try
+        {
+            preferencesJson = nlohmann::json::parse(preferencesContent);
+        }
+        catch (const nlohmann::json::parse_error& e)
+        {
+            // Log error and return empty list
+            return ChromeExtensionList();
+        }
+        catch (const std::exception& e)
+        {
+            return ChromeExtensionList();
+        }
+
+        const nlohmann::json& settings = getObjectField(getObjectField(preferencesJson, "extensions"), "settings");
+        ChromeExtensionList extensions;
+
+        for (const auto& item : settings.items())
+        {
+            if (item.value().contains("path"))
+            {
+                std::string extensionPath = getStringField(item.value(), "path");
+
+                const bool insideProfile = !m_fileSystemWrapper->is_absolute(extensionPath);
+                const std::filesystem::path extensionsDir = std::filesystem::path(profilePath) / EXTENSIONS_DIR;
+                const std::string relativePath = extensionPath;
+
+#ifdef _WIN32
+
+                if (!insideProfile && !Utils::isLocalFixedPath(extensionPath))
+                {
+                    continue;
+                }
+
+#endif
+
+                if (insideProfile)
+                {
+                    if (extensionPath.find("..") != std::string::npos ||
+                            extensionPath.find("//") != std::string::npos ||
+                            extensionPath.empty() || extensionPath.length() > MAX_PATH_LENGTH)
+                    {
+                        continue;
+                    }
+
+                    extensionPath = (extensionsDir / extensionPath).string();
+                }
+
+                std::filesystem::path manifestPath = std::filesystem::path(extensionPath) / EXTENSION_MANIFEST_FILE;
+                std::string manifestContent;
+
+                if (m_fileSystemWrapper->is_directory(extensionPath) &&
+                        (!insideProfile || browser_extensions::isPlainDirectoryChain(extensionsDir.string(), relativePath)) &&
+                        browser_extensions::readRegularFile(manifestPath.string(), manifestContent, m_currentOwnerUid))
+                {
+                    ChromeExtension extension;
+
+                    extension.profile = profileName;
+                    extension.profile_path = profilePath;
+                    extension.path = extensionPath;
+                    extension.referenced = std::to_string(1);
+
+                    getCommonSettings(extension, manifestContent);
+
+                    try
+                    {
+                        parsePreferenceSettings(extension, item.key(), item.value());
+
+                        nlohmann::json manifestJson = nlohmann::json::parse(manifestContent, nullptr, true, true);
+
+                        parseManifest(manifestJson, extension);
+
+                        extension.identifier = generateIdentifier(extension.key);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        continue; // Skip this extension and continue with next
+                    }
+
+                    extensions.emplace_back(extension);
+                }
+            }
+        }
+
+        return extensions;
+    }
+
+    std::string ChromeExtensionsProvider::getProfileFromPreferences(const std::string& preferencesFilePath, const std::string& securePreferencesFilePath)
+    {
+        std::string profileName = "";
+
+        if (!m_fileSystemWrapper->is_regular_file(preferencesFilePath))
+        {
+            // TODO: Improve handling this error.
+            // std::cerr << "Preferences file does not exist: " << preferencesFilePath << std::endl;
+            return profileName;
+        }
+
+        if (!m_fileSystemWrapper->is_regular_file(securePreferencesFilePath))
+        {
+            // TODO: Improve handling this error.
+            // std::cerr << "Preferences file does not exist: " << preferencesFilePath << std::endl;
+            return profileName;
+        }
+
+        std::string preferencesContent;
+        std::string extraPreferencesContent;
+
+        if (!browser_extensions::readRegularFile(preferencesFilePath, preferencesContent, m_currentOwnerUid) ||
+                !browser_extensions::readRegularFile(securePreferencesFilePath, extraPreferencesContent, m_currentOwnerUid))
+        {
+            return "";
+        }
+
+        nlohmann::json preferencesJson;
+
+        try
+        {
+            preferencesJson = nlohmann::json::parse(preferencesContent);
+        }
+        catch (const nlohmann::json::parse_error& e)
+        {
+            return "";
+        }
+
+        nlohmann::json securePreferencesJson;
+
+        try
+        {
+            securePreferencesJson = nlohmann::json::parse(extraPreferencesContent);
+        }
+        catch (const nlohmann::json::parse_error& e)
+        {
+            return "";
+        }
+
+        profileName = getStringField(getObjectField(preferencesJson, "profile"), "name");
+
+        if (profileName.empty())
+        {
+            profileName = getStringField(getObjectField(securePreferencesJson, "profile"), "name");
+        }
+
+        return profileName;
+    }
+
+    ChromeExtensionList ChromeExtensionsProvider::getReferencedExtensions(const std::string& profilePath)
+    {
+        std::filesystem::path preferencesFilePath = std::filesystem::path(profilePath) / PREFERENCES_FILE;
+        std::filesystem::path securePreferencesFilePath = std::filesystem::path(profilePath) / SECURE_PREFERENCES_FILE;
+        std::string profileName = getProfileFromPreferences(preferencesFilePath.string(), securePreferencesFilePath.string());
+
+        ChromeExtensionList preferencesFileExtensions = getExtensionsFromPreferences(profilePath, preferencesFilePath.string(), profileName);
+        ChromeExtensionList securePreferencesFileExtensions = getExtensionsFromPreferences(profilePath, securePreferencesFilePath.string(), profileName);
+
+        // Only add to extension list the extensions that are not already in the list
+        for (const auto& securePreferencesExtension : securePreferencesFileExtensions)
+        {
+            auto it = std::find_if(preferencesFileExtensions.begin(), preferencesFileExtensions.end(), [&securePreferencesExtension](const auto & preferencesExtension)
+            {
+                return preferencesExtension.path == securePreferencesExtension.path;
+            });
+
+            if (it == preferencesFileExtensions.end())
+            {
+                // This extension should be added to list
+                preferencesFileExtensions.emplace_back(securePreferencesExtension);
+            }
+        }
+
+        return preferencesFileExtensions;
+    }
+
+    ChromeExtensionList ChromeExtensionsProvider::getUnreferencedExtensions(const std::string& profilePath)
+    {
+        std::filesystem::path extensionPath = std::filesystem::path(profilePath) / EXTENSIONS_DIR;
+
+        if (!m_fileSystemWrapper->is_directory(extensionPath))
+        {
+            // TODO: Improve handling this error.
+            // std::cerr << "Extensions folder does not exist: " << extensionPath << std::endl;
+            return {};
+        }
+
+        std::filesystem::path preferencesFilePath = std::filesystem::path(profilePath) / PREFERENCES_FILE;
+        std::filesystem::path securePreferencesFilePath = std::filesystem::path(profilePath) / SECURE_PREFERENCES_FILE;
+
+        if (!m_fileSystemWrapper->is_regular_file(preferencesFilePath))
+        {
+            // TODO: Improve handling this error.
+            // std::cerr << "Preferences file does not exist: " << preferencesFilePath << std::endl;
+            return {};
+        }
+
+        if (!m_fileSystemWrapper->is_regular_file(securePreferencesFilePath))
+        {
+            // TODO: Improve handling this error.
+            // std::cerr << "Preferences file does not exist: " << securePreferencesFilePath << std::endl;
+            return {};
+        }
+
+        std::string profileName = getProfileFromPreferences(preferencesFilePath.string(), securePreferencesFilePath.string());
+        ChromeExtensionList extensions;
+
+        for (auto subDir : m_fileSystemWrapper->list_directory(extensionPath))
+        {
+            subDir = extensionPath / subDir;
+
+            if (!m_fileSystemWrapper->is_directory(subDir) || !browser_extensions::isPlainDirectory(subDir.string())) continue;
+
+            for (auto subSubDir : m_fileSystemWrapper->list_directory(subDir))
+            {
+                subSubDir = subDir / subSubDir;
+
+                if (!m_fileSystemWrapper->is_directory(subSubDir) || !browser_extensions::isPlainDirectory(subSubDir.string())) continue;
+
+                std::filesystem::path manifestPath = subSubDir / EXTENSION_MANIFEST_FILE;
+
+                std::string manifestContent;
+
+                if (browser_extensions::readRegularFile(manifestPath.string(), manifestContent, m_currentOwnerUid))
+                {
+                    ChromeExtension extension;
+
+                    extension.profile = profileName;
+                    extension.profile_path = profilePath;
+                    extension.path = subSubDir.string();
+                    extension.referenced = "0";
+                    extension.install_timestamp = "";
+
+                    getCommonSettings(extension, manifestContent);
+
+                    try
+                    {
+                        nlohmann::json manifestJson = nlohmann::json::parse(manifestContent, nullptr, true, true);
+
+                        parseManifest(manifestJson, extension);
+
+                        extension.identifier = generateIdentifier(extension.key);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        continue; // Skip this extension and continue with next
+                    }
+
+                    extensions.emplace_back(extension);
+                }
+            }
+        }
+
+        return extensions;
+    }
+
+    nlohmann::json ChromeExtensionsProvider::toJson(const ChromeExtensionList& extensions)
+    {
+        nlohmann::json results = nlohmann::json::array();
+
+        for (auto& extension : extensions)
+        {
+            nlohmann::json entry;
+            entry["author"] = extension.author;
+            entry["browser_type"] = extension.browser_type;
+            entry["current_locale"] = extension.current_locale;
+            entry["default_locale"] = extension.default_locale;
+            entry["description"] = extension.description;
+            entry["from_webstore"] = extension.from_webstore;
+            entry["identifier"] = extension.identifier;
+            entry["install_time"] = extension.install_time;
+            entry["install_timestamp"] = extension.install_timestamp;
+            entry["manifest_hash"] = extension.manifest_hash;
+            entry["name"] = extension.name;
+            entry["optional_permissions"] = extension.optional_permissions;
+            entry["path"] = extension.path;
+            entry["permissions"] = extension.permissions;
+            entry["persistent"] = extension.persistent;
+            entry["profile"] = extension.profile;
+            entry["profile_path"] = extension.profile_path;
+            entry["referenced"] = extension.referenced;
+            entry["referenced_identifier"] = extension.referenced_identifier;
+            entry["state"] = extension.state;
+            entry["uid"] = extension.uid;
+            entry["update_url"] = extension.update_url;
+            entry["version"] = extension.version;
+            results.push_back(std::move(entry));
+        }
+
+        return results;
+    }
+
+    void ChromeExtensionsProvider::getExtensionsFromPath(ChromeExtensionList& extensions, const std::string& path)
+    {
+        ChromeExtensionList referencedExtensions = getReferencedExtensions(path);
+        extensions.insert(extensions.end(), referencedExtensions.begin(), referencedExtensions.end());
+
+        ChromeExtensionList unreferencedExtensions = getUnreferencedExtensions(path);
+
+        // Only add to extension list the unreferenced extensions that are not already in the list
+        for (const auto& unreferencedExtension : unreferencedExtensions)
+        {
+            auto it = std::find_if(referencedExtensions.begin(), referencedExtensions.end(), [&unreferencedExtension](const auto & referencedExtension)
+            {
+                return referencedExtension.path == unreferencedExtension.path;
+            });
+
+            if (it == referencedExtensions.end())
+            {
+                // This extension should be added to list
+                extensions.emplace_back(unreferencedExtension);
+            }
+        }
+    }
+
+    void ChromeExtensionsProvider::getExtensionsFromProfiles(ChromeExtensionList& extensions)
+    {
+        std::string homePath = m_chromeExtensionsWrapper->getHomePath();
+
+        for (const auto& user : m_fileSystemWrapper->list_directory(homePath))
+        {
+            // ignore ".", ".." and hidden directories
+            if (Utils::startsWith(user.filename().string(), "."))
+            {
+                continue;
+            }
+
+            m_currentUid = m_chromeExtensionsWrapper->getUserId(user.filename().string());
+            const std::filesystem::path userHomePath = std::filesystem::path(homePath) / user;
+            m_currentOwnerUid = m_currentUid.empty() ? browser_extensions::homeDirectoryOwner(userHomePath.string()) : m_currentUid;
+
+#if defined(_WIN32) || defined(_WIN64)
+
+            for (const auto& [browserType, browserPath] : WINDOWS_PATH_LIST)
+#elif defined(__APPLE__) && defined(__MACH__)
+
+            for (const auto& [browserType, browserPath] : MACOS_PATH_LIST)
+#elif defined(__linux__)
+            for (const auto& [browserType, browserPath] : LINUX_PATH_LIST)
+#endif
+            {
+                const std::filesystem::path profilePath = userHomePath / browserPath;
+
+                if (!m_fileSystemWrapper->is_directory(profilePath))
+                {
+                    // std::cerr << "Chrome path does not exist\n";
+                    continue;
+                }
+
+                m_currentBrowserType = CHROME_BROWSER_TYPES.at(browserType);
+
+                // The profile path exists, now let's find the profile.
+                if (isValidChromeProfile(profilePath.string()))
+                {
+                    getExtensionsFromPath(extensions, profilePath.string());
+                }
+                else
+                {
+                    for (auto subDirectory : m_fileSystemWrapper->list_directory(profilePath))
+                    {
+                        subDirectory = profilePath / subDirectory;
+
+                        if (m_fileSystemWrapper->is_directory(subDirectory) && isValidChromeProfile(subDirectory.string()))
+                        {
+                            getExtensionsFromPath(extensions, subDirectory.string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    nlohmann::json ChromeExtensionsProvider::collect()
+    {
+        try
+        {
+            ChromeExtensionList extensions;
+            getExtensionsFromProfiles(extensions);
+
+            return toJson(extensions);
+        }
+        catch (const std::filesystem::filesystem_error&)
+        {
+            return nlohmann::json::array();
+        }
+    }
+
+
+} // namespace chrome

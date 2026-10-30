@@ -1,0 +1,27 @@
+/*
+ * URL download support library
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef CLUSTER_UTILS_H_
+#define CLUSTER_UTILS_H_
+
+// Returns 1 if the node is a worker, 0 if it is not and -1 if error.
+int w_is_worker(void);
+
+// Returns 1 if the manager has no cluster node_type configured (single node), 0 if it has one and -1 if error.
+// When not NULL, *is_worker receives w_is_worker()'s answer for the same document.
+int w_is_single_node(int* is_worker);
+
+// Returns the node name of the manager in cluster. The memory should be freed by the caller.
+char* get_node_name(void);
+
+// Returns the name of the manager in cluster. The memory should be freed by the caller.
+char* get_cluster_name(void);
+
+#endif

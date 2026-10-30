@@ -1,0 +1,1563 @@
+/*
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+/**
+ * @file syscollector_identity_tests.cpp
+ * @brief Decision procedure for #38601's identity resync, and the lane it resends on.
+ *
+ * The routing is the part worth pinning down: a recovered VD index has to be cleared and
+ * re-sent on the VD protocol, because the manager routes a VD session through the scan lane
+ * that feeds the vulnerability scanner. Sending it on the plain protocol repopulates
+ * wazuh-states-inventory-* and leaves the scanner with nothing -- measured as 1 package
+ * scanned instead of 679 before the fix, and invisible to every assertion that only checks
+ * that a resync happened at all.
+ *
+ * Driving any of this needs a manager to answer notifyDataClean(), so the protocols are mocked
+ * and reach Syscollector's members through the friend declarations in syscollector_defs.hpp.
+ */
+
+#include "gtest/gtest.h"
+#include "gmock/gmock.h"
+
+#include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <functional>
+#include <future>
+#include <thread>
+#include <vector>
+
+#include "json.hpp"
+#include "syscollector.hpp"
+#include "syscollector.h"
+#include "syscollectorTablesDef.hpp"
+#include "agent_sync_protocol.hpp"
+#include "metadata_provider.h"
+#include "module_query_errors.h"
+#include <sqlite3.h>
+#include <mock_sysinfo.hpp>
+
+using ::testing::_;
+using ::testing::NiceMock;
+using ::testing::Return;
+
+namespace
+{
+    constexpr auto IDENTITY_DB_PATH {"syscollector_identity_test.db"};
+    constexpr auto WORK_DIR {"syscollector_identity_test_workdir"};
+    constexpr auto SYNCED_AGENT_ID_KEY {"synced_agent_id"};
+    constexpr auto TABLE_SYNCED_AGENT_ID_PREFIX {"synced_agent_id:"};
+
+    class MockAgentSyncProtocol : public IAgentSyncProtocol
+    {
+        public:
+            MOCK_METHOD(void, persistDifference,
+                        (const std::string& id, Operation operation, const std::string& index,
+                         const std::string& data, uint64_t version, bool isDataContext), (override));
+            MOCK_METHOD(SyncModuleResult, synchronizeModule, (Mode mode, Option option), (override));
+            MOCK_METHOD(IntegrityCheckResult, requiresFullSync, (const std::string& index, const std::string& checksum), (override));
+            MOCK_METHOD(SyncModuleResult, synchronizeMetadataOrGroups,
+                        (Mode mode, const std::vector<std::string>& indices, uint64_t globalVersion), (override));
+            MOCK_METHOD(SyncModuleResult, notifyDataClean, (const std::vector<std::string>& indices, Option option, bool trackConsecutiveFailures), (override));
+            MOCK_METHOD(bool, parseResponseBuffer, (const uint8_t* data, size_t length), (override));
+            MOCK_METHOD(std::vector<PersistedData>, fetchPendingItems, (bool onlyDataValues), (override));
+            MOCK_METHOD(void, clearAllDataContext, (), (override));
+            MOCK_METHOD(void, deleteDatabase, (), (override));
+            MOCK_METHOD(void, stop, (), (override));
+            MOCK_METHOD(void, reset, (), (override));
+            MOCK_METHOD(bool, shouldStop, (), (const, override));
+    };
+
+    SyncModuleResult okResult()
+    {
+        SyncModuleResult result;
+        result.success = true;
+        return result;
+    }
+}
+
+class SyscollectorIdentityTest : public ::testing::Test
+{
+    protected:
+        void SetUp() override
+        {
+            // Own directory: the metadata provider is a file at a path relative to the working
+            // directory, and every other test binary in this tree writes the same one. Without
+            // this, a parallel ctest decides which agent id these cases observe.
+            std::filesystem::create_directories(std::string(WORK_DIR) + "/var/run");
+            std::filesystem::current_path(WORK_DIR);
+
+            std::remove(IDENTITY_DB_PATH);
+            metadata_provider_reset();
+        }
+
+        void TearDown() override
+        {
+            Syscollector::instance().destroy();
+            metadata_provider_reset();
+            std::remove(IDENTITY_DB_PATH);
+            std::filesystem::current_path("..");
+        }
+
+        /// @brief Publishes an agent id, the way agentd does after enrolling.
+        static void publishAgentId(const std::string& agentId)
+        {
+            agent_metadata_t metadata {};
+            strncpy(metadata.agent_id, agentId.c_str(), sizeof(metadata.agent_id) - 1);
+            strncpy(metadata.agent_name, "test-agent", sizeof(metadata.agent_name) - 1);
+            strncpy(metadata.agent_version, "5.0.0", sizeof(metadata.agent_version) - 1);
+            strncpy(metadata.architecture, "x86_64", sizeof(metadata.architecture) - 1);
+            strncpy(metadata.hostname, "test-host", sizeof(metadata.hostname) - 1);
+            strncpy(metadata.os_name, "Linux", sizeof(metadata.os_name) - 1);
+            strncpy(metadata.os_type, "linux", sizeof(metadata.os_type) - 1);
+            strncpy(metadata.os_platform, "ubuntu", sizeof(metadata.os_platform) - 1);
+            strncpy(metadata.os_version, "24.04", sizeof(metadata.os_version) - 1);
+            metadata_provider_update(&metadata);
+        }
+
+        /// @brief init() with only the collectors a case needs. packages and os ride the VD
+        /// lane, users the plain one, which is what makes the routing observable with two mocks.
+        static void initModule(bool packages, bool users, bool os = false,
+                               std::function<void(const modules_log_level_t, const std::string&)> log = {})
+        {
+            const auto spInfoWrapper {std::make_shared<MockSysInfo>()};
+            EXPECT_CALL(*spInfoWrapper, releaseThreadResources()).Times(::testing::AnyNumber());
+
+            if (!log)
+            {
+                log = [](const modules_log_level_t, const std::string&) {};
+            }
+
+            Syscollector::instance().init(spInfoWrapper,
+            [](const std::string&) {},
+            [](const std::string&, Operation_t, const std::string&,
+               const std::string&, uint64_t) {},
+            log,
+            IDENTITY_DB_PATH,
+            "",
+            "",
+            3600,
+            false,      // scanOnStart
+            false,      // hardware
+            os,         // os        -> VD lane
+            false,      // network
+            packages,   // packages  -> VD lane
+            false,      // ports
+            false,      // portsAll
+            false,      // processes
+            false,      // hotfixes
+            false,      // groups
+            users,      // users     -> plain lane
+            false,      // services
+            false,      // browserExtensions
+            false);     // notifyOnFirstScan
+
+            // start() computes this, and these cases do not call it -- they inject protocols
+            // instead of letting the module build real ones. Set here so that no case can model
+            // a lane a real agent could not have: with a VD collector switched off there is no
+            // VD lane at all, and checkAgentIdentity() routes os and packages through the plain
+            // one. (Windows also requires hotfixes; these cases stand in for the enabled lane.)
+            Syscollector::instance().m_vdSyncEnabled = packages && os;
+        }
+
+        /// @brief Creates the schema, seeds the marker, and reopens: DBSync holds the database
+        /// open for as long as the module is initialized, so a write from outside it is refused
+        /// with SQLITE_BUSY while it is up.
+        static void initWithMarker(bool packages, bool users, int64_t marker, bool os = false)
+        {
+            initModule(packages, users, os);
+            Syscollector::instance().destroy();
+            seedMarker(marker);
+            initModule(packages, users, os);
+        }
+
+        /// @brief Brings the module up with the identity already synchronized (so the recovery
+        /// pass goes straight to the integrity checks) and the given tables' integrity clocks
+        /// long expired, so each one is due.
+        static void initWithIntegrityDue(bool users, bool os, const std::vector<std::string>& dueTables)
+        {
+            initModule(false, users, os);
+            Syscollector::instance().destroy();
+            seedMarker(5);
+
+            for (const auto& table : dueTables)
+            {
+                seedMetadata(table, 1);
+            }
+
+            initModule(false, users, os);
+            publishAgentId("5");
+        }
+
+        static int64_t integrityClock(const std::string& table)
+        {
+            int64_t stamped = 0;
+            EXPECT_TRUE(Syscollector::instance().getMetadataValue(table, stamped));
+            return stamped;
+        }
+
+        /// @brief Replaces the module's logger, keeping what it logs at @p level.
+        static void captureLogs(std::vector<std::string>& logs, modules_log_level_t level)
+        {
+            Syscollector::instance().m_logFunction = [&logs, level](const modules_log_level_t logLevel, const std::string & msg)
+            {
+                if (logLevel == level)
+                {
+                    logs.push_back(msg);
+                }
+            };
+        }
+
+        /// @brief Writes any metadata row, for the markers other than synced_agent_id.
+        static void seedMetadata(const std::string& key, int64_t value)
+        {
+            sqlite3* db = nullptr;
+            ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+
+            const std::string statement =
+                "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('" +
+                key + "', " + std::to_string(value) + ");";
+
+            ASSERT_EQ(sqlite3_exec(db, statement.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+            sqlite3_close(db);
+        }
+
+        /// @brief Writes a non-numeric value under a key, so reading it back fails.
+        static void seedUnreadableMetadata(const std::string& key)
+        {
+            sqlite3* db = nullptr;
+            ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+
+            const std::string statement =
+                "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('" + key + "', 'unreadable');";
+
+            ASSERT_EQ(sqlite3_exec(db, statement.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+            sqlite3_close(db);
+        }
+
+        /// @brief Seeds one OS row, so a packages recovery has a real DataContext to attach.
+        /// Written from outside the module for the same reason seedMarker() is: DBSync holds the
+        /// database open while it is initialized.
+        static void seedOsRow()
+        {
+            sqlite3* db = nullptr;
+            ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+
+            const std::string statement =
+                "INSERT OR REPLACE INTO dbsync_osinfo (hostname, architecture, os_name, os_version, "
+                "os_codename, os_major, os_minor, os_patch, os_platform, os_type, os_kernel_name, "
+                "os_kernel_release, os_kernel_version, sync, checksum, version) VALUES "
+                "('test-host', 'x86_64', 'Ubuntu', '22.04.2 LTS', 'jammy', '22', '04', '2', 'ubuntu', "
+                "'linux', 'Linux', '5.15.0-69-generic', '#76-Ubuntu', 1, 'seedchecksum', 1);";
+
+            char* errMsg = nullptr;
+            ASSERT_EQ(sqlite3_exec(db, statement.c_str(), nullptr, nullptr, &errMsg), SQLITE_OK)
+                    << (errMsg ? errMsg : "");
+
+            if (errMsg)
+            {
+                sqlite3_free(errMsg);
+            }
+
+            sqlite3_close(db);
+        }
+
+        /// @brief Writes a row straight into table_metadata, which is where the marker lives.
+        static void seedMarker(int64_t agentId)
+        {
+            sqlite3* db = nullptr;
+            ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+
+            const std::string statement =
+                "INSERT OR REPLACE INTO table_metadata (table_name, last_sync_time) VALUES ('" +
+                std::string(SYNCED_AGENT_ID_KEY) + "', " + std::to_string(agentId) + ");";
+
+            char* errMsg = nullptr;
+            ASSERT_EQ(sqlite3_exec(db, statement.c_str(), nullptr, nullptr, &errMsg), SQLITE_OK)
+                    << (errMsg ? errMsg : "");
+
+            if (errMsg)
+            {
+                sqlite3_free(errMsg);
+            }
+
+            sqlite3_close(db);
+        }
+
+        /// @brief Waits for a DataClean started on another thread. On a timeout, stops the module
+        /// so it returns: a failed assertion must fail the test, not hang it in ~future.
+        static bool finished(std::future<bool>& dataClean)
+        {
+            if (dataClean.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
+            {
+                return true;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(Syscollector::instance().m_pauseMutex);
+                Syscollector::instance().m_stopping = true;
+            }
+
+            Syscollector::instance().m_pauseCv.notify_all();
+            dataClean.wait();
+            Syscollector::instance().m_stopping = false;
+            return false;
+        }
+
+        static int64_t readMarker()
+        {
+            const auto response = Syscollector::instance().query(R"({"command":"get_synced_agent_id"})");
+            return nlohmann::json::parse(response)["data"]["synced_agent_id"].get<int64_t>();
+        }
+};
+
+/// Declares plainProtocol / vdProtocol and publishes the mocks into the module. Written as a
+/// macro because gtest's FRIEND_TEST grants access to the test body, not to fixture members.
+#define INJECT_MOCK_PROTOCOLS()                                                            \
+    auto plainOwned = std::make_unique<NiceMock<MockAgentSyncProtocol>>();                 \
+    auto vdOwned = std::make_unique<NiceMock<MockAgentSyncProtocol>>();                    \
+    auto* plainProtocol = plainOwned.get();                                                \
+    auto* vdProtocol = vdOwned.get();                                                      \
+    Syscollector::instance().m_spSyncProtocol = std::move(plainOwned);                     \
+    Syscollector::instance().m_spSyncProtocolVD = std::move(vdOwned)
+
+// An in-place upgrade must not make the whole fleet resend at once: a database that never
+// recorded the marker adopts the current id and sends nothing.
+TEST_F(SyscollectorIdentityTest, AbsentMarkerIsAdoptedWithoutResync)
+{
+    initModule(true, true);
+    publishAgentId("7");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 7);
+}
+
+// The common re-enrollment keeps the same id (a key rotation, an authd password change, any
+// 401 that is not a deletion). Treating that as a change would resend the fleet on every
+// credential refresh.
+TEST_F(SyscollectorIdentityTest, UnchangedIdIsANoOp)
+{
+    initWithMarker(true, true, 5);
+    publishAgentId("5");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 5);
+}
+
+// Nothing published yet: an unavailable provider, or one still holding the previous id, must
+// read as unknown and never as a new identity.
+TEST_F(SyscollectorIdentityTest, UnknownIdIsANoOp)
+{
+    initWithMarker(true, true, 5);
+    metadata_provider_reset();
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 5);
+}
+
+// A failed read is not an answer. Folding it into "nothing recorded" would let one transient
+// database failure, in the window right after a re-enrollment, record the new id as already
+// synchronized and suppress the resync permanently.
+TEST_F(SyscollectorIdentityTest, FailedMarkerReadAdoptsNothing)
+{
+    initWithMarker(true, true, 5);
+    publishAgentId("9");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    // A read that fails rather than one that answers "nothing recorded": getMetadataValue()
+    // reports false when it has no database, which is the same "not an answer" a busy or
+    // unreadable one produces. Dropping table_metadata instead reproduces it too, but leaves the
+    // schema broken -- portable enough to pass here and fatal to the process under wine.
+    auto dbsync = std::move(Syscollector::instance().m_spDBSync);
+    Syscollector::instance().checkAgentIdentity();
+    Syscollector::instance().m_spDBSync = std::move(dbsync);
+
+    // The distinguishing observation, and the reason this case exists: an absent marker is
+    // adopted, a failed read must not be. Adopting 9 here would record an id nothing was ever
+    // sent under and suppress the resync permanently.
+    EXPECT_EQ(readMarker(), 5);
+}
+
+// The headline behaviour: every enabled table is resent, each on the protocol its data rides.
+TEST_F(SyscollectorIdentityTest, ChangedIdResendsEachTableOnItsOwnLane)
+{
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol,
+                notifyDataClean(std::vector<std::string> {SYSCOLLECTOR_SYNC_INDEX_PACKAGES}, _, _))
+    .Times(1)
+    .WillOnce(Return(okResult()));
+    EXPECT_CALL(*plainProtocol,
+                notifyDataClean(std::vector<std::string> {SYSCOLLECTOR_SYNC_INDEX_USERS}, _, _))
+    .Times(1)
+    .WillOnce(Return(okResult()));
+
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// A disabled collector holds no data worth resending, and its index must not be cleared.
+TEST_F(SyscollectorIdentityTest, ChangedIdSkipsDisabledCollectors)
+{
+    initWithMarker(true, false, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// To the manager a re-enrolled agent is a new agent, and a new agent's first scan is the one
+// that indexes its vulnerabilities without alerting on each -- the chain the manager picks for
+// Option::VDFIRST. The agent only asks for it while vd_first_sync_completed is unset, so the
+// identity resync clears that marker and sends the whole VD inventory in one session.
+TEST_F(SyscollectorIdentityTest, ChangedIdSendsTheVDInventoryAsAFirstSync)
+{
+    // os as well as packages: m_vdSyncEnabled is m_packages && m_os, and without it the module
+    // sends the VD tables with Option::SYNC and the first-scan question never arises.
+    initModule(true, true, /* os */ true);
+    Syscollector::instance().destroy();
+    seedMarker(1);
+    // Armed, as it is on any agent that has synchronized before: without this the plain lane's
+    // own session would already ask for VDFIRST and the reset below would prove nothing.
+    seedMetadata("vd_first_sync_completed", 1787900000);
+    initModule(true, true, /* os */ true);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+
+    // The whole point: exactly one session carries the VD inventory, and it asks for the
+    // first-scan chain. The plain lane's own sessions also reach this protocol -- syncModule()
+    // drains both -- but they run before any VD row is queued, so they find nothing to send and
+    // ask under the marker that is still armed. Those are allowed; a second VDFIRST is not,
+    // since each one opens by deleting what the previous indexed.
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, Option::VDSYNC))
+    .Times(::testing::AnyNumber())
+    .WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, Option::VDFIRST))
+    .Times(1)
+    .WillOnce(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// A refused DataClean means the manager never took that table. The pass keeps going, so the
+// tables that can be resent are, and the marker stays put so the next cycle retries.
+TEST_F(SyscollectorIdentityTest, RefusedDataCleanWithholdsTheMarkerAndKeepsGoing)
+{
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(SyncModuleResult {}));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 1);
+}
+
+// The combined marker waits for both lanes, so a plain table that keeps failing leaves the pass
+// unfinished cycle after cycle. The VD lane must not be redone on the strength of that: every
+// redo clears the vulnerability index and resends it as a first scan, which suppresses alerts,
+// so a CVE appearing between two cycles would never raise one.
+TEST_F(SyscollectorIdentityTest, PlainLaneFailureDoesNotRedoTheVDLaneNextCycle)
+{
+    initWithMarker(true, true, 1, /* os */ true);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    // The VD lane lands once across both cycles: one call per VD table -- packages and os --
+    // in the first cycle, and none in the second.
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(2).WillRepeatedly(Return(okResult()));
+    // The plain lane never does, and is retried on the second cycle.
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(2).WillRepeatedly(Return(SyncModuleResult {}));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+    Syscollector::instance().checkAgentIdentity();
+
+    // The identity is still not fully synchronized, so the combined marker stays where it was.
+    EXPECT_EQ(readMarker(), 1);
+}
+
+// Each resent table stamps the integrity clock, so the checksum loop running right behind this
+// one in the same pass does not clear and re-upload what was just replaced. Both lanes stamp,
+// from different places: the plain one as each session returns, the VD one only once its single
+// deferred session lands, so this case enables a table on each.
+TEST_F(SyscollectorIdentityTest, ResyncStampsTheIntegrityClockPerTable)
+{
+    initWithMarker(true, true, 1, /* os */ true);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    int64_t stamped = 0;
+    EXPECT_TRUE(Syscollector::instance().getMetadataValue(PACKAGES_TABLE, stamped));
+    EXPECT_GT(stamped, 0);
+
+    stamped = 0;
+    EXPECT_TRUE(Syscollector::instance().getMetadataValue(USERS_TABLE, stamped));
+    EXPECT_GT(stamped, 0);
+}
+
+// vd_synced_agent_id skips the VD lane for an identity it says is already covered, so only a run
+// that actually had that lane may write it. With a VD collector switched off there is none:
+// m_vdSyncEnabled is false, synchronizeVDTables() sends Option::SYNC, and os and packages go out
+// on the plain lane like any other table. Recording the marker there would let a later run --
+// packages switched back on -- honour it, skip the whole VD inventory, and leave it to go out as
+// VDSYNC: an alert for every finding the manager has never seen under this identity.
+TEST_F(SyscollectorIdentityTest, DisabledVDLaneDoesNotClaimTheVDMarker)
+{
+    // os off, so there is no VD lane while packages still has rows to resend.
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    // packages rides the plain lane here, so its own per-table marker skips it on the second
+    // cycle while users keeps failing. Its data still rides the VD protocol -- that routing is by
+    // index and is not what the lane decides.
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(2).WillRepeatedly(Return(SyncModuleResult {}));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+    Syscollector::instance().checkAgentIdentity();
+
+    // Read cleanly, and unset: an absent row reads as 0, which is what the resync compares
+    // against the current id and finds different.
+    int64_t vdMarker = -1;
+    EXPECT_TRUE(Syscollector::instance().getMetadataValue("vd_synced_agent_id", vdMarker));
+    EXPECT_EQ(vdMarker, 0);
+    EXPECT_EQ(readMarker(), 1);
+}
+
+// A table that failed is retried on the next pass, but the ones that landed are not cleared and
+// resent again: each plain-lane table keeps its own marker for the current id.
+TEST_F(SyscollectorIdentityTest, NextPassResendsOnlyThePendingTables)
+{
+    // os off, so packages rides the plain lane next to users.
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    // packages lands on the first pass and is not touched on the second.
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    // users fails on the first pass and lands on the second.
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _))
+    .Times(2)
+    .WillOnce(Return(SyncModuleResult {}))
+    .WillOnce(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(readMarker(), 1);
+
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// A stop mid-pass leaves the identity marker alone, and the next start resumes with the tables
+// that had not been resent yet instead of starting over.
+TEST_F(SyscollectorIdentityTest, PassCutByStopResumesWithThePendingTables)
+{
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    // packages comes first in the pass; the stop lands right after the manager accepted it.
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _))
+    .Times(1)
+    .WillOnce([](const std::vector<std::string>&, Option, bool)
+    {
+        Syscollector::instance().m_stopping = true;
+        return okResult();
+    });
+    // users is only reached by the resumed pass.
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(readMarker(), 1);
+
+    Syscollector::instance().m_stopping = false;
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// A per-table marker left by an earlier identity does not skip anything under the new one.
+TEST_F(SyscollectorIdentityTest, PerTableMarkerFromAnotherIdIsIgnored)
+{
+    initModule(true, true);
+    Syscollector::instance().destroy();
+    seedMarker(1);
+    seedMetadata(std::string(TABLE_SYNCED_AGENT_ID_PREFIX) + USERS_TABLE, 1);
+    initModule(true, true);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// A per-table marker that cannot be read counts as "not done", so the table is resent.
+TEST_F(SyscollectorIdentityTest, UnreadablePerTableMarkerCountsAsNotDone)
+{
+#ifdef _WIN32
+    // The non-numeric value that makes the read fail ends the test process under wine.
+    GTEST_SKIP() << "A non-numeric metadata value cannot be read back under wine";
+#endif
+    initModule(true, true);
+    Syscollector::instance().destroy();
+    seedMarker(1);
+    seedUnreadableMetadata(std::string(TABLE_SYNCED_AGENT_ID_PREFIX) + USERS_TABLE);
+    initModule(true, true);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    int64_t unreadable = 0;
+    ASSERT_FALSE(Syscollector::instance().getMetadataValue(std::string(TABLE_SYNCED_AGENT_ID_PREFIX) + USERS_TABLE,
+                                                           unreadable));
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// packages resent on the plain lane while the VD lane was off does not count for the VD lane:
+// once the lane exists under the same id, the VD inventory is still resent as one session.
+TEST_F(SyscollectorIdentityTest, PlainLaneMarkerDoesNotSkipTheVDLane)
+{
+    // os off, so packages starts on the plain lane.
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    // packages is cleared once per lane.
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(2).WillRepeatedly(Return(okResult()));
+    // users fails the first pass, so the identity stays unrecorded, and lands on the second.
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _))
+    .Times(2)
+    .WillOnce(Return(SyncModuleResult {}))
+    .WillOnce(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(readMarker(), 1);
+
+    Syscollector::instance().m_vdSyncEnabled = true;
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// The per-table and VD markers only describe the transition in progress. Once the identity is
+// recorded they are cleared, so a later enrollment that reuses one of those ids skips nothing.
+TEST_F(SyscollectorIdentityTest, ProgressMarkersAreClearedOnceTheIdentityIsRecorded)
+{
+    initWithMarker(true, true, 1, /* os */ true);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+    ASSERT_EQ(readMarker(), 2);
+
+    int64_t value = -1;
+    EXPECT_TRUE(Syscollector::instance().getMetadataValue(std::string(TABLE_SYNCED_AGENT_ID_PREFIX) + USERS_TABLE, value));
+    EXPECT_EQ(value, 0);
+
+    value = -1;
+    EXPECT_TRUE(Syscollector::instance().getMetadataValue("vd_synced_agent_id", value));
+    EXPECT_EQ(value, 0);
+}
+
+// A VD table that could not be cleared keeps the VD marker unset even if the VD session lands, so
+// the next pass resends the whole VD lane, that table included, instead of skipping it.
+TEST_F(SyscollectorIdentityTest, FailedVDTableKeepsTheVDLanePending)
+{
+    initWithMarker(true, true, 1, /* os */ true);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol,
+                notifyDataClean(std::vector<std::string> {SYSCOLLECTOR_SYNC_INDEX_SYSTEM}, _, _))
+    .Times(2)
+    .WillOnce(Return(SyncModuleResult {}))
+    .WillOnce(Return(okResult()));
+    EXPECT_CALL(*vdProtocol,
+                notifyDataClean(std::vector<std::string> {SYSCOLLECTOR_SYNC_INDEX_PACKAGES}, _, _))
+    .Times(2)
+    .WillRepeatedly(Return(okResult()));
+    // users lands on the first pass and is not cleared again.
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(1).WillOnce(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().checkAgentIdentity();
+
+    int64_t vdMarker = -1;
+    EXPECT_TRUE(Syscollector::instance().getMetadataValue("vd_synced_agent_id", vdMarker));
+    EXPECT_EQ(vdMarker, 0);
+    EXPECT_EQ(readMarker(), 1);
+
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(readMarker(), 2);
+}
+
+// A recovery session has to carry the same DataContext a scan would attach, and
+// processVDDataContext() is the only thing that builds it. It runs once per scan cycle -- a path
+// recovery never takes -- so before this it was simply never invoked for a recovered VD table,
+// and the session left with one table's rows and nothing else.
+//
+// Observed through the two calls processVDDataContext() always makes on the VD protocol before it
+// can decide there is anything to attach: the wipe of any stale context, and the read of the
+// pending DataValues it derives the required tables from.
+TEST_F(SyscollectorIdentityTest, VDRecoveryAttachesTheDataContext)
+{
+    // Seeded between two init()s: DBSync owns the database while the module is up, and the row has
+    // to exist before processVDDataContext() reads it.
+    initModule(true, true, /* os */ true);
+    Syscollector::instance().destroy();
+    seedOsRow();
+    initModule(true, true, /* os */ true);
+
+    // processVDDataContext() declines to build context until the first VD sync has landed, which
+    // on a real agent is long past by the time an integrity check can find a mismatch.
+    ASSERT_TRUE(Syscollector::instance().updateMetadataValue("vd_first_sync_completed", 1));
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    // The recovered packages row, as the queue would hand it back. getDataContextTables() maps a
+    // packages CREATE to the OS table, so this is what makes the OS row above required context.
+    PersistedData pendingPackage;
+    pendingPackage.id = "seeded-package-id";
+    pendingPackage.index = SYSCOLLECTOR_SYNC_INDEX_PACKAGES;
+    pendingPackage.operation = Operation::CREATE;
+    pendingPackage.is_data_context = false;
+    EXPECT_CALL(*vdProtocol, fetchPendingItems(true))
+    .WillRepeatedly(Return(std::vector<PersistedData> {pendingPackage}));
+
+    EXPECT_CALL(*vdProtocol, clearAllDataContext()).Times(::testing::AtLeast(1));
+
+    // The assertion that matters: the OS row goes out tagged as DataContext on the system index.
+    // Without it the session would carry the packages and nothing to evaluate them against.
+    EXPECT_CALL(*vdProtocol,
+                persistDifference(_, _, SYSCOLLECTOR_SYNC_INDEX_SYSTEM, _, _, /* isDataContext */ true))
+    .Times(::testing::AtLeast(1));
+
+    // The context rides the lane its DataValues do, so the plain protocol stays out of it.
+    EXPECT_CALL(*plainProtocol, clearAllDataContext()).Times(0);
+    EXPECT_CALL(*plainProtocol, fetchPendingItems(_)).Times(0);
+
+    EXPECT_TRUE(Syscollector::instance().resyncTableToManager(
+                    PACKAGES_TABLE, SYSCOLLECTOR_SYNC_INDEX_PACKAGES, /* syncNow */ true, "retry note"));
+}
+
+// The context step belongs to the VD lane only. A plain table has no DataContext rule to honour,
+// and running the step for one would clear the context of a VD session still queued beside it.
+TEST_F(SyscollectorIdentityTest, PlainRecoveryLeavesTheVDContextAlone)
+{
+    initModule(true, true, /* os */ true);
+    ASSERT_TRUE(Syscollector::instance().updateMetadataValue("vd_first_sync_completed", 1));
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    EXPECT_CALL(*vdProtocol, clearAllDataContext()).Times(0);
+    EXPECT_CALL(*plainProtocol, clearAllDataContext()).Times(0);
+
+    EXPECT_TRUE(Syscollector::instance().resyncTableToManager(
+                    USERS_TABLE, SYSCOLLECTOR_SYNC_INDEX_USERS, /* syncNow */ true, "retry note"));
+}
+
+// A deferred recovery is the identity path: checkAgentIdentity() queues every VD table and clears
+// the first-sync marker, so what finally goes out is a VDFirst carrying the whole inventory. There
+// is no context to add there, and building it per table would only wipe what the previous table
+// queued.
+TEST_F(SyscollectorIdentityTest, DeferredVDRecoveryDoesNotAttachContext)
+{
+    initModule(true, true, /* os */ true);
+    ASSERT_TRUE(Syscollector::instance().updateMetadataValue("vd_first_sync_completed", 1));
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(okResult()));
+    EXPECT_CALL(*vdProtocol, clearAllDataContext()).Times(0);
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).Times(0);
+    EXPECT_CALL(*plainProtocol, clearAllDataContext()).Times(0);
+
+    EXPECT_TRUE(Syscollector::instance().resyncTableToManager(
+                    PACKAGES_TABLE, SYSCOLLECTOR_SYNC_INDEX_PACKAGES, /* syncNow */ false, "retry note"));
+}
+
+// The sync thread polls this to resync right after a re-enrollment instead of waiting out a sync
+// interval that frequent reloads keep restarting. It must agree with checkAgentIdentity().
+TEST_F(SyscollectorIdentityTest, IdentityChangedQueryReportsAChangedId)
+{
+    initWithMarker(true, true, 5);
+    publishAgentId("9");
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    const auto response = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"get_identity_changed"})"));
+    EXPECT_EQ(response["error"], MQ_SUCCESS);
+    EXPECT_EQ(response["data"]["identity_changed"], 1);
+
+    // Read-only: the marker still says 5, so the next cycle still resends.
+    EXPECT_EQ(readMarker(), 5);
+}
+
+TEST_F(SyscollectorIdentityTest, IdentityChangedQueryIgnoresAnUnchangedId)
+{
+    initWithMarker(true, true, 5);
+    publishAgentId("5");
+    INJECT_MOCK_PROTOCOLS();
+    (void)plainProtocol;
+    (void)vdProtocol;
+
+    const auto response = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"get_identity_changed"})"));
+    EXPECT_EQ(response["data"]["identity_changed"], 0);
+}
+
+// "Cannot tell" is its own answer: read as "unchanged" it would reset the sync thread's backoff,
+// read as "changed" it would wake the sync thread every poll period.
+TEST_F(SyscollectorIdentityTest, IdentityChangedQueryReportsAnUnknownId)
+{
+    initWithMarker(true, true, 5);
+    metadata_provider_reset();
+    INJECT_MOCK_PROTOCOLS();
+    (void)plainProtocol;
+    (void)vdProtocol;
+
+    const auto response = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"get_identity_changed"})"));
+    EXPECT_EQ(response["data"]["identity_changed"], -1);
+}
+
+// An absent marker is adopted by checkAgentIdentity(), never resynced, so it is not a change. The
+// query leaves the adoption to the cycle.
+TEST_F(SyscollectorIdentityTest, IdentityChangedQueryIgnoresAnAbsentMarker)
+{
+    initModule(true, true);
+    publishAgentId("7");
+    INJECT_MOCK_PROTOCOLS();
+    (void)plainProtocol;
+    (void)vdProtocol;
+
+    const auto response = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"get_identity_changed"})"));
+    EXPECT_EQ(response["data"]["identity_changed"], 0);
+    EXPECT_EQ(readMarker(), 0);
+}
+
+// Without a sync protocol there is nothing to resend with.
+TEST_F(SyscollectorIdentityTest, IdentityChangedQueryReportsUnknownWithoutSyncProtocol)
+{
+    initWithMarker(true, true, 5);
+    publishAgentId("9");
+
+    const auto response = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"get_identity_changed"})"));
+    EXPECT_EQ(response["data"]["identity_changed"], -1);
+}
+
+// A flush sending from agent-info's coordination owns the protocols: a sync started beside it
+// would drain the same queue.
+TEST_F(SyscollectorIdentityTest, SyncSkipsWhileAFlushSends)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).Times(0);
+
+    Syscollector::instance().m_flushInProgress = true;
+    EXPECT_FALSE(Syscollector::instance().syncModule(Mode::DELTA).success);
+    Syscollector::instance().m_flushInProgress = false;
+}
+
+// The identity resync's DataClean has no session guard: sent beside a flush it would reset the
+// flush's session. The recovery stands back and the next cycle runs it.
+TEST_F(SyscollectorIdentityTest, RecoverySkipsWhileAFlushSends)
+{
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    Syscollector::instance().m_flushInProgress = true;
+    Syscollector::instance().runRecoveryProcess();
+    Syscollector::instance().m_flushInProgress = false;
+
+    EXPECT_EQ(readMarker(), 1);
+    EXPECT_FALSE(Syscollector::instance().m_recoveryInProgress.load());
+}
+
+// Nor does it run while the start-up DataClean for disabled collectors holds the slot: its guard
+// would clear that claim on the way out and let a flush start beside the DataClean.
+TEST_F(SyscollectorIdentityTest, RecoverySkipsWhileADataCleanHoldsTheSlot)
+{
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    Syscollector::instance().m_recoveryInProgress = true;
+    Syscollector::instance().runRecoveryProcess();
+
+    EXPECT_TRUE(Syscollector::instance().m_recoveryInProgress.load());
+    EXPECT_EQ(readMarker(), 1);
+    Syscollector::instance().m_recoveryInProgress = false;
+}
+
+// The other direction: a flush requested while a recovery runs waits for it, then sends.
+TEST_F(SyscollectorIdentityTest, FlushWaitsForARecoveryThenSends)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+
+    std::atomic<bool> sent {false};
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillOnce([&sent](Mode, Option)
+    {
+        sent = true;
+        return okResult();
+    });
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).WillRepeatedly(Return(okResult()));
+
+    Syscollector::instance().m_recoveryInProgress = true;
+
+    std::atomic<int> flushResult {1};
+    std::thread flusher([&flushResult]()
+    {
+        flushResult = Syscollector::instance().executeFlushSync();
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(sent.load());
+    EXPECT_FALSE(Syscollector::instance().m_flushInProgress.load());
+
+    {
+        std::lock_guard<std::mutex> lock(Syscollector::instance().m_pauseMutex);
+        Syscollector::instance().m_recoveryInProgress = false;
+    }
+    Syscollector::instance().m_pauseCv.notify_all();
+
+    flusher.join();
+    EXPECT_TRUE(sent.load());
+    EXPECT_EQ(flushResult.load(), 0);
+    EXPECT_FALSE(Syscollector::instance().m_flushInProgress.load());
+}
+
+// A flush still waiting when the module stops sends nothing and reports a failure, instead of
+// holding teardown until the recovery ends.
+TEST_F(SyscollectorIdentityTest, FlushWaitingForARecoveryGivesUpOnShutdown)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).Times(0);
+
+    Syscollector::instance().m_recoveryInProgress = true;
+
+    std::atomic<int> flushResult {1};
+    std::thread flusher([&flushResult]()
+    {
+        flushResult = Syscollector::instance().executeFlushSync();
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Syscollector::instance().m_stopping = true;
+    Syscollector::instance().m_pauseCv.notify_all();
+
+    flusher.join();
+    EXPECT_EQ(flushResult.load(), -1);
+    EXPECT_FALSE(Syscollector::instance().m_flushInProgress.load());
+
+    Syscollector::instance().m_recoveryInProgress = false;
+    Syscollector::instance().m_stopping = false;
+}
+
+// The start-up DataClean for disabled collectors resets a running flush's session just as the
+// recovery's does. It waits for the flush and holds the recovery slot while it sends and deletes
+// the data, so a flush requested meanwhile waits for it in turn.
+TEST_F(SyscollectorIdentityTest, DisabledCollectorsDataCleanWaitsForAFlush)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    Syscollector::instance().m_disabledCollectorsIndicesWithData = {"wazuh-states-inventory-hotfixes"};
+
+    std::atomic<bool> sent {false};
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillOnce([&sent](const std::vector<std::string>&, Option, bool)
+    {
+        EXPECT_FALSE(Syscollector::instance().m_flushInProgress.load());
+        EXPECT_TRUE(Syscollector::instance().m_recoveryInProgress.load());
+        EXPECT_TRUE(Syscollector::instance().m_startupDataCleanInProgress.load());
+        sent = true;
+        return okResult();
+    });
+
+    Syscollector::instance().m_flushInProgress = true;
+
+    auto cleaner = std::async(std::launch::async, [] { return Syscollector::instance().handleNotifyDataClean(); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(sent.load());
+
+    {
+        std::lock_guard<std::mutex> lock(Syscollector::instance().m_pauseMutex);
+        Syscollector::instance().m_flushInProgress = false;
+    }
+    Syscollector::instance().m_pauseCv.notify_all();
+
+    ASSERT_TRUE(finished(cleaner));
+    EXPECT_TRUE(sent.load());
+    EXPECT_TRUE(cleaner.get());
+    EXPECT_FALSE(Syscollector::instance().m_recoveryInProgress.load());
+    EXPECT_FALSE(Syscollector::instance().m_startupDataCleanInProgress.load());
+
+    Syscollector::instance().m_disabledCollectorsIndicesWithData.clear();
+}
+
+// Nor may it take the slot from a recovery already holding it (the sync thread resends after an
+// agent id change while start() runs): releasing it afterwards would let a flush start beside
+// that recovery's DataClean.
+TEST_F(SyscollectorIdentityTest, DisabledCollectorsDataCleanWaitsForARecovery)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    Syscollector::instance().m_disabledCollectorsIndicesWithData = {"wazuh-states-inventory-hotfixes"};
+
+    std::atomic<bool> recoveryRunning {true};
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillOnce([&recoveryRunning](const std::vector<std::string>&, Option, bool)
+    {
+        EXPECT_FALSE(recoveryRunning.load());
+        return okResult();
+    });
+
+    Syscollector::instance().m_recoveryInProgress = true;
+
+    auto cleaner = std::async(std::launch::async, [] { return Syscollector::instance().handleNotifyDataClean(); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    {
+        std::lock_guard<std::mutex> lock(Syscollector::instance().m_pauseMutex);
+        recoveryRunning = false;
+        Syscollector::instance().m_recoveryInProgress = false;
+    }
+    Syscollector::instance().m_pauseCv.notify_all();
+
+    ASSERT_TRUE(finished(cleaner));
+    EXPECT_TRUE(cleaner.get());
+    EXPECT_FALSE(Syscollector::instance().m_recoveryInProgress.load());
+
+    Syscollector::instance().m_disabledCollectorsIndicesWithData.clear();
+}
+
+// With nothing to clean it claims nothing, so it cannot clear a recovery's slot either.
+TEST_F(SyscollectorIdentityTest, NoDisabledCollectorsDataLeavesTheRecoverySlotAlone)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    Syscollector::instance().m_disabledCollectorsIndicesWithData.clear();
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    Syscollector::instance().m_recoveryInProgress = true;
+
+    // Were it to wait for the slot, it would wait forever: stop it so the test fails, not hangs.
+    auto dataClean = std::async(std::launch::async, [] { return Syscollector::instance().handleNotifyDataClean(); });
+    const bool returnedAtOnce = dataClean.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+
+    if (!returnedAtOnce)
+    {
+        Syscollector::instance().m_stopping = true;
+    }
+
+    EXPECT_TRUE(returnedAtOnce);
+    EXPECT_TRUE(dataClean.get());
+    EXPECT_TRUE(Syscollector::instance().m_recoveryInProgress.load());
+    Syscollector::instance().m_recoveryInProgress = false;
+    Syscollector::instance().m_stopping = false;
+}
+
+// The flag must not outlive a session that throws, or every later sync and recovery would skip.
+TEST_F(SyscollectorIdentityTest, FlushClearsItsFlagWhenTheSessionThrows)
+{
+#ifdef WIN32
+    GTEST_SKIP() << "Skipping FlushClearsItsFlagWhenTheSessionThrows test on Windows due to exception handling issues in Wine environment";
+#endif
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillOnce([](Mode, Option) -> SyncModuleResult
+    {
+        throw std::runtime_error("session failed");
+    });
+
+    EXPECT_THROW(Syscollector::instance().executeFlushSync(), std::runtime_error);
+    EXPECT_FALSE(Syscollector::instance().m_flushInProgress.load());
+}
+
+// agent-info pauses before it flushes and resumes before it polls the flush; a pause that waited
+// for the flush would stall that sequence.
+TEST_F(SyscollectorIdentityTest, PauseDoesNotWaitForAFlush)
+{
+    initModule(true, true);
+
+    Syscollector::instance().m_flushInProgress = true;
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_TRUE(Syscollector::instance().pause());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+
+    Syscollector::instance().resume();
+    Syscollector::instance().m_flushInProgress = false;
+}
+
+// The sync thread backs off only after a real attempt: it compares this count before and after a
+// cycle. The module is a singleton, so the cases compare deltas.
+static int queryResyncAttempts()
+{
+    const auto response = nlohmann::json::parse(Syscollector::instance().query(R"({"command":"get_identity_changed"})"));
+    return response["data"]["resync_attempts"].get<int>();
+}
+
+TEST_F(SyscollectorIdentityTest, ChangedIdResendCountsAsAResyncAttempt)
+{
+    initWithMarker(true, true, 1);
+    publishAgentId("2");
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(SyncModuleResult {}));
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(SyncModuleResult {}));
+
+    const int before = queryResyncAttempts();
+    Syscollector::instance().checkAgentIdentity();
+    EXPECT_EQ(queryResyncAttempts(), before + 1);
+}
+
+// The resend only follows a successful synchronization, so one that ran and failed (the manager
+// down) is the attempt that failed.
+TEST_F(SyscollectorIdentityTest, FailedSyncCountsAsAResyncAttempt)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).WillOnce(Return(SyncModuleResult {}));
+
+    const int before = queryResyncAttempts();
+    EXPECT_FALSE(Syscollector::instance().syncModule(Mode::DELTA).success);
+    EXPECT_EQ(queryResyncAttempts(), before + 1);
+}
+
+// A cycle skipped because agent-info's flush was sending -- the usual collision right after a
+// re-enrollment -- is no sign the manager refused anything, and must not count.
+TEST_F(SyscollectorIdentityTest, SkippedSyncIsNotAResyncAttempt)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).Times(0);
+
+    const int before = queryResyncAttempts();
+    Syscollector::instance().m_flushInProgress = true;
+    EXPECT_FALSE(Syscollector::instance().syncModule(Mode::DELTA).success);
+    Syscollector::instance().m_flushInProgress = false;
+    EXPECT_EQ(queryResyncAttempts(), before);
+}
+
+// The sync thread starts before start() and, after an agent id change, synchronizes at once, so it
+// can reach a sync while the start-up DataClean for disabled collectors is sending. That sync is
+// skipped, like one due while a flush sends, and is not counted as a resync attempt.
+TEST_F(SyscollectorIdentityTest, SyncSkipsWhileTheStartupDataCleanRuns)
+{
+    initModule(true, true);
+    INJECT_MOCK_PROTOCOLS();
+
+    EXPECT_CALL(*plainProtocol, synchronizeModule(_, _)).Times(0);
+    EXPECT_CALL(*vdProtocol, synchronizeModule(_, _)).Times(0);
+
+    const int before = queryResyncAttempts();
+    Syscollector::instance().m_startupDataCleanInProgress = true;
+    EXPECT_FALSE(Syscollector::instance().syncModule(Mode::DELTA).success);
+    Syscollector::instance().m_startupDataCleanInProgress = false;
+    EXPECT_EQ(queryResyncAttempts(), before);
+}
+
+namespace
+{
+    IntegrityCheckResult integrityResult(IntegrityCheckStatus status)
+    {
+        IntegrityCheckResult result;
+        result.status = status;
+        return result;
+    }
+
+    bool anyContains(const std::vector<std::string>& logs, const std::string& text)
+    {
+        return std::any_of(logs.begin(), logs.end(), [&text](const std::string & log)
+        {
+            return log.find(text) != std::string::npos;
+        });
+    }
+}
+
+// A check that could not run still counts the table as checked for this interval, but it must say
+// so -- once per pass, with the reason -- instead of passing for a valid checksum.
+TEST_F(SyscollectorIdentityTest, UncheckedTableIsStampedAndReportedOnce)
+{
+    initWithIntegrityDue(true, false, {USERS_TABLE});
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    IntegrityCheckResult notChecked;
+    notChecked.failureReason = "Failed to communicate with the manager.";
+    notChecked.managerNotReady = true;
+    EXPECT_CALL(*plainProtocol, requiresFullSync(_, _)).WillOnce(Return(notChecked));
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    std::vector<std::string> warnings;
+    captureLogs(warnings, LOG_WARNING);
+
+    Syscollector::instance().runRecoveryProcess();
+
+    EXPECT_GT(integrityClock(USERS_TABLE), 1);
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("Integrity check could not be performed for 1 table(s)"), std::string::npos) << warnings[0];
+    EXPECT_NE(warnings[0].find("inventory-users (Failed to communicate with the manager)"), std::string::npos) << warnings[0];
+    EXPECT_NE(warnings[0].find("next integrity_interval (24h)"), std::string::npos) << warnings[0];
+}
+
+// A stop in the middle of a check is not a failed check: the table is left unstamped so it is
+// checked after the restart, and a mismatch the manager had already reported is mentioned.
+TEST_F(SyscollectorIdentityTest, CheckInterruptedByStopLeavesTheTableUnstamped)
+{
+    initWithIntegrityDue(true, false, {USERS_TABLE});
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    IntegrityCheckResult stopped;
+    stopped.failureReason = "Module is stopping.";
+    stopped.stopped = true;
+    stopped.mismatchUnconfirmed = true;
+    EXPECT_CALL(*plainProtocol, requiresFullSync(_, _)).WillOnce(Return(stopped));
+
+    std::vector<std::string> infos;
+    captureLogs(infos, LOG_INFO);
+
+    Syscollector::instance().runRecoveryProcess();
+
+    EXPECT_EQ(integrityClock(USERS_TABLE), 1);
+    EXPECT_TRUE(anyContains(infos, "a checksum mismatch reported by the manager was not confirmed"));
+}
+
+// Every table left unchecked in a pass goes into one WARNING, each with its own reason. A mismatch
+// the manager had reported before the check failed (a 409, then a 503) is named, not lost.
+TEST_F(SyscollectorIdentityTest, UncheckedTablesShareOneWarningAndKeepAReportedMismatch)
+{
+    initWithIntegrityDue(true, true, {OS_TABLE, USERS_TABLE});
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    EXPECT_CALL(*plainProtocol, requiresFullSync(_, _)).WillRepeatedly([](const std::string & index, const std::string&)
+    {
+        IntegrityCheckResult notChecked;
+
+        if (index.find("users") != std::string::npos)
+        {
+            notChecked.failureReason = "Timed out waiting for manager response.";
+        }
+        else
+        {
+            notChecked.failureReason = "Failed to communicate with the manager.";
+            notChecked.managerNotReady = true;
+            notChecked.mismatchUnconfirmed = true;
+        }
+
+        return notChecked;
+    });
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).Times(0);
+
+    std::vector<std::string> warnings;
+    captureLogs(warnings, LOG_WARNING);
+
+    Syscollector::instance().runRecoveryProcess();
+
+    EXPECT_GT(integrityClock(OS_TABLE), 1);
+    EXPECT_GT(integrityClock(USERS_TABLE), 1);
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("Integrity check could not be performed for 2 table(s)"), std::string::npos) << warnings[0];
+    EXPECT_NE(warnings[0].find("(Failed to communicate with the manager, after a checksum mismatch reported by the manager)"),
+              std::string::npos) << warnings[0];
+    EXPECT_NE(warnings[0].find("inventory-users (Timed out waiting for manager response)"), std::string::npos) << warnings[0];
+}
+
+// A recovery that cannot start is retried in the next integrity_interval, like a failed check, and
+// the pass goes on to the next table instead of stopping there.
+TEST_F(SyscollectorIdentityTest, RefusedRecoveryDataCleanStampsAndMovesOn)
+{
+    initWithIntegrityDue(true, true, {OS_TABLE, USERS_TABLE});
+    INJECT_MOCK_PROTOCOLS();
+
+    // dbsync_osinfo comes first in the pass and mismatches; dbsync_users matches.
+    EXPECT_CALL(*plainProtocol, requiresFullSync(_, _)).WillRepeatedly([](const std::string & index, const std::string&)
+    {
+        return integrityResult(index.find("users") != std::string::npos ? IntegrityCheckStatus::VALID
+                               : IntegrityCheckStatus::MISMATCH);
+    });
+
+    SyncModuleResult refused;
+    refused.failureReason = "Failed to communicate with the manager.";
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(refused));
+    EXPECT_CALL(*vdProtocol, notifyDataClean(_, _, _)).WillRepeatedly(Return(refused));
+
+    std::vector<std::string> warnings;
+    captureLogs(warnings, LOG_WARNING);
+
+    Syscollector::instance().runRecoveryProcess();
+
+    EXPECT_GT(integrityClock(OS_TABLE), 1);
+    EXPECT_GT(integrityClock(USERS_TABLE), 1);
+    EXPECT_TRUE(anyContains(warnings, "it will be retried in the next integrity_interval (24h)"));
+}
+
+// A stop between two tables ends the pass: the tables not reached keep their old clock instead
+// of being counted as checked during the shutdown.
+TEST_F(SyscollectorIdentityTest, StopBetweenTablesLeavesTheRestUnstamped)
+{
+    initWithIntegrityDue(true, true, {OS_TABLE, USERS_TABLE});
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    EXPECT_CALL(*plainProtocol, requiresFullSync(_, _)).WillOnce([](const std::string&, const std::string&)
+    {
+        Syscollector::instance().m_stopping = true;
+        return integrityResult(IntegrityCheckStatus::VALID);
+    });
+
+    Syscollector::instance().runRecoveryProcess();
+    Syscollector::instance().m_stopping = false;
+
+    EXPECT_GT(integrityClock(OS_TABLE), 1);
+    EXPECT_EQ(integrityClock(USERS_TABLE), 1);
+}
+
+// A confirmed mismatch whose recovery a stop cuts short must not wait a whole integrity_interval:
+// the table stays unstamped and is checked again after the restart.
+TEST_F(SyscollectorIdentityTest, RecoveryInterruptedByStopLeavesTheTableUnstamped)
+{
+    initWithIntegrityDue(true, false, {USERS_TABLE});
+    INJECT_MOCK_PROTOCOLS();
+    (void)vdProtocol;
+
+    EXPECT_CALL(*plainProtocol, requiresFullSync(_, _)).WillOnce(Return(integrityResult(IntegrityCheckStatus::MISMATCH)));
+
+    // As quiesce() does: m_stopping is raised before the protocol is stopped, so a DataClean the stop
+    // cuts short always finds it set.
+    EXPECT_CALL(*plainProtocol, notifyDataClean(_, _, _)).WillOnce([](const std::vector<std::string>&, Option, bool)
+    {
+        Syscollector::instance().m_stopping = true;
+        SyncModuleResult stopped;
+        stopped.stopped = true;
+        return stopped;
+    });
+
+    std::vector<std::string> warnings;
+    captureLogs(warnings, LOG_WARNING);
+
+    Syscollector::instance().runRecoveryProcess();
+    Syscollector::instance().m_stopping = false;
+
+    EXPECT_EQ(integrityClock(USERS_TABLE), 1);
+    EXPECT_TRUE(warnings.empty());
+}
+
+// An agent upgraded from a version that stored host.os.distribution.release keeps its persistent
+// database: the column is renamed in place and its value is kept, instead of every OS insert
+// failing on the missing os_display_version column.
+TEST_F(SyscollectorIdentityTest, OsInfoDistributionReleaseColumnIsRenamedOnUpgrade)
+{
+    initModule(false, false);
+    Syscollector::instance().destroy();
+
+    // Turn the database back into the previous schema, with one row stored by it.
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "ALTER TABLE dbsync_osinfo RENAME COLUMN os_display_version TO os_distribution_release;"
+                           "INSERT INTO dbsync_osinfo (os_name, os_version, os_distribution_release, checksum) "
+                           "VALUES ('Microsoft Windows 10 Pro', '10.0.19045', '2009', 'oldchecksum');"
+                           "PRAGMA user_version = 1;",
+                           nullptr, nullptr, nullptr), SQLITE_OK);
+    sqlite3_close(db);
+
+    std::vector<std::string> warnings;
+    initModule(false, false, false, [&warnings](const modules_log_level_t level, const std::string & msg)
+    {
+        if (level == LOG_WARNING)
+        {
+            warnings.push_back(msg);
+        }
+    });
+    Syscollector::instance().destroy();
+
+    // Upgraded in place: nothing was lost, so nothing to warn about.
+    EXPECT_TRUE(warnings.empty());
+
+    db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
+
+    sqlite3_stmt* stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int(stmt, 0), static_cast<int>(UPGRADE_SQL_STATEMENTS.size() + 1));
+    sqlite3_finalize(stmt);
+
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT os_display_version FROM dbsync_osinfo;", -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    EXPECT_STREQ(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)), "2009");
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+}
+
+// A version 1 database whose schema the upgrade does not match (e.g. a development build that
+// already had os_display_version) must not keep the module from starting: it is created again.
+TEST_F(SyscollectorIdentityTest, OsInfoUnexpectedSchemaIsRecreatedOnUpgrade)
+{
+#ifdef WIN32
+    // The rejected upgrade is an exception thrown and caught inside DBSync.
+    GTEST_SKIP() << "Skipping OsInfoUnexpectedSchemaIsRecreatedOnUpgrade test on Windows due to exception handling issues in Wine environment";
+#endif
+    initModule(false, false);
+    Syscollector::instance().destroy();
+
+    // The current schema, stamped with the previous version, so the rename has nothing to rename.
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "INSERT INTO dbsync_osinfo (os_name, os_version, os_display_version, checksum) "
+                           "VALUES ('Microsoft Windows 10 Pro', '10.0.19045', '22H2', 'oldchecksum');"
+                           "PRAGMA user_version = 1;",
+                           nullptr, nullptr, nullptr), SQLITE_OK);
+    sqlite3_close(db);
+
+    std::vector<std::string> warnings;
+    ASSERT_NO_THROW(initModule(false, false, false, [&warnings](const modules_log_level_t level, const std::string & msg)
+    {
+        if (level == LOG_WARNING)
+        {
+            warnings.push_back(msg);
+        }
+    }));
+    Syscollector::instance().destroy();
+
+    // Logged by syscollector itself, at a level the default configuration shows: the shared
+    // DBSync callback belongs to whichever module registered first.
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("could not be upgraded from version 1 and was created again"), std::string::npos);
+
+    db = nullptr;
+    ASSERT_EQ(sqlite3_open_v2(IDENTITY_DB_PATH, &db, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
+
+    sqlite3_stmt* stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int(stmt, 0), static_cast<int>(UPGRADE_SQL_STATEMENTS.size() + 1));
+    sqlite3_finalize(stmt);
+
+    // Recreated, so the row stored with the unexpected schema is gone.
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM dbsync_osinfo;", -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    EXPECT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+}

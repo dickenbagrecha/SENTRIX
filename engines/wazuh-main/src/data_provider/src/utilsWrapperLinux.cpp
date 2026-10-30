@@ -1,0 +1,25 @@
+/*
+ * Wazuh SysInfo
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+#include "utilsWrapperLinux.hpp"
+#include "cmdHelper.h"
+#include <filesystem_wrapper.hpp>
+
+std::string UtilsWrapperLinux::exec(const std::string& cmd, const size_t bufferSize)
+{
+    return Utils::exec(cmd, bufferSize);
+}
+
+bool UtilsWrapperLinux::existsRegular(const std::string& path)
+{
+    const file_system::FileSystemWrapper fs;
+
+    return fs.is_regular_file(path);
+}

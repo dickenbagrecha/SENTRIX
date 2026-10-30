@@ -1,0 +1,884 @@
+/* Copyright (C) Wazuh Inc.
+ * Copyright (C) 2009 Trend Micro Inc.
+ * All right reserved.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation
+ */
+
+#include "shared.h"
+#include "list_op.h"
+#include "os_regex.h"
+#include "os_net.h"
+#include "wmodules.h"
+#include "cJSON.h"
+#include "execd.h"
+#include "active_responses.h"
+#include "startup_gate_op.h"
+
+#ifdef WAZUH_UNIT_TESTING
+// Remove static qualifier when unit testing
+#define STATIC
+#else
+#define STATIC static
+#endif
+
+int repeated_offenders_timeout[] = {0, 0, 0, 0, 0, 0, 0};
+time_t pending_upg = 0;
+
+STATIC OSList *timeout_list;
+STATIC OSListNode *timeout_node;
+STATIC OSHash *repeated_hash;
+STATIC int repeated_levels;
+STATIC time_t repeated_window;
+STATIC time_t repeated_last_purge;
+STATIC time_t repeated_last_full_warn;
+
+#ifdef WIN32
+#ifdef WAZUH_UNIT_TESTING
+    #include "../../unit_tests/wrappers/windows/libc/stdio_wrappers.h"
+#endif
+static pthread_mutex_t timeout_list_mutex;
+extern w_queue_t * winexec_queue;
+DWORD WINAPI win_exec_main(void * args);
+#endif
+
+/* Log a warning if an active response command reported failure or terminated abnormally.
+ * wstatus must be the value returned by wpclose(): a wait()-encoded status on POSIX
+ * (or a bare -1 if waitpid() itself failed, which never occurs as a real encoded status),
+ * or the already-resolved exit code on Windows.
+ */
+static void LogArExitStatus(const char *name, int wstatus) {
+#ifndef WIN32
+    if (wstatus == -1) {
+        mwarn("Could not determine exit status of active response command '%s'.", name);
+    } else if (WIFEXITED(wstatus)) {
+        if (WEXITSTATUS(wstatus) != 0) {
+            mwarn("Active response command '%s' reported failure (exit code %d).", name, WEXITSTATUS(wstatus));
+        }
+    } else {
+        mwarn("Active response command '%s' terminated abnormally.", name);
+    }
+#else
+    if (wstatus != 0) {
+        mwarn("Active response command '%s' reported failure (exit code %d).", name, wstatus);
+    }
+#endif
+}
+
+/* Free the timeout entry
+ * Must be called after popping it from the timeout list
+ */
+void FreeTimeoutEntry(timeout_data *timeout_entry)
+{
+    char **tmp_str;
+
+    if (!timeout_entry) {
+        return;
+    }
+
+    tmp_str = timeout_entry->command;
+
+    /* Clear the command arguments */
+    if (tmp_str) {
+        while (*tmp_str) {
+            os_free(*tmp_str);
+            *tmp_str = NULL;
+            tmp_str++;
+        }
+        os_free(timeout_entry->command);
+    }
+
+    os_free(timeout_entry->parameters);
+
+    os_free(timeout_entry->rkey);
+
+    os_free(timeout_entry);
+}
+
+/* Free the timeout list
+ */
+void FreeTimeoutList() {
+#ifdef WIN32
+    w_mutex_lock(&timeout_list_mutex);
+#endif
+    timeout_node = OSList_GetFirstNode(timeout_list);
+    while (timeout_node) {
+        FreeTimeoutEntry((timeout_data *)timeout_node->data);
+        OSList_DeleteCurrentlyNode(timeout_list);
+        timeout_node = OSList_GetCurrentlyNode(timeout_list);
+    }
+    os_free(timeout_list);
+#ifdef WIN32
+    w_mutex_unlock(&timeout_list_mutex);
+#endif
+}
+
+/* Create the repeated offenders table if the option is configured */
+STATIC void RepeatedOffendersInit()
+{
+    repeated_hash = NULL;
+    repeated_levels = 0;
+    repeated_window = 0;
+    repeated_last_purge = 0;
+    repeated_last_full_warn = 0;
+
+    if (repeated_offenders_timeout[0] == 0) {
+        return;
+    }
+
+    for (; repeated_offenders_timeout[repeated_levels] != 0; repeated_levels++) {
+        time_t level = (time_t)repeated_offenders_timeout[repeated_levels] * 60;
+
+        if (level > repeated_window) {
+            repeated_window = level;
+        }
+    }
+
+    if (repeated_hash = OSHash_Create(), !repeated_hash) {
+        merror_exit(HASH_ERROR);
+    }
+
+    if (!OSHash_setSize(repeated_hash, REPEATED_OFFENDERS_ROWS)) {
+        merror_exit(MEM_ERROR, errno, strerror(errno));
+    }
+
+    // OSHash_setSize() resets the seed to fixed values
+    repeated_hash->initial_seed = os_getprime((unsigned)os_random() % repeated_hash->rows);
+    repeated_hash->constant = os_getprime((unsigned)os_random() % repeated_hash->rows);
+}
+
+/* Forget the keys whose last block ended longer ago than the largest repeated timeout */
+STATIC void RepeatedOffendersPurge(time_t curr_time)
+{
+    unsigned int row;
+    OSHashNode *node;
+    OSHashNode *next;
+
+    for (node = OSHash_Begin(repeated_hash, &row); node; node = next) {
+        repeated_offender *offender = (repeated_offender *)node->data;
+
+        next = OSHash_Next(repeated_hash, &row, node);
+
+        if (curr_time - offender->release_at > repeated_window) {
+            free(OSHash_Delete(repeated_hash, node->key));
+        }
+    }
+
+    repeated_last_purge = curr_time;
+}
+
+/* Return the timeout for this offense of rkey and record it */
+STATIC int RepeatedOffendersCheck(const char *rkey, int timeout_value, time_t curr_time)
+{
+    repeated_offender *offender;
+
+    // Purge every interval, after a backward clock step, and at most once a second while full
+    if (curr_time - repeated_last_purge >= REPEATED_OFFENDERS_PURGE || curr_time < repeated_last_purge ||
+        (repeated_hash->elements >= REPEATED_OFFENDERS_MAX && curr_time != repeated_last_purge)) {
+        RepeatedOffendersPurge(curr_time);
+    }
+
+    if (offender = (repeated_offender *)OSHash_Get(repeated_hash, rkey), offender) {
+        if (offender->count >= repeated_levels) {
+            timeout_value = repeated_offenders_timeout[repeated_levels - 1] * 60;
+        } else {
+            timeout_value = repeated_offenders_timeout[offender->count] * 60;
+            offender->count++;
+        }
+
+        mdebug1("Repeated offender. Setting timeout to '%ds'", timeout_value);
+    } else {
+        if (repeated_hash->elements >= REPEATED_OFFENDERS_MAX) {
+            // Repeat the warning at most once per purge interval while the table stays full
+            if (curr_time - repeated_last_full_warn >= REPEATED_OFFENDERS_PURGE || curr_time < repeated_last_full_warn) {
+                mwarn(AR_REPEATED_FULL, REPEATED_OFFENDERS_MAX);
+                repeated_last_full_warn = curr_time;
+            }
+            return timeout_value;
+        }
+
+        os_calloc(1, sizeof(repeated_offender), offender);
+
+        if (OSHash_Add(repeated_hash, rkey, offender) != 2) {
+            os_free(offender);
+            merror("At ExecdRun: OSHash_Add() failed");
+            return timeout_value;
+        }
+    }
+
+    offender->release_at = curr_time + timeout_value;
+    return timeout_value;
+}
+
+#ifdef WIN32
+void ExecdShutdown()
+#else
+void ExecdShutdown(int sig)
+#endif
+{
+    /* Remove pending active responses */
+    minfo(EXEC_SHUTDOWN);
+
+#ifdef WIN32
+    w_mutex_lock(&timeout_list_mutex);
+#endif
+    timeout_node = timeout_list ? OSList_GetFirstNode(timeout_list) : NULL;
+    while (timeout_node) {
+        timeout_data *list_entry;
+
+        list_entry = (timeout_data *)timeout_node->data;
+
+        mdebug2("Delete pending AR: '%s' '%s'", list_entry->command[0], list_entry->parameters);
+
+        wfd_t *wfd = wpopenv(list_entry->command[0], list_entry->command, W_BIND_STDIN);
+        if (wfd) {
+            /* Send alert to AR script */
+            fprintf(wfd->file_in, "%s\n", list_entry->parameters);
+            fflush(wfd->file_in);
+            LogArExitStatus(list_entry->command[0], wpclose(wfd));
+        } else {
+            merror(EXEC_CMD_FAIL, strerror(errno), errno);
+        }
+
+        /* Delete current node - already sets the pointer to next */
+        OSList_DeleteCurrentlyNode(timeout_list);
+        timeout_node = OSList_GetCurrentlyNode(timeout_list);
+
+        /* Clear the memory */
+        FreeTimeoutEntry(list_entry);
+    }
+
+#ifndef WIN32
+    HandleSIG(sig);
+#else
+    w_mutex_unlock(&timeout_list_mutex);
+    w_mutex_destroy(&timeout_list_mutex);
+#endif
+}
+
+#ifdef WIN32
+void ExecdTimeoutRun()
+#else
+void ExecdTimeoutRun(int *childcount)
+#endif
+{
+    time_t curr_time = time(NULL);
+
+#ifdef WIN32
+    w_mutex_lock(&timeout_list_mutex);
+#endif
+    /* Check if there is any timed out command to execute */
+    timeout_node = OSList_GetFirstNode(timeout_list);
+    while (timeout_node) {
+        timeout_data *list_entry;
+
+        list_entry = (timeout_data *)timeout_node->data;
+
+        /* Timed out */
+        if ((curr_time - list_entry->time_of_addition) > list_entry->time_to_block) {
+
+            if (list_entry->command == NULL || list_entry->command[0] == NULL)
+            {
+                merror("Timeout command is null.");
+#ifdef WIN32
+                w_mutex_unlock(&timeout_list_mutex);
+#endif
+                return;
+            }
+
+            mdebug1("Executing command '%s %s' after a timeout of '%ds'",
+                list_entry->command[0],
+                list_entry->parameters ? list_entry->parameters : "",
+                list_entry->time_to_block
+            );
+
+            wfd_t *wfd = wpopenv(list_entry->command[0], list_entry->command, W_BIND_STDIN);
+            if (wfd) {
+                /* Send alert to AR script */
+                fprintf(wfd->file_in, "%s\n", list_entry->parameters);
+                fflush(wfd->file_in);
+                LogArExitStatus(list_entry->command[0], wpclose(wfd));
+            } else {
+                merror(EXEC_CMD_FAIL, strerror(errno), errno);
+            }
+
+            /* Delete currently node - already sets the pointer to next */
+            OSList_DeleteCurrentlyNode(timeout_list);
+            timeout_node = OSList_GetCurrentlyNode(timeout_list);
+
+            /* Clear the memory */
+            FreeTimeoutEntry(list_entry);
+
+#ifndef WIN32
+            (*childcount)++;
+#endif
+        } else {
+            timeout_node = OSList_GetNextNode(timeout_list);
+        }
+    }
+#ifdef WIN32
+    w_mutex_unlock(&timeout_list_mutex);
+#endif
+}
+
+static bool ar_ip_in(const os_ip *entry, const struct sockaddr *sa)
+{
+    if (sa->sa_family == AF_INET) {
+        if (entry->is_ipv6) {
+            return false;
+        }
+        const struct sockaddr_in *in4 = (const struct sockaddr_in *)sa;
+        return (in4->sin_addr.s_addr & entry->ipv4->netmask) == entry->ipv4->ip_address;
+    }
+
+    if (!entry->is_ipv6) {
+        return false;
+    }
+    const uint8_t *addr = (const uint8_t *)&((const struct sockaddr_in6 *)sa)->sin6_addr;
+    for (int i = 0; i < 16; i++) {
+        if ((addr[i] & entry->ipv6->netmask[i]) != entry->ipv6->ip_address[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ar_same_ip(const struct sockaddr *a, const struct sockaddr *b)
+{
+    if (a->sa_family != b->sa_family) {
+        return false;
+    }
+    if (a->sa_family == AF_INET) {
+        return ((const struct sockaddr_in *)a)->sin_addr.s_addr == ((const struct sockaddr_in *)b)->sin_addr.s_addr;
+    }
+    return !memcmp(&((const struct sockaddr_in6 *)a)->sin6_addr, &((const struct sockaddr_in6 *)b)->sin6_addr,
+                   sizeof(struct in6_addr));
+}
+
+#define AR_MANAGER_ADDR_MAX 32
+#define AR_MANAGER_RESOLVE_INTERVAL 60
+STATIC struct sockaddr_storage ar_manager_addrs[AR_MANAGER_ADDR_MAX];
+STATIC int ar_manager_addrs_n = 0;
+STATIC int ar_manager_addrs_next = 0;
+STATIC time_t ar_manager_resolved_at = 0;
+
+static void ar_unmap_ipv4(struct sockaddr_storage *addr)
+{
+    struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)addr;
+
+    if (addr->ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+        struct sockaddr_in in4 = {0};
+        in4.sin_family = AF_INET;
+        memcpy(&in4.sin_addr, (const uint8_t *)&in6->sin6_addr + 12, sizeof(in4.sin_addr));
+        memset(addr, 0, sizeof(*addr));
+        memcpy(addr, &in4, sizeof(in4));
+    }
+}
+
+void ar_resolve_manager_hosts(void)
+{
+    if (!ar_manager_hosts) {
+        return;
+    }
+
+    // Bounded so a slow resolver cannot stall execd on every response.
+    time_t now = time(NULL);
+    if (ar_manager_resolved_at && now - ar_manager_resolved_at < AR_MANAGER_RESOLVE_INTERVAL) {
+        return;
+    }
+    ar_manager_resolved_at = now;
+
+    // Failed lookups keep what was resolved before; when full, the oldest address is replaced.
+    for (int i = 0; ar_manager_hosts[i]; i++) {
+        struct addrinfo hints = {0};
+        struct addrinfo *res = NULL;
+        hints.ai_family = AF_UNSPEC;
+
+        if (getaddrinfo(ar_manager_hosts[i], NULL, &hints, &res) != 0) {
+            mdebug1("Could not resolve manager address '%s' for the active response allowlist.", ar_manager_hosts[i]);
+            continue;
+        }
+
+        for (struct addrinfo *r = res; r; r = r->ai_next) {
+            struct sockaddr_storage addr = {0};
+            bool known = false;
+
+            if (r->ai_addrlen > sizeof(addr)) {
+                continue;
+            }
+            memcpy(&addr, r->ai_addr, r->ai_addrlen);
+            ar_unmap_ipv4(&addr);
+
+            for (int j = 0; j < ar_manager_addrs_n && !known; j++) {
+                known = ar_same_ip((struct sockaddr *)&ar_manager_addrs[j], (struct sockaddr *)&addr);
+            }
+            if (!known) {
+                ar_manager_addrs[ar_manager_addrs_next] = addr;
+                ar_manager_addrs_next = (ar_manager_addrs_next + 1) % AR_MANAGER_ADDR_MAX;
+                if (ar_manager_addrs_n < AR_MANAGER_ADDR_MAX) {
+                    ar_manager_addrs_n++;
+                }
+            }
+        }
+        freeaddrinfo(res);
+    }
+}
+
+bool ar_source_allowlisted(const char *srcip)
+{
+    struct addrinfo hints = {0};
+    struct addrinfo *src = NULL;
+    struct sockaddr_storage addr = {0};
+    bool found = false;
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = AI_NUMERICHOST;
+
+    // Same parser block-ip uses, so both read the address the same way.
+    if (!srcip || getaddrinfo(srcip, NULL, &hints, &src) != 0 || !src) {
+        return false;
+    }
+    memcpy(&addr, src->ai_addr, src->ai_addrlen);
+    freeaddrinfo(src);
+
+    ar_unmap_ipv4(&addr);
+
+    for (int i = 0; ar_allowlist && ar_allowlist[i] && !found; i++) {
+        found = ar_ip_in(ar_allowlist[i], (struct sockaddr *)&addr);
+    }
+
+    if (!found && ar_manager_hosts) {
+        ar_resolve_manager_hosts();
+        for (int i = 0; i < ar_manager_addrs_n && !found; i++) {
+            found = ar_same_ip((struct sockaddr *)&ar_manager_addrs[i], (struct sockaddr *)&addr);
+        }
+    }
+
+    return found;
+}
+
+#ifdef WIN32
+void ExecdRun(char *exec_msg)
+#else
+void ExecdRun(char *exec_msg, int *childcount)
+#endif
+{
+    time_t curr_time;
+
+    int timeout_value;
+    int added_before = 0;
+
+    cJSON *json_root = NULL;
+    char *name = NULL;
+    char *cmd[2] = { NULL, NULL };
+    char *cmd_parameters = NULL;
+
+    timeout_data *timeout_entry;
+
+    /* Current time */
+    curr_time = time(0);
+
+    /* Parse message */
+    if (json_root = cJSON_Parse(exec_msg), !json_root) {
+        merror(EXEC_INV_JSON, exec_msg);
+        return;
+    }
+
+    /* Get executable name and AR metadata from wazuh.active_response */
+    cJSON *json_wazuh = cJSON_GetObjectItem(json_root, "wazuh");
+    if (!cJSON_IsObject(json_wazuh)) {
+        merror(EXEC_INV_CMD, exec_msg);
+        cJSON_Delete(json_root);
+        return;
+    }
+
+    cJSON *json_ar = cJSON_GetObjectItem(json_wazuh, "active_response");
+    if (!cJSON_IsObject(json_ar)) {
+        merror(EXEC_INV_CMD, exec_msg);
+        cJSON_Delete(json_root);
+        return;
+    }
+
+    cJSON *json_executable = cJSON_GetObjectItem(json_ar, "executable");
+    if (!cJSON_IsString(json_executable) || json_executable->valuestring[0] == '\0') {
+        merror(EXEC_INV_CMD, exec_msg);
+        cJSON_Delete(json_root);
+        return;
+    }
+    name = json_executable->valuestring;
+
+    cJSON *json_srcip = cJSON_GetObjectItem(cJSON_GetObjectItem(json_root, "source"), "ip");
+    if (cJSON_IsString(json_srcip) && ar_source_allowlisted(json_srcip->valuestring)) {
+        mwarn("Active response '%s' not executed: source.ip '%s' is the manager or in the allowlist.",
+              name, json_srcip->valuestring);
+        cJSON_Delete(json_root);
+        return;
+    }
+
+    /* Directory traversal protection */
+    if (w_ref_parent_folder(name)) {
+        merror("Active response command '%s' vulnerable to directory traversal attack. Ignoring.", name);
+        cJSON_Delete(json_root);
+        return;
+    }
+
+    /* Build full command path */
+    static char cmd_path[OS_FLSIZE];
+#ifdef WIN32
+    const char *exe_suffix = strchr(name, '.') ? "" : ".exe";
+#else
+    const char *exe_suffix = "";
+#endif
+    if (snprintf(cmd_path, sizeof(cmd_path), "%s/%s%s", AR_BINDIR, name, exe_suffix) >= (int)sizeof(cmd_path)) {
+        merror("Active response command path too long for '%s'. Ignoring.", name);
+        cJSON_Delete(json_root);
+        return;
+    }
+    cmd[0] = cmd_path;
+
+    /* Verify executable exists */
+    FILE *exec_fp = wfopen(cmd[0], "r");
+    if (!exec_fp) {
+        merror(EXEC_INV_NAME, name);
+        cJSON_Delete(json_root);
+        return;
+    }
+    fclose(exec_fp);
+
+    /* Determine timeout from AR type metadata */
+    cJSON *json_ar_type = cJSON_GetObjectItem(json_ar, "type");
+    cJSON *json_stateful_timeout = cJSON_GetObjectItem(json_ar, "stateful_timeout");
+
+    if (cJSON_IsString(json_ar_type) && strcmp(json_ar_type->valuestring, "stateful") == 0) {
+        timeout_value = cJSON_IsNumber(json_stateful_timeout) ? (int)json_stateful_timeout->valuedouble : 0;
+
+        if (timeout_value == 0) {
+            mdebug1("Stateful AR '%s' has timeout value of 0. AR will be treated as stateless.", name);
+        }
+    } else {
+        timeout_value = 0;
+    }
+
+    /* Add command field for AR script protocol compatibility */
+    cJSON_AddStringToObject(json_root, "command", ENABLE_ENTRY);
+    cmd_parameters = cJSON_PrintUnformatted(json_root);
+
+    /* Execute command */
+    mdebug1("Executing command '%s %s'", cmd[0], cmd_parameters ? cmd_parameters : "");
+
+    wfd_t *wfd = wpopenv(cmd[0], cmd, W_BIND_STDIN | W_BIND_STDOUT);
+    if (wfd) {
+        char response[OS_SIZE_8192];
+        char rkey[OS_SIZE_4096];
+        cJSON *keys_json = NULL;
+
+        /* Send alert to AR script */
+        fprintf(wfd->file_in, "%s\n", cmd_parameters);
+        fflush(wfd->file_in);
+
+        /* Receive alert keys from AR script to check timeout list */
+        if (fgets(response, sizeof(response), wfd->file_out) == NULL) {
+            mdebug1("Active response won't be added to timeout list. "
+                    "Message not received with alert keys from script '%s'", cmd[0]);
+            LogArExitStatus(cmd[0], wpclose(wfd));
+            os_free(cmd_parameters);
+            cJSON_Delete(json_root);
+            return;
+        }
+
+        char *cmd_copy;
+        os_strdup(cmd[0], cmd_copy);
+        if (cmd_copy == NULL) {
+            merror("Active response command is null");
+            LogArExitStatus(cmd[0], wpclose(wfd));
+            os_free(cmd_parameters);
+            cJSON_Delete(json_root);
+            return;
+        }
+
+        /* Set rkey initially with the name of the AR */
+        memset(rkey, '\0', OS_SIZE_4096);
+        snprintf(rkey, OS_SIZE_4096 - 1, "%s", basename_ex(cmd_copy));
+
+        keys_json = cJSON_Parse(response);
+        if (keys_json != NULL) {
+            const char *action = get_command_from_json(keys_json);
+            if ((action != NULL) && (strcmp(CHECK_KEYS_ENTRY, action) == 0)) {
+                char *keys = get_keys_from_json(keys_json);
+                if (keys != NULL) {
+                    /* Append to rkey the alert keys that the AR script will use */
+                    size_t rkey_len = strlen(rkey);
+                    size_t keys_len = strlen(keys);
+
+                    if (rkey_len + keys_len >= OS_SIZE_4096) {
+                        mwarn("Active response key exceeds maximum size (%d). Truncating keys.",
+                              OS_SIZE_4096);
+                    }
+
+                    strncat(rkey, keys, OS_SIZE_4096 - rkey_len - 1);
+                    os_free(keys);
+                }
+            }
+            cJSON_Delete(keys_json);
+        }
+
+        added_before = 0;
+
+        /* We don't need to add to the list if the timeout_value == 0 */
+        if (timeout_value) {
+            if (repeated_hash != NULL) {
+                timeout_value = RepeatedOffendersCheck(rkey, timeout_value, curr_time);
+            }
+
+#ifdef WIN32
+            w_mutex_lock(&timeout_list_mutex);
+#endif
+            /* Check if this command was already executed */
+            timeout_node = OSList_GetFirstNode(timeout_list);
+            while (timeout_node) {
+                timeout_data *list_entry;
+
+                list_entry = (timeout_data *)timeout_node->data;
+                if (strcmp(list_entry->rkey, rkey) == 0) {
+                    /* Means we executed this command before and we don't need to add it again */
+                    added_before = 1;
+
+                    /* Update the timeout */
+                    mdebug1("Command already received, updating time of addition to now.");
+                    list_entry->time_of_addition = curr_time;
+                    list_entry->time_to_block = timeout_value;
+                    break;
+                }
+
+                /* Continue with the next entry in timeout list */
+                timeout_node = OSList_GetNextNode(timeout_list);
+            }
+#ifdef WIN32
+            w_mutex_unlock(&timeout_list_mutex);
+#endif
+            /* If it wasn't added before, do it now */
+            if (!added_before) {
+                /* Timeout parameters - change command to disable */
+                cJSON *existing_command = cJSON_GetObjectItem(json_root, "command");
+                if (existing_command) {
+                    cJSON_ReplaceItemInObject(json_root, "command", cJSON_CreateString(DISABLE_ENTRY));
+                } else {
+                    cJSON_AddStringToObject(json_root, "command", DISABLE_ENTRY);
+                }
+
+                /* Create the timeout entry */
+                os_calloc(1, sizeof(timeout_data), timeout_entry);
+                os_calloc(2, sizeof(char *), timeout_entry->command);
+                os_strdup(cmd[0], timeout_entry->command[0]);
+                timeout_entry->command[1] = NULL;
+                timeout_entry->parameters = cJSON_PrintUnformatted(json_root);
+                os_strdup(rkey, timeout_entry->rkey);
+                timeout_entry->time_of_addition = curr_time;
+                timeout_entry->time_to_block = timeout_value;
+
+                /* Add command to the timeout list */
+                mdebug1("Adding command '%s %s' to the timeout list, with a timeout of '%ds'.",
+                    timeout_entry->command[0],
+                    timeout_entry->parameters,
+                    timeout_entry->time_to_block
+                );
+
+#ifdef WIN32
+                w_mutex_lock(&timeout_list_mutex);
+#endif
+                if (!OSList_AddData(timeout_list, timeout_entry)) {
+                    merror(LIST_ADD_ERROR);
+                    FreeTimeoutEntry(timeout_entry);
+                }
+#ifdef WIN32
+                w_mutex_unlock(&timeout_list_mutex);
+#endif
+            }
+        }
+
+        /* If it wasn't added before, continue execution */
+        if (!added_before) {
+            /* Continue command */
+            cJSON *existing_command = cJSON_GetObjectItem(json_root, "command");
+            if (existing_command) {
+                cJSON_ReplaceItemInObject(json_root, "command", cJSON_CreateString(CONTINUE_ENTRY));
+            } else {
+                cJSON_AddStringToObject(json_root, "command", CONTINUE_ENTRY);
+            }
+        } else {
+            /* Abort command */
+            cJSON *existing_command = cJSON_GetObjectItem(json_root, "command");
+            if (existing_command) {
+                cJSON_ReplaceItemInObject(json_root, "command", cJSON_CreateString(ABORT_ENTRY));
+            } else {
+                cJSON_AddStringToObject(json_root, "command", ABORT_ENTRY);
+            }
+        }
+
+        os_free(cmd_parameters);
+        cmd_parameters = cJSON_PrintUnformatted(json_root);
+
+        /* Send continue/abort message to AR script */
+        fprintf(wfd->file_in, "%s\n", cmd_parameters);
+        fflush(wfd->file_in);
+
+        LogArExitStatus(cmd[0], wpclose(wfd));
+        os_free(cmd_copy);
+#ifndef WIN32
+        (*childcount)++;
+#endif
+    } else {
+        merror(EXEC_CMD_FAIL, strerror(errno), errno);
+    }
+
+    os_free(cmd_parameters);
+    cJSON_Delete(json_root);
+}
+
+#ifndef WIN32
+
+void ExecdStart(int q)
+{
+    int childcount = 0;
+
+    char buffer[OS_MAXSTR + 1];
+
+    /* Select */
+    fd_set fdset;
+    struct timeval socket_timeout;
+
+    /* Clear the buffer */
+    memset(buffer, '\0', OS_MAXSTR + 1);
+
+#ifndef WAZUH_UNIT_TESTING
+    /* Create list for timeout */
+    timeout_list = OSList_Create();
+    if (!timeout_list) {
+        merror_exit(LIST_ERROR);
+    }
+#endif
+
+    RepeatedOffendersInit();
+
+    /* Main loop */
+    while (1) {
+        /* Clean up any children */
+        while (childcount) {
+            int wp;
+            wp = waitpid((pid_t) - 1, NULL, WNOHANG);
+            if (wp < 0 && errno != ECHILD) {
+                merror(WAITPID_ERROR, errno, strerror(errno));
+                break;
+            }
+            /* if = 0, we still need to wait for the child process */
+            else if (wp == 0) {
+                break;
+            }
+            /* Child completed if wp > 0 */
+            else {
+                childcount--;
+            }
+        }
+
+        ExecdTimeoutRun(&childcount);
+
+        /* Set timeout to EXECD_TIMEOUT */
+        socket_timeout.tv_sec = EXECD_TIMEOUT;
+        socket_timeout.tv_usec = 0;
+
+        /* Set FD values */
+        FD_ZERO(&fdset);
+        FD_SET(q, &fdset);
+
+        /* Add timeout */
+        if (select(q + 1, &fdset, NULL, NULL, &socket_timeout) == 0) {
+            /* Timeout */
+            continue;
+        }
+
+        /* Check for error */
+        if (!FD_ISSET(q, &fdset)) {
+            merror(SELECT_ERROR, errno, strerror(errno));
+            continue;
+        }
+
+        /* Receive the message */
+        if (OS_RecvUnix(q, OS_MAXSTR, buffer) == 0) {
+            merror(QUEUE_ERROR, EXECQUEUE, strerror(errno));
+            continue;
+        }
+
+        mdebug2("Received message: '%s'", buffer);
+
+        ExecdRun(buffer, &childcount);
+
+    #ifdef WAZUH_UNIT_TESTING
+        break;
+    #endif
+    }
+}
+
+#else
+
+int WinExecdStart()
+{
+    int c;
+    char *cfg = WAZUHCONF;
+    winexec_queue = queue_init(OS_SIZE_128);
+
+    /* Read config */
+    if ((c = ExecdConfig(cfg)) < 0) {
+        mlerror_exit(LOGLEVEL_ERROR, CONFIG_ERROR, cfg);
+    }
+
+    /* Active response disabled */
+    if (c == 1) {
+        minfo(EXEC_DISABLED);
+        return (0);
+    }
+
+    /* Create list for timeout */
+    timeout_list = OSList_Create();
+    if (!timeout_list) {
+        merror_exit(LIST_ERROR);
+    }
+
+    RepeatedOffendersInit();
+
+    /* Mutex to access timeout list */
+    w_mutex_init(&timeout_list_mutex, NULL);
+
+    /* Delete pending AR at succesfull exit */
+    atexit(ExecdShutdown);
+
+    /* Start up message */
+    minfo(STARTUP_MSG, getpid());
+
+    w_create_thread(NULL, 0, win_exec_main,
+                    winexec_queue, 0, NULL);
+
+    return (1);
+}
+
+// Create a thread to run windows AR simultaneous
+DWORD WINAPI win_exec_main(__attribute__((unused)) void * args) {
+    if (startup_gate_wait_for_ready("wazuh-execd") != STARTUP_GATE_READY) {
+        return 0;
+    }
+
+    ar_resolve_manager_hosts();
+
+    while(1) {
+        char* exec_msg = queue_pop_ex(winexec_queue);
+        if (exec_msg) {
+            mdebug2("Received message: '%s'", exec_msg);
+            ExecdRun(exec_msg);
+            os_free(exec_msg);
+        }
+    }
+}
+
+#endif

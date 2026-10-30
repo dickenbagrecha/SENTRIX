@@ -1,0 +1,98 @@
+/*
+ * Wazuh remoted module - Control endpoint configuration
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#ifndef _REMOTED_CONTROL_CONFIG_HPP
+#define _REMOTED_CONTROL_CONFIG_HPP
+
+#include "common/installPaths.hpp"
+#include "json.hpp"
+#include "remoted_module.h"
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+
+namespace remoted::control
+{
+    inline constexpr uint32_t kRegistryEvictionTtlSec = 21'600; // 6 hours
+    inline constexpr uint32_t kRegistryEvictionIntervalSec = 300;
+    inline constexpr uint32_t kKeepaliveThrottleSec = 60;
+    inline constexpr uint32_t kWdbRequestConnections = 4;
+    inline constexpr uint32_t kWdbRoundtripDeadlineMs = 2000;
+    /// End-to-end budget of one wazuh-db request, counted from the moment it is queued: queue wait,
+    /// reconnection and the round trip. kWdbRoundtripDeadlineMs bounds only the last of the three.
+    inline constexpr uint32_t kWdbRequestDeadlineMs = 5000;
+    inline constexpr uint32_t kWdbMaxQueueSize = 10'000;
+    /// RegistryLookup (the /download fallback): its own wazuh-db connections, and the requests one
+    /// lookup, and all lookups together, may hold before new ones are refused (503).
+    inline constexpr uint32_t kLookupConnections = 2;
+    inline constexpr uint32_t kLookupMaxWaitersPerAgent = 32;
+    inline constexpr uint32_t kLookupMaxWaiters = 1024;
+    inline constexpr uint32_t kGroupsRefreshIntervalSec = 60;
+    inline constexpr uint32_t kTmConcurrency = 4;
+    inline constexpr uint32_t kTaskMaxQueueSize = 10'000;
+    inline constexpr uint32_t kTmDeadlineMs = 2000;
+    inline constexpr size_t kFileHashBufferSize = 8192;
+    inline constexpr size_t kInotifyBufferSize = 4096;
+
+    /// Connect deadline for the task manager, separate from kTmDeadlineMs, which bounds the whole
+    /// round trip. Reaching a socket on the same host either works almost immediately or is not
+    /// going to; a slow connect is really an absent task manager.
+    inline constexpr int kTaskConnectTimeoutMs = 2000;
+
+    inline constexpr const char* kTaskSocketPath = paths::kTaskSocket;
+
+    /// The task manager route that hands over an agent's pending tasks and marks them delivered.
+    inline constexpr const char* kTaskPendingRoute = "/v1/tasks/pending";
+    inline constexpr const char* kWdbSocketPath = paths::kWdbSocket;
+    inline constexpr const char* kSharedGroupsRoot = paths::kSharedDir;
+    inline constexpr const char* kMultiGroupsRoot = paths::kMultigroupsDir;
+
+    struct Config
+    {
+        std::string clusterName;
+        bool isWorkerNode = false;
+        std::string managerVersion;
+        bool allowHigherVersions = false;
+
+        nlohmann::json limits;
+
+        std::string wdbSocketPath = kWdbSocketPath;
+        std::string taskSocketPath = kTaskSocketPath;
+        std::string sharedGroupsRoot = kSharedGroupsRoot;
+        std::string multiGroupsRoot = kMultiGroupsRoot;
+
+        uint32_t wdbRequestConnections = kWdbRequestConnections;
+        uint32_t wdbRoundtripDeadlineMs = kWdbRoundtripDeadlineMs;
+        uint32_t wdbRequestDeadlineMs = kWdbRequestDeadlineMs;
+        uint32_t wdbMaxQueueSize = kWdbMaxQueueSize;
+        uint32_t groupsRefreshIntervalSec = kGroupsRefreshIntervalSec;
+        uint32_t tmConcurrency = kTmConcurrency;
+        uint32_t tmDeadlineMs = kTmDeadlineMs;
+        uint32_t tmMaxQueueSize = kTaskMaxQueueSize;
+        uint32_t keepaliveThrottleSec = kKeepaliveThrottleSec;
+        uint32_t registryEvictionTtlSec = kRegistryEvictionTtlSec;
+
+        /// Where the CA bundle's published generation comes from on the notify path (RF-3): the
+        /// facade binds it to the HTTPS listener's CaCertificateSource through
+        /// IHttpServer::caDescriptor(), which revalidates at most once a second (C8/C18), so a
+        /// notify storm never turns into a read storm. `nullopt` means there is no servable bundle
+        /// at all (`ca_generation: null` on the wire), 0 means there is one and no guard vouched
+        /// for it. An EMPTY function is "this manager has no such provider": the response then
+        /// carries no `ca_generation` at all, which is exactly what a build without the listener
+        /// (buildControlConfig() never sets this) and the tests' bare Config do.
+        std::function<std::optional<std::int64_t>()> caGenerationProvider;
+    };
+
+    Config buildControlConfig(const remoted_module_config_t& c);
+
+} // namespace remoted::control
+
+#endif // _REMOTED_CONTROL_CONFIG_HPP

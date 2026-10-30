@@ -1,0 +1,251 @@
+name: 5.X - Manager config - Unit tests
+
+on:
+  pull_request:
+    types: [synchronize, opened, reopened, ready_for_review]
+    paths:
+      - ".github/workflows/5_testunit_managerconfig.yml"
+      # Library, schema (embedded at configure time, MANAGER_CONFIG_SCHEMA_FILE in CMakeLists.txt), CLI, GTest, vectors,
+      # tests/cli/manager_conf_cli_test.sh and tests/parity.py.
+      - "src/shared_modules/manager_config/**"
+      # bin/wazuh-manager-conf re-spells error_messages.h's NO_CONFIG/CONFIG_INVALID (cli/manager-conf.cpp);
+      # manager_config_cli asserts those (1244)/(1239) texts.
+      - "src/shared/include/error_messages/error_messages.h"
+      # The end-to-end suite (manager_config_cli) runs the real generator and asserts that the
+      # configuration the installer writes is accepted by the strict loader. Exactly what it executes:
+      # the mirror holds only src/init/*.sh, etc/ and VERSION.json (MIRROR in manager_conf_cli_test.sh);
+      # gen_wazuh.sh sources shared.sh and inst-functions.sh (its `conf` branch), which sources
+      # template-select.sh (at the top of inst-functions.sh); shared.sh reads VERSION.json (VERSION,
+      # REVISION); WriteManager() reads only the seven generic templates below (inst-functions.sh's *_TEMPLATE).
+      - "src/init/gen_wazuh.sh"
+      - "src/init/shared.sh"
+      - "src/init/inst-functions.sh"
+      - "src/init/template-select.sh"
+      - "etc/templates/config/generic/header-comments.template"
+      - "etc/templates/config/generic/global.template"
+      - "etc/templates/config/generic/logging.template"
+      - "etc/templates/config/generic/wodle-vulnerability-detection.manager.template"
+      - "etc/templates/config/generic/wodle-indexer.manager.template"
+      - "etc/templates/config/generic/auth.template"
+      - "etc/templates/config/generic/cluster.template"
+      # The installer-scripts suite runs the shell helpers that replaced sed/grep/awk in the scripts
+      # above, in dist-detect.sh (RPM %post) and in the two Python wrappers, each beside the command it
+      # replaced.
+      - "src/init/dist-detect.sh"
+      - "src/init/tests/test_installer_text_tools.sh"
+      - "framework/wrappers/generic_wrapper.sh"
+      - "api/wrappers/generic_wrapper.sh"
+      # Configure path: build_target_cpp configures src/ as one tree -- src/CMakeLists.txt (registers
+      # this module with add_subdirectory(shared_modules/manager_config), includes src/cmake/*.cmake by
+      # include(WazuhRpath)/include(WazuhJemalloc) -- wazuh_set_runtime_rpath comes from WazuhRpath.cmake --
+      # and reads VERSION.json into VERSION_JSON) and src/external/CMakeLists.txt,
+      # which defines ext_pugixml/ext_rapidjson linked here.
+      - "src/CMakeLists.txt"
+      - "src/cmake/**"
+      - "src/external/CMakeLists.txt"
+      - "VERSION.json"
+      # build_external_deps runs `make deps`/`make build-external` (src/Makefile; its ref list comes
+      # from tools/get_git_refs.sh, GIT_REFS_LIST in src/Makefile) and builds the http-request submodule
+      # (its "Build http-request" step, also configured by add_subdirectory(shared_modules/http-request)
+      # in src/CMakeLists.txt). A submodule bump changes only
+      # the gitlink path, which `http-request/**` would never match.
+      - "src/Makefile"
+      - "src/deps.lock.mk"
+      - "tools/get_git_refs.sh"
+      - "src/shared_modules/http-request"
+      # Result-affecting actions this workflow executes (reinstall_cmake runs the devContainer script,
+      # its `sudo tools/devContainer/reinstall-cmake.sh` step). upload_s3_artifact is left out on purpose: coverage_cpp calls
+      # it with continue-on-error (coverage_cpp's "Uploading coverage report" step), so it can only report, and the
+      # agent package and -rtr lanes exercise it on PRs.
+      - ".github/actions/build_external_deps/**"
+      - ".github/actions/build_target_cpp/**"
+      - ".github/actions/coverage_cpp/**"
+      - ".github/actions/test_cpp/**"
+      - ".github/actions/reinstall_cmake/**"
+      - "tools/devContainer/reinstall-cmake.sh"
+      - ".github/actions/setup-sccache/**"
+      # Prose: no build or test reads it.
+      - "!src/shared_modules/manager_config/README.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  managerconfig-modules:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Cancel previous runs
+        uses: fkirc/skip-duplicate-actions@v5.3.2
+        with:
+          cancel_others: 'true'
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          skip_after_successful_duplicate: 'false'
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # No build needed, so it runs first: the installer's text handling without sed, grep or awk,
+      # checked against those tools under both shells the packages may use.
+      - name: Installer scripts - text handling (dash and bash)
+        run: |
+          sh src/init/tests/test_installer_text_tools.sh
+          bash src/init/tests/test_installer_text_tools.sh
+
+      - name: Install a compatible CMake
+        uses: ./.github/actions/reinstall_cmake
+      # Compilation cache (issue 38139). Skipped on fork PRs (no credentials).
+      - name: "Configure AWS credentials for the compilation cache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.CI_AWS_REGION }}
+          role-duration-seconds: 7200
+      - name: "Set up sccache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/setup-sccache
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          region: ${{ secrets.CI_AWS_REGION }}
+          key-prefix: sccache/5.0.0
+
+      # Mandatory: the library links ext_pugixml and ext_rapidjson, and the test target links
+      # gtest/gmock from src/external/googletest/lib, all produced by this action.
+      - name: Project dependencies
+        uses: ./.github/actions/build_external_deps
+
+      # manager_config_parity runs tests/parity.py, which imports jsonschema (Draft4Validator) to
+      # cross-check the schema against the same vectors as the library. Installed before the build
+      # because the test is only registered when CMake finds a python3 interpreter.
+      - name: Install parity check dependencies
+        uses: awalsh128/cache-apt-pkgs-action@v1.4.3
+        with:
+          packages: python3-jsonschema
+          version: 1.0
+
+      # No -DTARGET is passed, so IS_AGENT stays FALSE and the server-only branch that owns
+      # add_subdirectory(shared_modules/manager_config) is the one configured.
+      - name: Manager config - Build tests
+        uses: ./.github/actions/build_target_cpp
+        with:
+          target: "manager_config_utest"
+          test: "true"
+          asan: "false"
+
+      # Second target, not a duplicate: manager_config_cli executes bin/wazuh-manager-conf (over the
+      # vectors and over the configuration gen_wazuh.sh generates) and the CLI is not a build
+      # dependency of the test binary, so without this step that test would run against nothing.
+      - name: Manager config - Build the configuration CLI
+        uses: ./.github/actions/build_target_cpp
+        with:
+          target: "wazuh-manager-conf"
+          test: "true"
+          asan: "false"
+
+      # manager_config_parity is registered only when find_program() finds python3
+      # (find_program(MANAGER_CONFIG_PYTHON) in tests/unit/CMakeLists.txt, HINTS $ENV{TMP_PY_VENV}/bin with NO_DEFAULT_PATH, so it
+      # resolves through /bin only by luck of the runner layout), and ctest -L passes over a test that
+      # was never registered. Fail here instead of running 2 of 3 suites green.
+      - name: Manager config - Fail if a suite is not registered
+        shell: bash
+        run: |
+          set -euo pipefail
+          registered=$(cd src/build && ctest -N -L manager_config)
+          for t in manager_config_utest manager_config_cli manager_config_parity; do
+            if ! printf '%s\n' "$registered" | grep -qE "Test +#[0-9]+: ${t}\$"; then
+              echo "::error::ctest test '${t}' is not registered under the manager_config label"
+              exit 1
+            fi
+          done
+
+      # `manager_config` is the module-wide ctest label: it selects the GTest, the CLI end-to-end
+      # suite and the jsonschema parity check (tests/unit/CMakeLists.txt).
+      #
+      # Valgrind is deliberately off: test_cpp runs `valgrind ctest` without --trace-children=yes, so
+      # the test binaries are not instrumented anyway, and two of the three tests are a shell script
+      # and a Python script. The ASAN job below is the memory gate that matters here.
+      - name: Manager config - Run tests
+        uses: ./.github/actions/test_cpp
+        with:
+          valgrind: "false"
+          target: "manager_config"
+
+      # Coverage is reported, not gated (threshold 0): the point of this workflow is that the suites
+      # run at all, which they did not before. The lcov report is uploaded as an artifact so the team
+      # can pin a real floor once the number has a history.
+      - name: Manager config - Coverage
+        uses: ./.github/actions/coverage_cpp
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          aws_role: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          path: src/shared_modules/manager_config
+          test_directory: src/shared_modules/manager_config
+          id: manager_config
+          threshold: "0"
+          validate_function_coverage: "false"
+      - name: "Compilation cache statistics"
+        if: always()
+        run: sccache --show-stats 2>/dev/null | grep -viE "cache location|bucket" || true
+
+  managerconfig-asan:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install a compatible CMake
+        uses: ./.github/actions/reinstall_cmake
+      # Compilation cache (issue 38139). Skipped on fork PRs (no credentials).
+      - name: "Configure AWS credentials for the compilation cache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.CI_AWS_REGION }}
+          role-duration-seconds: 7200
+      - name: "Set up sccache"
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/setup-sccache
+        with:
+          bucket: ${{ secrets.CI_INTERNAL_S3_BUCKET }}
+          region: ${{ secrets.CI_AWS_REGION }}
+          key-prefix: sccache/5.0.0
+
+      - name: Project dependencies
+        uses: ./.github/actions/build_external_deps
+
+      - name: Manager config - Build tests
+        uses: ./.github/actions/build_target_cpp
+        with:
+          target: "manager_config_utest"
+          test: "true"
+          asan: "true"
+
+      # This job is not a redundant second run: build_target_cpp's asan mode compiles with
+      # -fsanitize=address,undefined,leak, and this library walks a pugixml DOM to build a rapidjson
+      # document -- string views into freed nodes, out-of-range indexes while typing a value from the
+      # schema, or an unsigned overflow in a duration or size conversion all yield a plausible value
+      # and a green test without a sanitizer.
+      #
+      # Only the GTest label is selected here, on purpose. The CLI end-to-end suite asserts exact
+      # exit codes and an empty stderr, both of which a leak report from the sanitized binary would
+      # break, and the parity check is pure Python: neither says anything about memory safety.
+      - name: Manager config - Run tests
+        uses: ./.github/actions/test_cpp
+        with:
+          target: "manager_config_utest"
+          valgrind: "false"

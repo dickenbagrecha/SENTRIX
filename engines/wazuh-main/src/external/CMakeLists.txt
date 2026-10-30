@@ -1,0 +1,1737 @@
+# Copyright (C) Wazuh Inc. External dependencies build orchestrator
+
+include(ExternalProject)
+
+# ==============================================================================
+# Common settings
+# ==============================================================================
+
+set(EXTERNAL_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Detect platform
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(IS_LINUX TRUE)
+  set(IS_DARWIN FALSE)
+  set(IS_WINDOWS FALSE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(IS_LINUX FALSE)
+  set(IS_DARWIN TRUE)
+  set(IS_WINDOWS FALSE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  set(IS_LINUX FALSE)
+  set(IS_DARWIN FALSE)
+  set(IS_WINDOWS TRUE)
+endif()
+
+# Detect architecture
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(IS_AARCH64 TRUE)
+else()
+  set(IS_AARCH64 FALSE)
+endif()
+
+# MinGW cross-compilation prefix
+if(IS_WINDOWS)
+  set(MINGW_PREFIX "i686-w64-mingw32-")
+  set(MINGW_HOST "i686-w64-mingw32")
+  set(MINGW_CC "${MINGW_PREFIX}gcc")
+else()
+  set(MINGW_PREFIX "")
+  set(MINGW_HOST "")
+  set(MINGW_CC "${CMAKE_C_COMPILER}")
+endif()
+
+# ==============================================================================
+# Flags inherited from the project
+# ==============================================================================
+
+include(WazuhExternalFlags)
+
+# These libraries add a "d" postfix to their file name in a Debug build; the
+# targets that link them expect the plain name, which the precompiled ones have.
+function(deps_debug_alias target dir lib)
+  if(DEPS_BUILD_TYPE STREQUAL "Debug")
+    ExternalProject_Add_Step(
+      ${target} debug_alias
+      COMMAND ${CMAKE_COMMAND} -E copy ${dir}/${lib}d.a ${dir}/${lib}.a
+      DEPENDEES build)
+  endif()
+endfunction()
+
+# ==============================================================================
+# Section 1: Autotools-based dependencies (ExternalProject_Add)
+# ==============================================================================
+
+# deps-entry openssl: begin
+# ------------------------------------------------------------------------------
+# OpenSSL
+# ------------------------------------------------------------------------------
+
+set(OPENSSL_FLAGS "enable-weak-ssl-ciphers;no-shared")
+
+if(IS_WINDOWS)
+  # mingw keeps the POSIX default prefix, so the openssl.cnf, provider and engine
+  # directories compiled into libcrypto land under C:\usr\local, which any user can
+  # create on most hosts (CVE-2019-1552). All three derive from --prefix, and only
+  # administrators can create folders in C:\Program Files, on 32- and 64-bit Windows
+  # alike, as long as C: is the system drive. Configure takes a non-POSIX prefix only
+  # when cross-compiling, hence the cross prefix instead of a prefixed CC.
+  set(OPENSSL_CONFIGURE_CMD ${EXTERNAL_DIR}/openssl/Configure ${OPENSSL_FLAGS}
+                            mingw --cross-compile-prefix=${MINGW_PREFIX}
+                            "--prefix=C:/Program Files/ossec-agent")
+  set(OPENSSL_ENV CC=gcc RC=windres)
+elseif(IS_DARWIN)
+  if(IS_AARCH64)
+    set(OPENSSL_CONFIGURE_CMD ${EXTERNAL_DIR}/openssl/Configure
+                              ${OPENSSL_FLAGS} darwin64-arm64-cc)
+  else()
+    set(OPENSSL_CONFIGURE_CMD ${EXTERNAL_DIR}/openssl/Configure
+                              ${OPENSSL_FLAGS} darwin64-x86_64-cc)
+  endif()
+  set(OPENSSL_ENV "")
+else()
+  set(OPENSSL_CONFIGURE_CMD ${EXTERNAL_DIR}/openssl/config ${OPENSSL_FLAGS})
+  set(OPENSSL_ENV "")
+endif()
+
+# Check if precompiled libraries exist
+if(EXISTS ${EXTERNAL_DIR}/openssl/libssl.a
+   AND EXISTS ${EXTERNAL_DIR}/openssl/libcrypto.a)
+  message(STATUS "Using precompiled OpenSSL libraries")
+  add_custom_target(openssl_external)
+else()
+  ExternalProject_Add(
+    openssl_external
+    SOURCE_DIR ${EXTERNAL_DIR}/openssl
+    CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env ${OPENSSL_ENV}
+                      ${OPENSSL_CONFIGURE_CMD}
+    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} build_libs
+    BUILD_IN_SOURCE TRUE
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS ${EXTERNAL_DIR}/openssl/libssl.a
+                     ${EXTERNAL_DIR}/openssl/libcrypto.a)
+
+  if(IS_WINDOWS)
+    find_program(MINGW_RANLIB i686-w64-mingw32-ranlib REQUIRED)
+    ExternalProject_Add_Step(
+      openssl_external ranlib_libs
+      COMMAND ${MINGW_RANLIB} ${EXTERNAL_DIR}/openssl/libssl.a
+              ${EXTERNAL_DIR}/openssl/libcrypto.a
+      DEPENDEES build
+      COMMENT "Running ranlib on OpenSSL libraries")
+  endif()
+endif()
+
+add_library(openssl_ssl STATIC IMPORTED GLOBAL)
+set_target_properties(openssl_ssl PROPERTIES IMPORTED_LOCATION
+                                             ${EXTERNAL_DIR}/openssl/libssl.a)
+target_include_directories(openssl_ssl
+                           INTERFACE ${EXTERNAL_DIR}/openssl/include)
+add_dependencies(openssl_ssl openssl_external)
+add_library(ssl ALIAS openssl_ssl)
+
+add_library(openssl_crypto STATIC IMPORTED GLOBAL)
+set_target_properties(
+  openssl_crypto PROPERTIES IMPORTED_LOCATION
+                            ${EXTERNAL_DIR}/openssl/libcrypto.a)
+target_include_directories(openssl_crypto
+                           INTERFACE ${EXTERNAL_DIR}/openssl/include)
+add_dependencies(openssl_crypto openssl_external)
+add_library(crypto ALIAS openssl_crypto)
+
+# Set variables for modules that use find_library()
+set(OPENSSL_LIB
+    ${EXTERNAL_DIR}/openssl/libssl.a
+    CACHE FILEPATH "OpenSSL SSL library" FORCE)
+set(OPENSSL_CRYPTO_LIB
+    ${EXTERNAL_DIR}/openssl/libcrypto.a
+    CACHE FILEPATH "OpenSSL Crypto library" FORCE)
+# deps-entry openssl: end
+
+# deps-entry zlib: begin
+# ------------------------------------------------------------------------------
+# zlib
+# ------------------------------------------------------------------------------
+
+if(EXISTS ${EXTERNAL_DIR}/zlib/libz.a)
+  message(STATUS "Using precompiled zlib library")
+  add_custom_target(zlib_external)
+else()
+  if(IS_WINDOWS)
+    ExternalProject_Add(
+      zlib_external
+      SOURCE_DIR ${EXTERNAL_DIR}/zlib
+      CONFIGURE_COMMAND ${CMAKE_COMMAND} -E copy ${EXTERNAL_DIR}/zlib/zconf.h.in
+                        ${EXTERNAL_DIR}/zlib/zconf.h
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -f win32/Makefile.gcc
+                    PREFIX=${MINGW_PREFIX} libz.a
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/zlib/libz.a)
+  else()
+    ExternalProject_Add(
+      zlib_external
+      SOURCE_DIR ${EXTERNAL_DIR}/zlib
+      CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}"
+                        ${EXTERNAL_DIR}/zlib/configure
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} libz.a
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/zlib/libz.a)
+  endif()
+endif()
+
+add_library(ext_zlib STATIC IMPORTED GLOBAL)
+set_target_properties(ext_zlib PROPERTIES IMPORTED_LOCATION
+                                          ${EXTERNAL_DIR}/zlib/libz.a)
+add_dependencies(ext_zlib zlib_external)
+target_include_directories(ext_zlib INTERFACE ${EXTERNAL_DIR}/zlib)
+
+# ------------------------------------------------------------------------------
+# minizip (depends on zlib)
+# ------------------------------------------------------------------------------
+
+# The agent never links minizip — only the server does (engine,
+# content_manager). It is still built for the agent target because
+# libminizip.a lives inside the zlib tree (zlib/contrib/minizip/) and the
+# precompiled zlib dependency published on packages.wazuh.com already
+# includes it. Building it here too keeps the agent's external tree aligned
+# with that shared zlib tarball instead of diverging from it. Windows
+# genuinely never needs it.
+if(NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/zlib/contrib/minizip/libminizip.a)
+    message(STATUS "Using precompiled minizip library")
+    add_custom_target(minizip_external)
+  else()
+    ExternalProject_Add(
+      minizip_external
+      SOURCE_DIR ${EXTERNAL_DIR}/zlib/contrib/minizip
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND
+        ${CMAKE_C_COMPILER} -fPIC ${DEPS_CFLAGS_LIST} -c
+        ${EXTERNAL_DIR}/zlib/contrib/minizip/unzip.c
+        ${EXTERNAL_DIR}/zlib/contrib/minizip/ioapi.c -I${EXTERNAL_DIR}/zlib
+      COMMAND ar rcs ${EXTERNAL_DIR}/zlib/contrib/minizip/libminizip.a unzip.o
+              ioapi.o
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      DEPENDS zlib_external
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/zlib/contrib/minizip/libminizip.a)
+  endif()
+
+  add_library(ext_minizip STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_minizip PROPERTIES IMPORTED_LOCATION
+                           ${EXTERNAL_DIR}/zlib/contrib/minizip/libminizip.a)
+  add_dependencies(ext_minizip minizip_external)
+  target_include_directories(ext_minizip INTERFACE ${EXTERNAL_DIR}/zlib/contrib)
+  add_library(minizip ALIAS ext_minizip)
+endif()
+# deps-entry zlib: end
+
+# deps-entry libyaml: begin
+# ------------------------------------------------------------------------------
+# libyaml
+# ------------------------------------------------------------------------------
+
+if(IS_WINDOWS)
+  set(LIBYAML_CONFIGURE_CMD
+      ${CMAKE_COMMAND}
+      -E
+      env
+      CC=${MINGW_CC}
+      "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}"
+      ${EXTERNAL_DIR}/libyaml/configure
+      --host=${MINGW_HOST}
+      --enable-static=yes)
+else()
+  set(LIBYAML_CONFIGURE_CMD
+      ${CMAKE_COMMAND}
+      -E
+      env
+      "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}"
+      ${EXTERNAL_DIR}/libyaml/configure
+      --enable-static=yes
+      --enable-shared=no)
+endif()
+
+if(EXISTS ${EXTERNAL_DIR}/libyaml/src/.libs/libyaml.a)
+  message(STATUS "Using precompiled libyaml library")
+  add_custom_target(libyaml_external)
+else()
+  ExternalProject_Add(
+    libyaml_external
+    SOURCE_DIR ${EXTERNAL_DIR}/libyaml
+    CONFIGURE_COMMAND ${LIBYAML_CONFIGURE_CMD}
+    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+    BUILD_IN_SOURCE TRUE
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS ${EXTERNAL_DIR}/libyaml/src/.libs/libyaml.a)
+endif()
+
+add_library(ext_libyaml STATIC IMPORTED GLOBAL)
+set_target_properties(
+  ext_libyaml PROPERTIES IMPORTED_LOCATION
+                         ${EXTERNAL_DIR}/libyaml/src/.libs/libyaml.a)
+add_dependencies(ext_libyaml libyaml_external)
+# deps-entry libyaml: end
+
+# deps-entry curl: begin
+# ------------------------------------------------------------------------------
+# curl (depends on OpenSSL)
+# ------------------------------------------------------------------------------
+
+if(IS_WINDOWS)
+  # OpenSSL, not Schannel. Schannel cannot negotiate TLS 1.3 before Windows 11
+  # / Server 2022, and it does not advertise SSLSUPP_TLS13_CIPHERSUITES, so
+  # CURLOPT_TLS13_CIPHERS comes back CURLE_NOT_BUILT_IN. The manager's HTTPS
+  # listener pins a hardcoded TLS 1.3 floor, so a Schannel agent cannot reach
+  # it at all on those Windows versions. The rest of the agent (ssl_op.c,
+  # enrollment, authd) already links the mingw OpenSSL built above, so pointing
+  # curl at the same tree costs no extra dependency. Callers must set
+  # CURLSSLOPT_NATIVE_CA to keep validating against the Windows certificate
+  # store, which Schannel used to give us for free.
+  #
+  # _WIN32_WINNT=0x0600 (Vista) is the rest of the project's target — see
+  # src/syscheckd/CMakeLists.txt, src/wazuh_modules/CMakeLists.txt, etc.
+  # Curl ≥ 8.x's configure refuses to build for anything older. MinGW 12+
+  # already defaults to 0x0A00 (Win10) and would pass the configure check
+  # implicitly, but the compile_windows_agent image (ubuntu:22.04) ships
+  # MinGW 10, which still defaults to 0x0501 (XP). Set it explicitly so the
+  # build is portable across MinGW versions.
+  #
+  # --with-openssl=DIR searches DIR/lib, but our OpenSSL builds in-source, so
+  # the archives sit at DIR/ — hence the explicit -L, same as the Linux and
+  # Darwin arms. LIBS is what configure's own OpenSSL probe needs to link:
+  # libcrypto's Windows engine calls into the certificate store (crypt32) and
+  # its socket BIO into winsock (ws2_32), and without both, `HMAC_Update in
+  # -lcrypto` fails and configure aborts with "OpenSSL could not be detected".
+  set(CURL_CONFIGURE_CMD
+      ${CMAKE_COMMAND}
+      -E
+      env
+      "CFLAGS=-fPIC -D_WIN32_WINNT=0x0600"
+      "LDFLAGS=-L${EXTERNAL_DIR}/openssl"
+      "LIBS=-lcrypt32 -lws2_32"
+      CC=${MINGW_CC}
+      ${EXTERNAL_DIR}/curl/configure
+      --host=${MINGW_HOST}
+      PREFIX=${MINGW_PREFIX}
+      --enable-static=yes
+      --disable-shared
+      --with-openssl=${EXTERNAL_DIR}/openssl
+      --disable-ldap
+      --without-libidn2
+      --without-libpsl
+      --without-zstd)
+elseif(IS_LINUX)
+  if(IS_AARCH64)
+    set(CURL_BUILD_FLAG "--build=${CMAKE_SYSTEM_PROCESSOR}-unknown-linux-gnu")
+  else()
+    set(CURL_BUILD_FLAG "")
+  endif()
+  # curl ≥ 8.20 needs zlib ≥ 1.2.5.2 (z_const, inflateReset2). centos:6 ships
+  # zlib 1.2.3, so point configure at the externally-built zlib regardless of
+  # leg.
+  set(CURL_CONFIGURE_CMD
+      ${CMAKE_COMMAND}
+      -E
+      env
+      ${DEPS_CFLAGS_ENV}
+      "CPPFLAGS=-fPIC -I${EXTERNAL_DIR}/openssl/include -I${EXTERNAL_DIR}/zlib"
+      "LDFLAGS=-L${EXTERNAL_DIR}/openssl -L${EXTERNAL_DIR}/zlib"
+      "LIBS=-ldl -lpthread"
+      ${EXTERNAL_DIR}/curl/configure
+      --with-openssl=${EXTERNAL_DIR}/openssl
+      --with-zlib
+      --disable-ldap
+      --without-libidn2
+      --without-libpsl
+      --without-brotli
+      --without-nghttp2
+      --without-zstd
+      ${CURL_BUILD_FLAG})
+else() # Darwin
+  set(CURL_CONFIGURE_CMD
+      ${CMAKE_COMMAND}
+      -E
+      env
+      ${DEPS_CFLAGS_ENV}
+      "CPPFLAGS=-fPIC -I${EXTERNAL_DIR}/openssl/include"
+      "LDFLAGS=-L${EXTERNAL_DIR}/openssl"
+      "LIBS=-lpthread"
+      ${EXTERNAL_DIR}/curl/configure
+      --with-openssl=${EXTERNAL_DIR}/openssl
+      --with-apple-sectrust
+      --disable-ldap
+      --without-libidn2
+      --without-brotli
+      --without-nghttp2
+      --without-librtmp
+      --without-zstd
+      --without-libpsl)
+endif()
+# curl's configure sets its own -O level; CFLAGS alone do not change it.
+if(DEPS_BUILD_TYPE STREQUAL "Debug")
+  list(APPEND CURL_CONFIGURE_CMD --disable-optimize)
+endif()
+
+if(EXISTS ${EXTERNAL_DIR}/curl/lib/.libs/libcurl.a)
+  message(STATUS "Using precompiled curl library")
+  add_custom_target(curl_external)
+else()
+  ExternalProject_Add(
+    curl_external
+    SOURCE_DIR ${EXTERNAL_DIR}/curl
+    CONFIGURE_COMMAND ${CURL_CONFIGURE_CMD}
+    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -C lib
+    BUILD_IN_SOURCE TRUE
+    INSTALL_COMMAND ""
+    DEPENDS openssl_external zlib_external
+    BUILD_BYPRODUCTS ${EXTERNAL_DIR}/curl/lib/.libs/libcurl.a)
+endif()
+
+add_library(ext_curl STATIC IMPORTED GLOBAL)
+set_target_properties(
+  ext_curl PROPERTIES IMPORTED_LOCATION
+                      ${EXTERNAL_DIR}/curl/lib/.libs/libcurl.a)
+add_dependencies(ext_curl curl_external)
+# deps-entry curl: end
+
+# deps-entry libpcre2: begin
+# ------------------------------------------------------------------------------
+# PCRE2
+# ------------------------------------------------------------------------------
+
+if(IS_WINDOWS)
+  set(PCRE2_CONFIGURE_CMD
+      ${CMAKE_COMMAND}
+      -E
+      env
+      "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}"
+      CC=${MINGW_CC}
+      ${EXTERNAL_DIR}/libpcre2/configure
+      --enable-jit=no
+      --host=${MINGW_HOST}
+      --disable-shared)
+else()
+  set(PCRE2_CONFIGURE_CMD
+      ${CMAKE_COMMAND}
+      -E
+      env
+      "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}"
+      ${EXTERNAL_DIR}/libpcre2/configure
+      --enable-jit=auto
+      --disable-shared)
+endif()
+
+if(EXISTS ${EXTERNAL_DIR}/libpcre2/.libs/libpcre2-8.a)
+  message(STATUS "Using precompiled PCRE2 library")
+  add_custom_target(pcre2_external)
+else()
+  ExternalProject_Add(
+    pcre2_external
+    SOURCE_DIR ${EXTERNAL_DIR}/libpcre2
+    CONFIGURE_COMMAND ${PCRE2_CONFIGURE_CMD}
+    # Library and headers only: pcre2posix_test and the tools do not link with MinGW.
+    BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} PROGRAMS=
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${EXTERNAL_DIR}/libpcre2/include
+    COMMAND ${CMAKE_COMMAND} -E copy ${EXTERNAL_DIR}/libpcre2/src/pcre2.h
+            ${EXTERNAL_DIR}/libpcre2/include/pcre2.h
+    BUILD_IN_SOURCE TRUE
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS ${EXTERNAL_DIR}/libpcre2/.libs/libpcre2-8.a)
+endif()
+
+add_library(ext_pcre2 STATIC IMPORTED GLOBAL)
+set_target_properties(
+  ext_pcre2 PROPERTIES IMPORTED_LOCATION
+                       ${EXTERNAL_DIR}/libpcre2/.libs/libpcre2-8.a)
+add_dependencies(ext_pcre2 pcre2_external)
+add_library(pcre2-8 ALIAS ext_pcre2)
+# deps-entry libpcre2: end
+
+# deps-entry audit-userspace: begin
+# ------------------------------------------------------------------------------
+# audit-userspace (Linux agent only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND IS_AGENT)
+  if(EXISTS ${EXTERNAL_DIR}/audit-userspace/lib/.libs/libaudit.a)
+    message(STATUS "Using precompiled audit library")
+    add_custom_target(audit_external)
+  else()
+    ExternalProject_Add(
+      audit_external
+      SOURCE_DIR ${EXTERNAL_DIR}/audit-userspace
+      CONFIGURE_COMMAND ${EXTERNAL_DIR}/audit-userspace/autogen.sh
+      COMMAND ${CMAKE_COMMAND} -E env "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}"
+              ${EXTERNAL_DIR}/audit-userspace/configure --with-libcap-ng=no
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -C lib
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/audit-userspace/lib/.libs/libaudit.a)
+  endif()
+
+  add_library(ext_audit STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_audit PROPERTIES IMPORTED_LOCATION
+                         ${EXTERNAL_DIR}/audit-userspace/lib/.libs/libaudit.a)
+  add_dependencies(ext_audit audit_external)
+endif()
+# deps-entry audit-userspace: end
+
+# deps-entry libffi: begin
+# ------------------------------------------------------------------------------
+# libffi (not for agent target)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT)
+  # libffi builds in architecture-specific subdirectory (e.g.,
+  # x86_64-pc-linux-gnu) Find precompiled library in any architecture
+  # subdirectory
+  file(GLOB LIBFFI_PRECOMPILED "${EXTERNAL_DIR}/libffi/*/.libs/libffi.a")
+  if(LIBFFI_PRECOMPILED)
+    list(GET LIBFFI_PRECOMPILED 0 LIBFFI_LIBRARY)
+    message(STATUS "Using precompiled libffi library: ${LIBFFI_LIBRARY}")
+    add_custom_target(libffi_external)
+  else()
+    # libffi's top-level configure is a wrapper that re-execs the real
+    # configure inside a build subdirectory and leaves the static archive
+    # at libffi/<builddir>/.libs/libffi.a — never at libffi/.libs/libffi.a.
+    # The subdir name is non-deterministic (it defaults to a value derived
+    # from the build environment), so we pin it with --enable-builddir and
+    # point BUILD_BYPRODUCTS / LIBFFI_LIBRARY at that fixed location.
+    ExternalProject_Add(
+      libffi_external
+      SOURCE_DIR ${EXTERNAL_DIR}/libffi
+      CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}"
+                        ${EXTERNAL_DIR}/libffi/configure --enable-builddir=build
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/libffi/build/.libs/libffi.a)
+
+    set(LIBFFI_LIBRARY ${EXTERNAL_DIR}/libffi/build/.libs/libffi.a)
+  endif()
+
+  add_library(ext_libffi STATIC IMPORTED GLOBAL)
+  set_target_properties(ext_libffi PROPERTIES IMPORTED_LOCATION
+                                              ${LIBFFI_LIBRARY})
+  add_dependencies(ext_libffi libffi_external)
+endif()
+# deps-entry libffi: end
+
+# deps-entry libplist: begin
+# ------------------------------------------------------------------------------
+# libplist (macOS only)
+# ------------------------------------------------------------------------------
+
+if(IS_DARWIN)
+  if(EXISTS ${EXTERNAL_DIR}/libplist/bin/lib/libplist-2.0.a)
+    message(STATUS "Using precompiled libplist library")
+    add_custom_target(libplist_external)
+  else()
+    ExternalProject_Add(
+      libplist_external
+      SOURCE_DIR ${EXTERNAL_DIR}/libplist
+      CONFIGURE_COMMAND ${EXTERNAL_DIR}/libplist/autogen.sh
+                        --prefix=${EXTERNAL_DIR}/libplist/bin --without-cython
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+      INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
+      BUILD_IN_SOURCE TRUE
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/libplist/bin/lib/libplist-2.0.a)
+  endif()
+
+  add_library(ext_libplist STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_libplist PROPERTIES IMPORTED_LOCATION
+                            ${EXTERNAL_DIR}/libplist/bin/lib/libplist-2.0.a)
+  add_dependencies(ext_libplist libplist_external)
+  add_library(plist ALIAS ext_libplist)
+endif()
+# deps-entry libplist: end
+
+# deps-entry bzip2: begin
+# ------------------------------------------------------------------------------
+# bzip2 (not winagent)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/bzip2/libbz2.a)
+    message(STATUS "Using precompiled bzip2 library")
+    add_custom_target(bzip2_external)
+  else()
+    ExternalProject_Add(
+      bzip2_external
+      SOURCE_DIR ${EXTERNAL_DIR}/bzip2
+      CONFIGURE_COMMAND ""
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+                    "CFLAGS=-fpic -Wall -O2 -D_FILE_OFFSET_BITS=64${DEPS_CFLAGS_EXTRA}" libbz2.a
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/bzip2/libbz2.a)
+  endif()
+
+  add_library(ext_bzip2 STATIC IMPORTED GLOBAL)
+  set_target_properties(ext_bzip2 PROPERTIES IMPORTED_LOCATION
+                                             ${EXTERNAL_DIR}/bzip2/libbz2.a)
+  add_dependencies(ext_bzip2 bzip2_external)
+endif()
+# deps-entry bzip2: end
+
+# deps-entry libdb: begin
+# ------------------------------------------------------------------------------
+# Berkeley DB (Linux agent only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND IS_AGENT)
+  if(EXISTS ${EXTERNAL_DIR}/libdb/build_unix/.libs/libdb-18.1.a)
+    message(STATUS "Using precompiled Berkeley DB library")
+    add_custom_target(libdb_external)
+  else()
+    ExternalProject_Add(
+      libdb_external
+      SOURCE_DIR ${EXTERNAL_DIR}/libdb/build_unix
+      CONFIGURE_COMMAND
+        ${CMAKE_COMMAND} -E env ${DEPS_CFLAGS_ENV} CPPFLAGS=-fPIC
+        ${EXTERNAL_DIR}/libdb/dist/configure --with-cryptography=no
+        --disable-queue --disable-heap --disable-partition
+        --disable-mutexsupport --disable-replication --disable-verify
+        --disable-statistics ac_cv_func_pthread_yield=no
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} libdb.a
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/libdb/build_unix/.libs/libdb-18.1.a)
+  endif()
+
+  add_library(ext_libdb STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_libdb PROPERTIES IMPORTED_LOCATION
+                         ${EXTERNAL_DIR}/libdb/build_unix/.libs/libdb-18.1.a)
+  add_dependencies(ext_libdb libdb_external)
+endif()
+# deps-entry libdb: end
+
+# deps-entry lua: begin
+# ------------------------------------------------------------------------------
+# Lua (Linux agent only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND IS_AGENT)
+  if(EXISTS ${EXTERNAL_DIR}/lua/liblua.a)
+    message(STATUS "Using precompiled Lua library")
+    add_custom_target(lua_external)
+  else()
+    ExternalProject_Add(
+      lua_external
+      SOURCE_DIR ${EXTERNAL_DIR}/lua
+      CONFIGURE_COMMAND ""
+      # Upstream CFLAGS without -march=native, so the library runs on any CPU of the target architecture.
+      BUILD_COMMAND
+        ${CMAKE_MAKE_PROGRAM} all
+        "CFLAGS=-Wall -O2 -fPIC -DLUA_USE_LINUX -fno-stack-protector -fno-common${DEPS_CFLAGS_EXTRA}"
+        "MYLIBS=-lm -ldl${DEPS_CFLAGS_EXTRA}"
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/lua/liblua.a)
+  endif()
+
+  add_library(ext_lua STATIC IMPORTED GLOBAL)
+  set_target_properties(ext_lua PROPERTIES IMPORTED_LOCATION
+                                           ${EXTERNAL_DIR}/lua/liblua.a)
+  add_dependencies(ext_lua lua_external)
+endif()
+# deps-entry lua: end
+
+# deps-entry dbus: begin
+# ------------------------------------------------------------------------------
+# dbus (Linux agent only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND IS_AGENT)
+  set(DBUS_CONFIG_OPTS
+      --enable-static
+      --disable-shared
+      --disable-doxygen-docs
+      --disable-xml-docs
+      --disable-dependency-tracking
+      --disable-systemd
+      --prefix=${EXTERNAL_DIR}/dbus
+      --includedir=${EXTERNAL_DIR}/dbus/include
+      --libdir=${EXTERNAL_DIR}/dbus/lib
+      --with-system-socket=/run/dbus/system_bus_socket)
+
+  if(EXISTS ${EXTERNAL_DIR}/dbus/lib/libdbus-1.a)
+    message(STATUS "Using precompiled D-Bus library")
+    add_custom_target(dbus_external)
+  else()
+    ExternalProject_Add(
+      dbus_external
+      SOURCE_DIR ${EXTERNAL_DIR}/dbus
+      CONFIGURE_COMMAND
+        ${CMAKE_COMMAND} -E env "CFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}" "CXXFLAGS=-fPIC${DEPS_CFLAGS_EXTRA}" LDFLAGS=-fPIC
+        ${EXTERNAL_DIR}/dbus/configure ${DBUS_CONFIG_OPTS}
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+      INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
+      BUILD_IN_SOURCE TRUE
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/dbus/lib/libdbus-1.a)
+  endif()
+
+  add_library(ext_dbus STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_dbus PROPERTIES IMPORTED_LOCATION ${EXTERNAL_DIR}/dbus/lib/libdbus-1.a)
+  add_dependencies(ext_dbus dbus_external)
+endif()
+# deps-entry dbus: end
+
+# deps-entry jemalloc: begin
+# ------------------------------------------------------------------------------
+# jemalloc (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/jemalloc/lib/libjemalloc.so.2)
+    message(STATUS "Using precompiled jemalloc library")
+    add_custom_target(jemalloc_external)
+  else()
+    if(EXISTS ${EXTERNAL_DIR}/jemalloc/configure)
+      set(JEMALLOC_CONFIGURE_CMD ${EXTERNAL_DIR}/jemalloc/configure)
+    else()
+      set(JEMALLOC_CONFIGURE_CMD ${EXTERNAL_DIR}/jemalloc/autogen.sh)
+    endif()
+
+    ExternalProject_Add(
+      jemalloc_external
+      SOURCE_DIR ${EXTERNAL_DIR}/jemalloc
+      CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env LDFLAGS=-s
+                        ${JEMALLOC_CONFIGURE_CMD} --disable-static --disable-cxx
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+      BUILD_IN_SOURCE TRUE
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/jemalloc/lib/libjemalloc.so.2)
+  endif()
+
+  add_library(ext_jemalloc SHARED IMPORTED GLOBAL)
+  set_target_properties(
+    ext_jemalloc PROPERTIES IMPORTED_LOCATION
+                            ${EXTERNAL_DIR}/jemalloc/lib/libjemalloc.so.2)
+  add_dependencies(ext_jemalloc jemalloc_external)
+endif()
+# deps-entry jemalloc: end
+
+# ==============================================================================
+# Section 2: CMake-based dependencies (ExternalProject_Add)
+# ==============================================================================
+
+# deps-entry rocksdb: begin
+# ------------------------------------------------------------------------------
+# RocksDB (server only, shared lib)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/rocksdb/build/librocksdb.so)
+    message(STATUS "Using precompiled RocksDB library")
+    add_custom_target(rocksdb_external)
+  else()
+    ExternalProject_Add(
+      rocksdb_external
+      SOURCE_DIR ${EXTERNAL_DIR}/rocksdb
+      BINARY_DIR ${EXTERNAL_DIR}/rocksdb/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS}
+                 -DWITH_GFLAGS=0
+                 -DWITH_TESTS=0
+                 -DWITH_BENCHMARK_TOOLS=0
+                 -DWITH_TOOLS=0
+                 -DUSE_RTTI=1
+                 -DROCKSDB_BUILD_SHARED=1
+                 -DWITH_BZ2=1
+                 -DBZIP2_INCLUDE_DIR=${EXTERNAL_DIR}/bzip2
+                 -DBZIP2_LIBRARIES=${EXTERNAL_DIR}/bzip2/libbz2.a
+                 -DCMAKE_POSITION_INDEPENDENT_CODE=1
+                 -DWITH_ALL_TESTS=0
+                 -DWITH_RUNTIME_DEBUG=0
+                 -DWITH_TRACE_TOOLS=0
+                 -DPORTABLE=1
+      INSTALL_COMMAND ""
+      DEPENDS bzip2_external
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/rocksdb/build/librocksdb.so)
+  endif()
+
+  add_library(ext_rocksdb SHARED IMPORTED GLOBAL)
+  set_target_properties(
+    ext_rocksdb PROPERTIES IMPORTED_LOCATION
+                           ${EXTERNAL_DIR}/rocksdb/build/librocksdb.so)
+  add_dependencies(ext_rocksdb rocksdb_external)
+  target_include_directories(ext_rocksdb
+                             INTERFACE ${EXTERNAL_DIR}/rocksdb/include)
+  add_library(rocksdb ALIAS ext_rocksdb)
+endif()
+# deps-entry rocksdb: end
+
+# deps-entry simdjson: begin
+# ------------------------------------------------------------------------------
+# simdjson (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/simdjson/build/libsimdjson.a)
+    message(STATUS "Using precompiled simdjson library")
+    add_custom_target(simdjson_external)
+  else()
+    ExternalProject_Add(
+      simdjson_external
+      SOURCE_DIR ${EXTERNAL_DIR}/simdjson
+      BINARY_DIR ${EXTERNAL_DIR}/simdjson/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS} -DSIMDJSON_DEVELOPER_MODE=OFF
+                 -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=1
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/simdjson/build/libsimdjson.a)
+  endif()
+
+  add_library(ext_simdjson STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_simdjson PROPERTIES IMPORTED_LOCATION
+                            ${EXTERNAL_DIR}/simdjson/build/libsimdjson.a)
+  add_dependencies(ext_simdjson simdjson_external)
+  target_include_directories(ext_simdjson
+                             INTERFACE ${EXTERNAL_DIR}/simdjson/include)
+endif()
+# deps-entry simdjson: end
+
+# deps-entry abseil-cpp: begin
+# ------------------------------------------------------------------------------
+# abseil-cpp (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/abseil-cpp/build/build_result/lib64/libabsl_base.a
+     OR EXISTS ${EXTERNAL_DIR}/abseil-cpp/build/build_result/lib/libabsl_base.a)
+    message(STATUS "Using precompiled abseil-cpp libraries")
+    add_custom_target(abseilcpp_external)
+  else()
+    ExternalProject_Add(
+      abseilcpp_external
+      SOURCE_DIR ${EXTERNAL_DIR}/abseil-cpp
+      BINARY_DIR ${EXTERNAL_DIR}/abseil-cpp/build
+      CMAKE_ARGS
+        ${DEPS_CMAKE_ARGS}
+        -DABSL_BUILD_TESTING=OFF
+        -DABSL_USE_GOOGLETEST_HEAD=OFF
+        -DCMAKE_CXX_STANDARD=17
+        -DCMAKE_POSITION_INDEPENDENT_CODE=1
+        -DCMAKE_INSTALL_PREFIX=${EXTERNAL_DIR}/abseil-cpp/build/build_result
+      INSTALL_COMMAND ${CMAKE_MAKE_PROGRAM} install
+      BUILD_BYPRODUCTS
+        ${EXTERNAL_DIR}/abseil-cpp/build/build_result/lib/libabsl_base.a)
+  endif()
+  # Note: abseil produces many libabsl_*.a files. Consumers should link against
+  # the install prefix directory.
+endif()
+# deps-entry abseil-cpp: end
+
+# deps-entry re2: begin
+# ------------------------------------------------------------------------------
+# RE2 (server only, depends on abseil-cpp)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/re2/build/libre2.a)
+    message(STATUS "Using precompiled RE2 library")
+    add_custom_target(re2_external)
+  else()
+    ExternalProject_Add(
+      re2_external
+      SOURCE_DIR ${EXTERNAL_DIR}/re2
+      BINARY_DIR ${EXTERNAL_DIR}/re2/build
+      CMAKE_ARGS
+        ${DEPS_CMAKE_ARGS}
+        -DRE2_BUILD_TESTING=OFF
+        -DCMAKE_CXX_STANDARD=17
+        -DBUILD_SHARED_LIBS=OFF
+        -DCMAKE_PREFIX_PATH=${EXTERNAL_DIR}/abseil-cpp/build/build_result
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        -DCMAKE_INSTALL_PREFIX=${EXTERNAL_DIR}/re2/build/result
+      INSTALL_COMMAND ""
+      DEPENDS abseilcpp_external
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/re2/build/libre2.a)
+  endif()
+
+  add_library(ext_re2 STATIC IMPORTED GLOBAL)
+  set_target_properties(ext_re2 PROPERTIES IMPORTED_LOCATION
+                                           ${EXTERNAL_DIR}/re2/build/libre2.a)
+  add_dependencies(ext_re2 re2_external)
+endif()
+# deps-entry re2: end
+
+# deps-entry flatbuffers: begin
+# ------------------------------------------------------------------------------
+# FlatBuffers (all targets need headers; server links the static lib)
+# ------------------------------------------------------------------------------
+
+if(EXISTS ${EXTERNAL_DIR}/flatbuffers/build/libflatbuffers.a
+   AND EXISTS ${EXTERNAL_DIR}/flatbuffers/build/flatc)
+  message(STATUS "Using precompiled FlatBuffers library")
+  add_custom_target(flatbuffers_external)
+else()
+  if(IS_LINUX)
+    set(FLATBUFFERS_EXE_LINKER_FLAGS "-static-libstdc++ -static-libgcc")
+  else()
+    set(FLATBUFFERS_EXE_LINKER_FLAGS "")
+  endif()
+  ExternalProject_Add(
+    flatbuffers_external
+    SOURCE_DIR ${EXTERNAL_DIR}/flatbuffers
+    BINARY_DIR ${EXTERNAL_DIR}/flatbuffers/build
+    CMAKE_ARGS ${DEPS_CMAKE_ARGS} -DFLATBUFFERS_BUILD_TESTS=0
+               -DFLATBUFFERS_INSTALL=0 -DCMAKE_POSITION_INDEPENDENT_CODE=1
+               "-DCMAKE_EXE_LINKER_FLAGS=${FLATBUFFERS_EXE_LINKER_FLAGS}"
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS ${EXTERNAL_DIR}/flatbuffers/build/libflatbuffers.a
+                     ${EXTERNAL_DIR}/flatbuffers/build/flatc)
+endif()
+
+add_library(ext_flatbuffers STATIC IMPORTED GLOBAL)
+set_target_properties(
+  ext_flatbuffers PROPERTIES IMPORTED_LOCATION
+                             ${EXTERNAL_DIR}/flatbuffers/build/libflatbuffers.a)
+add_dependencies(ext_flatbuffers flatbuffers_external)
+# deps-entry flatbuffers: end
+
+# deps-entry spdlog: begin
+# ------------------------------------------------------------------------------
+# spdlog (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/spdlog/build/libspdlog.a)
+    message(STATUS "Using precompiled spdlog library")
+    add_custom_target(spdlog_external)
+  else()
+    ExternalProject_Add(
+      spdlog_external
+      SOURCE_DIR ${EXTERNAL_DIR}/spdlog
+      BINARY_DIR ${EXTERNAL_DIR}/spdlog/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS}
+                 -DSPDLOG_BUILD_EXAMPLE=OFF
+                 -DSPDLOG_BUILD_TESTS=OFF
+                 -DSPDLOG_BUILD_BENCH=OFF
+                 -DSPDLOG_FMT_EXTERNAL=OFF
+                 -DBUILD_SHARED_LIBS=OFF
+                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/spdlog/build/libspdlog.a)
+    deps_debug_alias(spdlog_external ${EXTERNAL_DIR}/spdlog/build libspdlog)
+  endif()
+
+  add_library(ext_spdlog STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_spdlog PROPERTIES IMPORTED_LOCATION
+                          ${EXTERNAL_DIR}/spdlog/build/libspdlog.a)
+  add_dependencies(ext_spdlog spdlog_external)
+endif()
+# deps-entry spdlog: end
+
+# deps-entry yaml-cpp: begin
+# ------------------------------------------------------------------------------
+# yaml-cpp (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/yaml-cpp/build/libyaml-cpp.a)
+    message(STATUS "Using precompiled yamlcpp library")
+    add_custom_target(yamlcpp_external)
+  else()
+    ExternalProject_Add(
+      yamlcpp_external
+      SOURCE_DIR ${EXTERNAL_DIR}/yaml-cpp
+      BINARY_DIR ${EXTERNAL_DIR}/yaml-cpp/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS} -DYAML_CPP_BUILD_TOOLS=OFF
+                 -DYAML_CPP_BUILD_TESTS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=1
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/yaml-cpp/build/libyaml-cpp.a)
+    deps_debug_alias(yamlcpp_external ${EXTERNAL_DIR}/yaml-cpp/build libyaml-cpp)
+  endif()
+
+  add_library(ext_yamlcpp STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_yamlcpp PROPERTIES IMPORTED_LOCATION
+                           ${EXTERNAL_DIR}/yaml-cpp/build/libyaml-cpp.a)
+  add_dependencies(ext_yamlcpp yamlcpp_external)
+endif()
+# deps-entry yaml-cpp: end
+
+# deps-entry pugixml: begin
+# ------------------------------------------------------------------------------
+# pugixml (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/pugixml/build/libpugixml.a)
+    message(STATUS "Using precompiled pugixml library")
+    add_custom_target(pugixml_external)
+  else()
+    ExternalProject_Add(
+      pugixml_external
+      SOURCE_DIR ${EXTERNAL_DIR}/pugixml
+      BINARY_DIR ${EXTERNAL_DIR}/pugixml/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS} -DPUGIXML_BUILD_TESTS=OFF
+                 -DCMAKE_POSITION_INDEPENDENT_CODE=1
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/pugixml/build/libpugixml.a)
+  endif()
+
+  add_library(ext_pugixml STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_pugixml PROPERTIES IMPORTED_LOCATION
+                           ${EXTERNAL_DIR}/pugixml/build/libpugixml.a)
+  add_dependencies(ext_pugixml pugixml_external)
+endif()
+# deps-entry pugixml: end
+
+# deps-entry libmaxminddb: begin
+# ------------------------------------------------------------------------------
+# libmaxminddb (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/libmaxminddb/build/libmaxminddb.a)
+    message(STATUS "Using precompiled libmaxminddb library")
+    add_custom_target(maxminddb_external)
+  else()
+    file(MAKE_DIRECTORY ${EXTERNAL_DIR}/libmaxminddb/build/generated)
+
+    ExternalProject_Add(
+      maxminddb_external
+      SOURCE_DIR ${EXTERNAL_DIR}/libmaxminddb
+      BINARY_DIR ${EXTERNAL_DIR}/libmaxminddb/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS} -DBUILD_TESTING=OFF
+                 -DCMAKE_POSITION_INDEPENDENT_CODE=1
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/libmaxminddb/build/libmaxminddb.a)
+  endif()
+
+  add_library(ext_maxminddb STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_maxminddb PROPERTIES IMPORTED_LOCATION
+                             ${EXTERNAL_DIR}/libmaxminddb/build/libmaxminddb.a)
+  add_dependencies(ext_maxminddb maxminddb_external)
+endif()
+# deps-entry libmaxminddb: end
+
+# deps-entry protobuf: begin
+# ------------------------------------------------------------------------------
+# protobuf (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/protobuf/build/libprotobuf.a)
+    message(STATUS "Using precompiled protobuf library")
+    add_custom_target(protobuf_external)
+  else()
+    ExternalProject_Add(
+      protobuf_external
+      SOURCE_DIR ${EXTERNAL_DIR}/protobuf
+      BINARY_DIR ${EXTERNAL_DIR}/protobuf/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS} -Dprotobuf_BUILD_TESTS=OFF
+                 -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/protobuf/build/libprotobuf.a)
+    deps_debug_alias(protobuf_external ${EXTERNAL_DIR}/protobuf/build libprotobuf)
+  endif()
+
+  add_library(ext_protobuf STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_protobuf PROPERTIES IMPORTED_LOCATION
+                            ${EXTERNAL_DIR}/protobuf/build/libprotobuf.a)
+  add_dependencies(ext_protobuf protobuf_external)
+endif()
+# deps-entry protobuf: end
+
+# deps-entry date: begin
+# ------------------------------------------------------------------------------
+# date (Howard Hinnant, server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/date/build/libdate-tz.a)
+    message(STATUS "Using precompiled date library")
+    add_custom_target(date_external)
+  else()
+    ExternalProject_Add(
+      date_external
+      SOURCE_DIR ${EXTERNAL_DIR}/date
+      BINARY_DIR ${EXTERNAL_DIR}/date/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS}
+                 -DENABLE_DATE_TESTING=OFF
+                 -DUSE_SYSTEM_TZ_DB=OFF
+                 -DBUILD_TZ_LIB=ON
+                 -DBUILD_SHARED_LIBS=OFF
+                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+                 -DCURL_INCLUDE_DIR=${EXTERNAL_DIR}/curl/include
+                 -DCURL_LIBRARY=${EXTERNAL_DIR}/curl/lib/.libs/libcurl.a
+      INSTALL_COMMAND ""
+      DEPENDS curl_external
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/date/build/libdate-tz.a)
+  endif()
+
+  add_library(ext_date STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_date PROPERTIES IMPORTED_LOCATION
+                        ${EXTERNAL_DIR}/date/build/libdate-tz.a)
+  add_dependencies(ext_date date_external)
+endif()
+# deps-entry date: end
+
+# deps-entry fmt: begin
+# ------------------------------------------------------------------------------
+# fmt (server only)
+# ------------------------------------------------------------------------------
+
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  if(EXISTS ${EXTERNAL_DIR}/fmt/build/libfmt.a)
+    message(STATUS "Using precompiled fmt library")
+    add_custom_target(fmt_external)
+  else()
+    ExternalProject_Add(
+      fmt_external
+      SOURCE_DIR ${EXTERNAL_DIR}/fmt
+      BINARY_DIR ${EXTERNAL_DIR}/fmt/build
+      CMAKE_ARGS ${DEPS_CMAKE_ARGS} -DFMT_TEST=OFF -DFMT_DOC=OFF
+                 -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/fmt/build/libfmt.a)
+    deps_debug_alias(fmt_external ${EXTERNAL_DIR}/fmt/build libfmt)
+  endif()
+
+  add_library(ext_fmt STATIC IMPORTED GLOBAL)
+  set_target_properties(ext_fmt PROPERTIES IMPORTED_LOCATION
+                                           ${EXTERNAL_DIR}/fmt/build/libfmt.a)
+  add_dependencies(ext_fmt fmt_external)
+  target_include_directories(ext_fmt INTERFACE ${EXTERNAL_DIR}/fmt/include)
+endif()
+# deps-entry fmt: end
+
+# deps-entry llhttp: begin
+# ------------------------------------------------------------------------------
+# llhttp (Linux server only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND NOT IS_AGENT)
+  if(EXISTS ${EXTERNAL_DIR}/llhttp/build/libllhttp.a)
+    message(STATUS "Using precompiled llhttp library")
+    add_library(ext_llhttp STATIC IMPORTED GLOBAL)
+    set_target_properties(
+      ext_llhttp PROPERTIES IMPORTED_LOCATION
+                            ${EXTERNAL_DIR}/llhttp/build/libllhttp.a)
+    target_include_directories(ext_llhttp INTERFACE
+                               ${EXTERNAL_DIR}/llhttp/include)
+  else()
+    add_library(
+      ext_llhttp STATIC
+      ${EXTERNAL_DIR}/llhttp/src/llhttp.c ${EXTERNAL_DIR}/llhttp/src/http.c
+      ${EXTERNAL_DIR}/llhttp/src/api.c)
+    set_target_properties(
+      ext_llhttp PROPERTIES POSITION_INDEPENDENT_CODE ON
+                            C_STANDARD 99
+                            OUTPUT_NAME llhttp
+                            ARCHIVE_OUTPUT_DIRECTORY
+                            ${EXTERNAL_DIR}/llhttp/build)
+    target_include_directories(ext_llhttp PUBLIC ${EXTERNAL_DIR}/llhttp/include)
+  endif()
+endif()
+# deps-entry llhttp: end
+
+# deps-entry restinio: begin
+# ------------------------------------------------------------------------------
+# RESTinio (Linux server only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND NOT IS_AGENT)
+  add_library(ext_asio INTERFACE)
+  target_include_directories(ext_asio SYSTEM INTERFACE ${EXTERNAL_DIR}/asio/include)
+
+  add_library(ext_expected_lite INTERFACE)
+  target_include_directories(ext_expected_lite SYSTEM
+                             INTERFACE ${EXTERNAL_DIR}/expected-lite/include)
+
+  add_library(ext_restinio INTERFACE)
+  target_include_directories(ext_restinio SYSTEM
+                             INTERFACE ${EXTERNAL_DIR}/restinio/dev)
+  target_link_libraries(ext_restinio INTERFACE ext_asio ext_llhttp ext_fmt
+                                              ext_expected_lite pthread ssl crypto)
+endif()
+# deps-entry restinio: end
+
+# deps-entry zstd: begin
+# ------------------------------------------------------------------------------
+# zstd (manager + agent, all platforms incl. winagent)
+# ------------------------------------------------------------------------------
+#
+# Upstream ships its CMake project under build/cmake (not at the repo root),
+# so SOURCE_DIR points there. BINARY_DIR is kept out of that tree (as
+# build/cmake-build, or build/cmake-build-win when cross-compiling for
+# Windows) to avoid colliding with the vendored build/{cmake,meson,VS2010,
+# single_file_libs} directories. The Windows BINARY_DIR is intentionally
+# distinct from the non-Windows one -- a Linux/macOS libzstd.a already built
+# on disk must never satisfy the Windows precompiled-artifact fast path
+# below (or vice versa); each platform gets its own EXISTS check. The static
+# archive lands under <BINARY_DIR>/lib/libzstd.a because upstream's
+# lib/CMakeLists.txt is pulled in via add_subdirectory(lib).
+#
+# Windows (winagent) cross-compiles via a nested ExternalProject_Add whose
+# own CMAKE_ARGS re-declare CMAKE_SYSTEM_NAME=Windows and forward the
+# already-cross-compiling top-level CMAKE_C_COMPILER/CMAKE_CXX_COMPILER/
+# CMAKE_AR/CMAKE_RANLIB (mirrors the GoogleTest Windows block below) instead
+# of re-deriving a MinGW prefix independently -- this file's own
+# MINGW_PREFIX is a second, non-synchronized source of truth vs.
+# src/Makefile's MING_BASE, so forwarding what the top-level configure
+# already resolved avoids adding to that split.
+#
+# CMAKE_CXX_COMPILER is required even though zstd's own library is C-only:
+# CMake's project() call, with no explicit LANGUAGES restriction, enables
+# CXX by default, so the nested configure's own compiler sanity-check tries
+# to find a C++ compiler regardless. Without forwarding it, that check falls
+# back to the HOST's /usr/bin/c++ (not the MinGW cross compiler), which
+# fails immediately on a MinGW-only linker flag -- confirmed empirically,
+# not just theorized.
+if(IS_WINDOWS)
+  set(ZSTD_BINARY_DIR ${EXTERNAL_DIR}/zstd/build/cmake-build-win)
+  find_program(FULL_RANLIB ${CMAKE_RANLIB} REQUIRED)
+  set(ZSTD_CMAKE_ARGS
+      -DCMAKE_SYSTEM_NAME=Windows
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DCMAKE_AR=${CMAKE_AR}
+      -DCMAKE_RANLIB=${FULL_RANLIB}
+      -DZSTD_MULTITHREAD_SUPPORT=OFF)
+else()
+  set(ZSTD_BINARY_DIR ${EXTERNAL_DIR}/zstd/build/cmake-build)
+  set(ZSTD_CMAKE_ARGS "")
+endif()
+
+if(EXISTS ${ZSTD_BINARY_DIR}/lib/libzstd.a)
+  message(STATUS "Using precompiled zstd library")
+  add_custom_target(zstd_external)
+else()
+  ExternalProject_Add(
+    zstd_external
+    SOURCE_DIR ${EXTERNAL_DIR}/zstd/build/cmake
+    BINARY_DIR ${ZSTD_BINARY_DIR}
+    CMAKE_ARGS ${DEPS_CMAKE_ARGS}
+               -DBUILD_SHARED_LIBS=OFF
+               -DZSTD_BUILD_STATIC=ON
+               -DZSTD_BUILD_SHARED=OFF
+               -DZSTD_BUILD_PROGRAMS=OFF
+               -DZSTD_BUILD_TESTS=OFF
+               -DZSTD_LEGACY_SUPPORT=OFF
+               -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+               ${ZSTD_CMAKE_ARGS}
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS ${ZSTD_BINARY_DIR}/lib/libzstd.a)
+
+  if(IS_WINDOWS)
+    ExternalProject_Add_Step(
+      zstd_external ranlib_libs
+      COMMAND ${FULL_RANLIB} ${ZSTD_BINARY_DIR}/lib/libzstd.a
+      DEPENDEES build
+      COMMENT "Running ranlib on zstd library")
+  endif()
+endif()
+
+add_library(ext_zstd STATIC IMPORTED GLOBAL)
+set_target_properties(
+  ext_zstd PROPERTIES IMPORTED_LOCATION ${ZSTD_BINARY_DIR}/lib/libzstd.a)
+add_dependencies(ext_zstd zstd_external)
+target_include_directories(ext_zstd INTERFACE ${EXTERNAL_DIR}/zstd/lib)
+# deps-entry zstd: end
+
+# deps-entry popt: begin
+# ------------------------------------------------------------------------------
+# popt (Linux agent only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND IS_AGENT)
+  if(EXISTS ${EXTERNAL_DIR}/popt/build/output/src/.libs/libpopt.a)
+    message(STATUS "Using precompiled popt library")
+    add_custom_target(popt_external)
+  else()
+    ExternalProject_Add(
+      popt_external
+      SOURCE_DIR ${EXTERNAL_DIR}/popt
+      BINARY_DIR ${EXTERNAL_DIR}/popt/build
+      CMAKE_ARGS ""
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/popt/build/output/src/.libs/libpopt.a)
+  endif()
+
+  add_library(ext_popt STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_popt PROPERTIES IMPORTED_LOCATION
+                        ${EXTERNAL_DIR}/popt/build/output/src/.libs/libpopt.a)
+  add_dependencies(ext_popt popt_external)
+endif()
+# deps-entry popt: end
+
+# deps-entry googletest: begin
+# ------------------------------------------------------------------------------
+# GoogleTest (test builds only)
+# ------------------------------------------------------------------------------
+
+if(UNIT_TEST OR WAZUH_ENGINE_TEST)
+  if(IS_WINDOWS)
+    find_program(FULL_RANLIB ${CMAKE_RANLIB} REQUIRED)
+    set(GTEST_CMAKE_ARGS
+        -DCMAKE_SYSTEM_NAME=Windows
+        -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+        -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DCMAKE_RC_COMPILER=${CMAKE_RC_COMPILER}
+        -DCMAKE_AR=${CMAKE_AR}
+        -DCMAKE_RANLIB=${FULL_RANLIB}
+        -DCMAKE_SHARED_LIBRARY_LINK_C_FLAGS=
+        -DCMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS=)
+  else()
+    set(GTEST_CMAKE_ARGS "")
+  endif()
+
+  if(EXISTS ${EXTERNAL_DIR}/googletest/lib/libgtest.a
+     AND EXISTS ${EXTERNAL_DIR}/googletest/lib/libgmock.a)
+    message(STATUS "Using precompiled GoogleTest libraries")
+    add_custom_target(googletest_external)
+  else()
+    ExternalProject_Add(
+      googletest_external
+      SOURCE_DIR ${EXTERNAL_DIR}/googletest
+      BINARY_DIR ${EXTERNAL_DIR}/googletest/build
+      CMAKE_ARGS -DBUILD_GMOCK=ON -DBUILD_SHARED_LIBS=0 ${GTEST_CMAKE_ARGS}
+      INSTALL_COMMAND
+        ${CMAKE_COMMAND} -E copy_directory ${EXTERNAL_DIR}/googletest/build/lib
+        ${EXTERNAL_DIR}/googletest/lib
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/googletest/build/lib/libgtest.a
+                       ${EXTERNAL_DIR}/googletest/build/lib/libgmock.a)
+
+    if(IS_WINDOWS)
+      ExternalProject_Add_Step(
+        googletest_external ranlib_libs
+        COMMAND ${FULL_RANLIB} ${EXTERNAL_DIR}/googletest/lib/libgtest.a
+        COMMAND ${FULL_RANLIB} ${EXTERNAL_DIR}/googletest/lib/libgtest_main.a
+        COMMAND ${FULL_RANLIB} ${EXTERNAL_DIR}/googletest/lib/libgmock.a
+        COMMAND ${FULL_RANLIB} ${EXTERNAL_DIR}/googletest/lib/libgmock_main.a
+        DEPENDEES install
+        COMMENT "Running ranlib on GoogleTest libraries")
+    endif()
+  endif()
+
+  add_library(gtest STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    gtest PROPERTIES IMPORTED_LOCATION
+                     ${EXTERNAL_DIR}/googletest/lib/libgtest.a)
+  add_dependencies(gtest googletest_external)
+  add_library(gtestd ALIAS gtest)
+
+  add_library(gtest_main STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    gtest_main PROPERTIES IMPORTED_LOCATION
+                          ${EXTERNAL_DIR}/googletest/lib/libgtest_main.a)
+  add_dependencies(gtest_main googletest_external)
+  add_library(gtest_maind ALIAS gtest_main)
+
+  add_library(gmock STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    gmock PROPERTIES IMPORTED_LOCATION
+                     ${EXTERNAL_DIR}/googletest/lib/libgmock.a)
+  add_dependencies(gmock googletest_external)
+  add_library(gmockd ALIAS gmock)
+
+  add_library(gmock_main STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    gmock_main PROPERTIES IMPORTED_LOCATION
+                          ${EXTERNAL_DIR}/googletest/lib/libgmock_main.a)
+  add_dependencies(gmock_main googletest_external)
+  add_library(gmock_maind ALIAS gmock_main)
+endif()
+# deps-entry googletest: end
+
+# deps-entry benchmark: begin
+# ------------------------------------------------------------------------------
+# Google Benchmark (test builds only; server/manager targets)
+# ------------------------------------------------------------------------------
+
+if((UNIT_TEST OR WAZUH_ENGINE_TEST) AND NOT IS_AGENT)
+  if(EXISTS ${EXTERNAL_DIR}/benchmark/build/src/libbenchmark.a)
+    message(STATUS "Using precompiled benchmark library")
+    add_custom_target(benchmark_external)
+  else()
+    ExternalProject_Add(
+      benchmark_external
+      SOURCE_DIR ${EXTERNAL_DIR}/benchmark
+      BINARY_DIR ${EXTERNAL_DIR}/benchmark/build
+      CMAKE_ARGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} -DBENCHMARK_ENABLE_TESTING=0 ${CMAKE_OPTS}
+      INSTALL_COMMAND ""
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/benchmark/build/src/libbenchmark.a)
+  endif()
+
+  add_library(benchmark STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    benchmark PROPERTIES IMPORTED_LOCATION
+                         ${EXTERNAL_DIR}/benchmark/build/src/libbenchmark.a)
+  add_dependencies(benchmark benchmark_external)
+  target_include_directories(benchmark
+                             INTERFACE ${EXTERNAL_DIR}/benchmark/include)
+
+  # Create the benchmark::benchmark alias that benchmark tests expect
+  add_library(benchmark::benchmark ALIAS benchmark)
+endif()
+# deps-entry benchmark: end
+
+# ==============================================================================
+# Section 3: Manually compiled dependencies (add_library STATIC)
+# ==============================================================================
+
+# deps-entry cJSON: begin
+# ------------------------------------------------------------------------------
+# cJSON
+# ------------------------------------------------------------------------------
+
+if(EXISTS ${EXTERNAL_DIR}/cJSON/libcjson.a)
+  message(STATUS "Using precompiled cJSON library")
+  add_library(ext_cjson STATIC IMPORTED GLOBAL)
+  set_target_properties(ext_cjson PROPERTIES IMPORTED_LOCATION
+                                             ${EXTERNAL_DIR}/cJSON/libcjson.a)
+  target_include_directories(ext_cjson INTERFACE ${EXTERNAL_DIR}/cJSON)
+else()
+  add_library(ext_cjson STATIC ${EXTERNAL_DIR}/cJSON/cJSON.c)
+  target_include_directories(ext_cjson PUBLIC ${EXTERNAL_DIR}/cJSON)
+  set_target_properties(ext_cjson PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                             C_STANDARD 99)
+endif()
+add_library(cjson ALIAS ext_cjson)
+# deps-entry cJSON: end
+
+# deps-entry sqlite: begin
+# ------------------------------------------------------------------------------
+# SQLite
+# ------------------------------------------------------------------------------
+
+if(EXISTS ${EXTERNAL_DIR}/sqlite/libsqlite3.a)
+  message(STATUS "Using precompiled SQLite library")
+  add_library(ext_sqlite STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_sqlite PROPERTIES IMPORTED_LOCATION ${EXTERNAL_DIR}/sqlite/libsqlite3.a)
+  target_include_directories(ext_sqlite INTERFACE ${EXTERNAL_DIR}/sqlite)
+else()
+  add_library(ext_sqlite STATIC ${EXTERNAL_DIR}/sqlite/sqlite3.c)
+  target_include_directories(ext_sqlite PUBLIC ${EXTERNAL_DIR}/sqlite)
+  target_compile_definitions(ext_sqlite PRIVATE SQLITE_ENABLE_DBSTAT_VTAB=1)
+  target_compile_options(ext_sqlite PRIVATE -w)
+  set_target_properties(ext_sqlite PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                              C_STANDARD 99)
+endif()
+add_library(sqlite3 ALIAS ext_sqlite)
+add_library(sqlite ALIAS ext_sqlite)
+# deps-entry sqlite: end
+
+# deps-entry procps: begin
+# ------------------------------------------------------------------------------
+# procps (Linux agent only)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND IS_AGENT)
+  if(EXISTS ${EXTERNAL_DIR}/procps/libproc.a)
+    message(STATUS "Using precompiled procps library")
+    add_library(ext_procps STATIC IMPORTED GLOBAL)
+    set_target_properties(
+      ext_procps PROPERTIES IMPORTED_LOCATION ${EXTERNAL_DIR}/procps/libproc.a)
+    target_include_directories(ext_procps INTERFACE ${EXTERNAL_DIR}/procps)
+  else()
+    file(GLOB PROCPS_SOURCES ${EXTERNAL_DIR}/procps/*.c)
+    add_library(ext_procps STATIC ${PROCPS_SOURCES})
+    target_include_directories(ext_procps PUBLIC ${EXTERNAL_DIR}/procps)
+    target_compile_definitions(ext_procps PRIVATE _GNU_SOURCE)
+    set_target_properties(ext_procps PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                                C_STANDARD 99)
+  endif()
+  add_library(proc ALIAS ext_procps)
+endif()
+# deps-entry procps: end
+
+# deps-entry rpm: begin
+# ------------------------------------------------------------------------------
+# RPM (Linux agent only, CMake-based but with special env)
+# ------------------------------------------------------------------------------
+
+if(IS_LINUX AND IS_AGENT)
+  set(RPM_INC_PATHS
+      "-I${EXTERNAL_DIR}/openssl/include" "-I${EXTERNAL_DIR}/zlib"
+      "-I${EXTERNAL_DIR}/popt/src" "-I${EXTERNAL_DIR}/sqlite"
+      "-I${EXTERNAL_DIR}/lua")
+  set(RPM_LIB_PATHS
+      "-L${EXTERNAL_DIR}/openssl" "-L${EXTERNAL_DIR}/zlib"
+      "-L${EXTERNAL_DIR}/popt/build/output/src/.libs"
+      "-L${EXTERNAL_DIR}/sqlite" "-L${EXTERNAL_DIR}/lua")
+  string(JOIN " " RPM_CFLAGS_STR "-fPIC" ${DEPS_CFLAGS_LIST} ${RPM_INC_PATHS} ${RPM_LIB_PATHS})
+
+  if(EXISTS ${EXTERNAL_DIR}/rpm/builddir/librpm.a)
+    message(STATUS "Using precompiled RPM library")
+    add_custom_target(rpm_external)
+  else()
+    ExternalProject_Add(
+      rpm_external
+      SOURCE_DIR ${EXTERNAL_DIR}/rpm
+      BINARY_DIR ${EXTERNAL_DIR}/rpm/builddir
+      CMAKE_ARGS ""
+      CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env "CFLAGS=${RPM_CFLAGS_STR}"
+                        CC=gcc cmake ${EXTERNAL_DIR}/rpm
+      BUILD_COMMAND ${CMAKE_MAKE_PROGRAM}
+      INSTALL_COMMAND ""
+      DEPENDS openssl_external zlib_external popt_external ext_sqlite
+              lua_external
+      BUILD_BYPRODUCTS ${EXTERNAL_DIR}/rpm/builddir/librpm.a)
+  endif()
+
+  add_library(ext_rpm STATIC IMPORTED GLOBAL)
+  set_target_properties(
+    ext_rpm PROPERTIES IMPORTED_LOCATION ${EXTERNAL_DIR}/rpm/builddir/librpm.a)
+  add_dependencies(ext_rpm rpm_external)
+endif()
+# deps-entry rpm: end
+
+# ==============================================================================
+# Section 4: Header-only libraries
+# ==============================================================================
+
+# deps-entry nlohmann: begin
+# nlohmann JSON
+add_library(ext_nlohmann INTERFACE)
+target_include_directories(ext_nlohmann SYSTEM
+                           INTERFACE ${EXTERNAL_DIR}/nlohmann)
+# deps-entry nlohmann: end
+
+# deps-entry cpp-httplib: begin
+# cpp-httplib
+add_library(ext_httplib INTERFACE)
+target_include_directories(ext_httplib SYSTEM
+                           INTERFACE ${EXTERNAL_DIR}/cpp-httplib)
+# deps-entry cpp-httplib: end
+
+# deps-entry jwt-cpp: begin
+# jwt-cpp (header-only; in the base EXTERNAL_RES list so agent, winagent and manager all get it).
+# ${EXTERNAL_DIR} is on the include path because traits/nlohmann-json/traits.h does
+# #include "nlohmann/json.hpp" and this tree vendors json.hpp directly under external/nlohmann/.
+# picojson is not vendored, so its default traits are disabled. HS256 needs libcrypto (EVP HMAC).
+if(EXISTS ${EXTERNAL_DIR}/jwt-cpp)
+  add_library(ext_jwt_cpp INTERFACE)
+  target_include_directories(ext_jwt_cpp SYSTEM
+                             INTERFACE ${EXTERNAL_DIR}/jwt-cpp/include
+                                       ${EXTERNAL_DIR})
+  target_compile_definitions(ext_jwt_cpp INTERFACE JWT_DISABLE_PICOJSON)
+  target_link_libraries(ext_jwt_cpp INTERFACE crypto)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    # `crypto` is the static libcrypto.a: on MinGW its winstore/bio_sock objects import
+    # crypt32 (Cert*) and ws2_32 (WSA*, sockets), so any consumer that resolves OpenSSL
+    # from this archive rather than from the wazuhext DLL (e.g. https_client_unit_test.exe)
+    # needs both -- same pairing as every other winagent target that links `crypto`.
+    target_link_libraries(ext_jwt_cpp INTERFACE crypt32 ws2_32)
+  endif()
+endif()
+# deps-entry jwt-cpp: end
+
+# deps-entry rapidjson: begin
+# rapidjson (header-only; in the base EXTERNAL_RES list since #38582: the shared wazuh-agent+jwt
+# verifier in shared_modules/utils/jwt/ parses tokens with its SAX reader, and the agent's
+# component tests run that verifier as their fake manager).
+if(EXISTS ${EXTERNAL_DIR}/rapidjson)
+  add_library(ext_rapidjson INTERFACE)
+  target_include_directories(ext_rapidjson SYSTEM
+                             INTERFACE ${EXTERNAL_DIR}/rapidjson/include)
+endif()
+# deps-entry rapidjson: end
+
+# Header-only libs that are only downloaded for server builds
+if(NOT IS_AGENT)
+# deps-entry RxCpp: begin
+  # RxCpp
+  if(EXISTS ${EXTERNAL_DIR}/RxCpp)
+    add_library(ext_rxcpp INTERFACE)
+    target_include_directories(ext_rxcpp SYSTEM
+                               INTERFACE ${EXTERNAL_DIR}/RxCpp/Rx/v2/src)
+  endif()
+# deps-entry RxCpp: end
+
+# deps-entry taskflow: begin
+  # taskflow
+  if(EXISTS ${EXTERNAL_DIR}/taskflow)
+    add_library(ext_taskflow INTERFACE)
+    target_include_directories(ext_taskflow SYSTEM
+                               INTERFACE ${EXTERNAL_DIR}/taskflow)
+  endif()
+# deps-entry taskflow: end
+
+# deps-entry concurrentqueue: begin
+  # concurrentqueue
+  if(EXISTS ${EXTERNAL_DIR}/concurrentqueue)
+    add_library(ext_concurrentqueue INTERFACE)
+    target_include_directories(ext_concurrentqueue SYSTEM
+                               INTERFACE ${EXTERNAL_DIR}/concurrentqueue)
+  endif()
+# deps-entry concurrentqueue: end
+
+# deps-entry fast_float: begin
+  # fast_float
+  if(EXISTS ${EXTERNAL_DIR}/fast_float)
+    add_library(ext_fast_float INTERFACE)
+    target_include_directories(ext_fast_float SYSTEM
+                               INTERFACE ${EXTERNAL_DIR}/fast_float/include)
+  endif()
+# deps-entry fast_float: end
+endif()
+
+# deps-entry libwazuhext: begin
+# ==============================================================================
+# Section 5: libwazuhext — shared library bundling all core external deps
+# ==============================================================================
+
+# Create an empty source file so CMake accepts the shared library target. Only
+# write if it doesn't exist to avoid triggering rebuilds
+if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/wazuhext_empty.c)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/wazuhext_empty.c "/* empty */\n")
+endif()
+add_library(wazuhext SHARED ${CMAKE_CURRENT_BINARY_DIR}/wazuhext_empty.c)
+
+# Collect all static libraries that go into libwazuhext (whole-archive)
+set(WAZUHEXT_WHOLE_LIBS
+    ext_cjson
+    ext_zlib
+    openssl_ssl
+    openssl_crypto
+    ext_sqlite
+    ext_libyaml
+    ext_pcre2)
+
+# Add curl on supported platforms
+if(IS_LINUX
+   OR IS_DARWIN
+   OR IS_WINDOWS)
+  list(APPEND WAZUHEXT_WHOLE_LIBS ext_curl)
+endif()
+
+# Non-Windows additions
+if(NOT IS_WINDOWS)
+  # bzip2 is shared: the agent links it via shared/src/bzip2_op.c and the server
+  # additionally builds rocksdb WITH_BZ2, so it stays in every non-Windows leg.
+  list(APPEND WAZUHEXT_WHOLE_LIBS ext_bzip2)
+  if(NOT IS_AGENT)
+    list(APPEND WAZUHEXT_WHOLE_LIBS ext_libffi)
+  endif()
+  # Linux agent-only libraries. Their only consumers (data_provider/sysinfo,
+  # syscheckd, rootcheck) are agent-only subdirectories, so the server build
+  # neither compiles nor links them.
+  if(IS_LINUX AND IS_AGENT)
+    list(
+      APPEND
+      WAZUHEXT_WHOLE_LIBS
+      ext_dbus
+      ext_lua
+      ext_rpm
+      ext_popt
+      ext_audit
+      ext_procps)
+  endif()
+endif()
+
+# macOS-only
+if(IS_DARWIN)
+  list(APPEND WAZUHEXT_WHOLE_LIBS ext_libplist)
+endif()
+
+# Server-only additions to whole-archive
+if(NOT IS_AGENT AND NOT IS_WINDOWS)
+  list(APPEND WAZUHEXT_WHOLE_LIBS ext_minizip)
+endif()
+
+# --- Platform-specific linking ---
+
+if(IS_DARWIN)
+  # macOS: -all_load + install name
+  set_target_properties(
+    wazuhext
+    PROPERTIES INSTALL_RPATH "@rpath"
+               BUILD_WITH_INSTALL_RPATH TRUE
+               INSTALL_NAME_DIR "@rpath"
+               MACOSX_RPATH TRUE)
+  # -framework CoreServices: required by curl's --with-apple-sectrust (enabled
+  # above) alongside CoreFoundation/Security -- see m4/curl-apple-sectrust.m4's
+  # APPLE_SECTRUST_LDFLAGS. A static libcurl.a doesn't drag its own configure-time
+  # LDFLAGS into whatever finally links it, so this has to be declared here too.
+  target_link_libraries(
+    wazuhext
+    PRIVATE "-Wl,-all_load" ${WAZUHEXT_WHOLE_LIBS} "-framework Security"
+            "-framework CoreFoundation" "-framework CoreServices"
+            "-framework SystemConfiguration")
+
+elseif(IS_WINDOWS)
+  # Windows (MinGW cross-compile): DLL + delay-import lib
+  target_sources(wazuhext PRIVATE ${RESOURCE_OBJ_DLL})
+  add_dependencies(wazuhext winpthreadpatched)
+  target_link_libraries(
+    wazuhext
+    PRIVATE -static-libgcc
+            "-Wl,--export-all-symbols"
+            "-Wl,--add-stdcall-alias"
+            "-Wl,-L,${SRC_FOLDER}/build/lib"
+            "-Wl,-Bstatic,--whole-archive"
+            -lwinpthreadpatched
+            ${WAZUHEXT_WHOLE_LIBS}
+            "-Wl,--no-whole-archive"
+            "-Wl,-Bdynamic"
+            -ldelayimp
+            wsock32
+            ws2_32
+            crypt32
+            bcrypt
+            secur32
+            iphlpapi)
+
+  # Output .def for delay-import lib creation
+  set_target_properties(
+    wazuhext
+    PROPERTIES LINK_FLAGS
+               "-Wl,--output-def,${CMAKE_CURRENT_BINARY_DIR}/libwazuhext.def")
+
+  # Create delay-import library after DLL is built
+  add_custom_command(
+    TARGET wazuhext
+    POST_BUILD
+    COMMAND
+      i686-w64-mingw32-dlltool -D $<TARGET_FILE:wazuhext> --def
+      ${CMAKE_CURRENT_BINARY_DIR}/libwazuhext.def --output-delaylib
+      ${SRC_FOLDER}/build/lib/libwazuhext.lib
+    COMMENT "Creating delay-import library libwazuhext.lib")
+
+else()
+  # Linux: --whole-archive + system libs
+  target_link_libraries(
+    wazuhext
+    PRIVATE "-Wl,--whole-archive"
+            ${WAZUHEXT_WHOLE_LIBS}
+            "-Wl,--no-whole-archive"
+            rt
+            dl
+            m
+            pthread)
+endif()
+
+# Output to src/build/lib
+set_target_properties(
+  wazuhext
+  PROPERTIES OUTPUT_NAME "wazuhext"
+             PREFIX "lib"
+             LIBRARY_OUTPUT_DIRECTORY ${SRC_FOLDER}/build/lib
+             RUNTIME_OUTPUT_DIRECTORY ${SRC_FOLDER}/build/bin
+             POSITION_INDEPENDENT_CODE ON)
+
+# Provide include dirs to consumers of wazuhext
+target_include_directories(
+  wazuhext PUBLIC ${EXTERNAL_DIR}/cJSON ${EXTERNAL_DIR}/openssl/include
+                  ${EXTERNAL_DIR}/zlib ${EXTERNAL_DIR}/zlib/contrib)
+# deps-entry libwazuhext: end

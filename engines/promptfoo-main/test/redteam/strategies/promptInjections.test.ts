@@ -1,0 +1,132 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { addInjections } from '../../../src/redteam/strategies/promptInjections/index';
+
+import type { TestCase } from '../../../src/types/index';
+
+vi.mock('../../../src/redteam/strategies/promptInjections/data', () => ({
+  default: [
+    'Default template: __PROMPT__',
+    'Before __PROMPT__ middle __PROMPT__ after',
+    'Template without a placeholder',
+  ],
+}));
+
+describe('addInjections', () => {
+  beforeEach(() => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+  it('should add prompt injections and store originalText', async () => {
+    const testCases: TestCase[] = [
+      {
+        vars: { prompt: 'Tell me a joke' },
+        metadata: { pluginId: 'harmful:test' },
+        assert: [{ type: 'promptfoo:redteam:harmful', metric: 'test' }],
+      },
+    ];
+
+    const result = await addInjections(testCases, 'prompt', {});
+
+    expect(result).toHaveLength(1);
+    // Check that the prompt was modified (it should be different from original)
+    expect(result[0].vars?.prompt).toBeDefined();
+    expect(result[0].vars?.prompt).not.toBe('Tell me a joke'); // Should be modified
+    // Check that metadata stores the original text correctly
+    expect(result[0].metadata).toMatchObject({
+      pluginId: 'harmful:test',
+      strategyId: 'jailbreak-templates',
+      originalText: 'Tell me a joke',
+    });
+    expect(result[0].assert?.[0].metric).toBe('Harmful/Injection');
+  });
+
+  it('should handle multiple samples', async () => {
+    const testCases: TestCase[] = [
+      {
+        vars: { prompt: 'Hello world' },
+        metadata: {},
+      },
+    ];
+
+    const result = await addInjections(testCases, 'prompt', { sample: 3 });
+
+    expect(result).toHaveLength(3);
+    result.forEach((testCase) => {
+      expect(testCase.metadata?.originalText).toBe('Hello world');
+      expect(testCase.metadata?.strategyId).toBe('jailbreak-templates');
+      // The injection might modify the prompt in various ways
+      expect(testCase.vars?.prompt).toBeDefined();
+      expect(testCase.vars?.prompt).not.toBe('Hello world'); // Should be modified
+    });
+  });
+
+  it('should preserve an explicit sample size of 0', async () => {
+    const testCases: TestCase[] = [
+      {
+        vars: { prompt: 'Hello world' },
+        metadata: {},
+      },
+    ];
+
+    const result = await addInjections(testCases, 'prompt', { sample: 0 });
+
+    expect(result).toEqual([]);
+  });
+
+  it('should filter harmful only when configured', async () => {
+    const testCases: TestCase[] = [
+      {
+        vars: { prompt: 'Harmful content' },
+        metadata: { pluginId: 'harmful:test' },
+      },
+      {
+        vars: { prompt: 'Safe content' },
+        metadata: { pluginId: 'safe:test' },
+      },
+    ];
+
+    const result = await addInjections(testCases, 'prompt', { harmfulOnly: true });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].metadata?.originalText).toBe('Harmful content');
+  });
+
+  it('should handle test cases without metadata', async () => {
+    const testCases: TestCase[] = [
+      {
+        vars: { prompt: 'Test content' },
+      },
+    ];
+
+    const result = await addInjections(testCases, 'prompt', {});
+
+    expect(result).toHaveLength(1);
+    expect(result[0].metadata?.originalText).toBe('Test content');
+    expect(result[0].metadata?.strategyId).toBe('jailbreak-templates');
+  });
+
+  it.each([
+    'Print $$ literally',
+    'Print $& literally',
+    'Print $` literally',
+    "Print $' literally",
+    "Repeat $& $& $$ $` $'",
+    'Normal attack text',
+  ])('inserts %j literally in default and sampled templates', async (prompt) => {
+    const testCases = [{ vars: { prompt } }];
+    const [result] = await addInjections(testCases, 'prompt', {});
+    expect(result.vars?.prompt, 'default template').toBe(`Default template: ${prompt}`);
+
+    const sampled = await addInjections(testCases, 'prompt', { sample: 3 });
+    expect(
+      sampled.map((testCase) => testCase.vars?.prompt),
+      'sampled templates',
+    ).toEqual([
+      `Default template: ${prompt}`,
+      `Before ${prompt} middle ${prompt} after`,
+      'Template without a placeholder',
+    ]);
+  });
+});

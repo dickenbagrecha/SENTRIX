@@ -1,0 +1,52 @@
+# Multi-stage Docker build for Wazuh 5.1 Manager
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    gcc-14 \
+    g++-14 \
+    make \
+    curl \
+    procps \
+    python3 \
+    python3-pip \
+    python3-venv \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY engines/wazuh-main/ ./
+
+# Compile Wazuh Manager daemons
+RUN make -C src TARGET=manager deps -j$(nproc) && \
+    make -C src TARGET=manager -j$(nproc)
+
+# Install Python framework
+RUN python3 -m venv /var/wazuh-manager/framework/python && \
+    /var/wazuh-manager/framework/python/bin/pip install --no-cache-dir -r framework/requirements.txt
+
+# Runtime Stage
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    procps \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /var/wazuh-manager
+
+COPY --from=builder /var/wazuh-manager /var/wazuh-manager
+COPY --from=builder /etc/wazuh-manager /etc/wazuh-manager
+
+EXPOSE 1514/tcp 1515/tcp 55000/tcp
+
+ENTRYPOINT ["/var/wazuh-manager/bin/wazuh-manager-control"]
+CMD ["start"]

@@ -1,0 +1,860 @@
+/*
+ * Wazuh SysInfo
+ * Copyright (C) Wazuh Inc.
+ *
+ * This program is free software; you can redistribute it
+ * and/or modify it under the terms of the GNU General Public
+ * License (version 2) as published by the FSF - Free Software
+ * Foundation.
+ */
+
+#include "pkgWrapper_test.h"
+#include <optional>
+#include "packages/packageMac.h"
+#include "packages/pkgWrapper.h"
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <limits.h>
+#include <stdexcept>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <iostream>
+
+namespace
+{
+    std::string currentWorkingDirectory()
+    {
+        char path[PATH_MAX];
+
+        if (::getcwd(path, sizeof(path)) == nullptr)
+        {
+            throw std::runtime_error("getcwd failed");
+        }
+
+        return path;
+    }
+}
+
+void PKGWrapperTest::SetUp()
+{
+    PKGWrapper::setReceiptLivenessChecker(
+        [](const std::string&, const std::string&)
+    {
+        return true;
+    });
+
+    // Create a unique temp directory for tests that write files.
+    char tmpl[] = "/tmp/pkgtest_XXXXXX";
+
+    if (const char* dir = ::mkdtemp(tmpl))
+    {
+        m_tempDir = dir;
+    }
+};
+
+void PKGWrapperTest::TearDown()
+{
+    PKGWrapper::resetReceiptLivenessChecker();
+
+    // Remove any leftover files and the temp directory itself.
+    if (!m_tempDir.empty())
+    {
+        const std::string cmd { "rm -rf " + m_tempDir };
+        ::system(cmd.c_str());
+    }
+};
+
+using ::testing::_;
+using ::testing::Return;
+
+TEST_F(PKGWrapperTest, LongVersion)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_LongVersion.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "Opera");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, ShortVersion)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_ShortVersion.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "Opera");
+    EXPECT_EQ(wrapper->version(), "100.0");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NameDifferentExecutable)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NameDifferentExecutable.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "OperaName");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NameFirst)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NameFirst.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "OperaName");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NoNameButExecutable)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NoNameButExecutable.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "Opera");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NoNameNoExecutable)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NoNameNoExecutable.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NoVersion)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NoVersion.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "Opera");
+    EXPECT_EQ(wrapper->version(), " ");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NoGroups)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NoGroups.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "Opera");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), " ");
+    EXPECT_EQ(wrapper->description(), "com.operasoftware.Opera");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Operasoftware");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NoDescription)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NoDescription.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "Opera");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), " ");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+TEST_F(PKGWrapperTest, NoVendor)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_NoVendor.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "Opera");
+    EXPECT_EQ(wrapper->version(), "100.0.4815.54");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.productivity");
+    EXPECT_EQ(wrapper->description(), "description_text");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+// A bundle under a Utilities directory is the only case that may report
+// "utilities". Paired with the cases above, which all sit directly under
+// input_files, this pins both values the classifier can produce.
+TEST_F(PKGWrapperTest, SourceUtilitiesFolder)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files/Utilities";
+    std::string package { "PKGWrapperTest_Utilities.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "SampleUtility");
+    EXPECT_EQ(wrapper->version(), "1.2.3");
+    EXPECT_EQ(wrapper->groups(), "public.app-category.utilities");
+    EXPECT_EQ(wrapper->description(), "com.wazuh.SampleUtility");
+    EXPECT_EQ(wrapper->architecture(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "utilities");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+    EXPECT_EQ(wrapper->vendor(), "Wazuh");
+    EXPECT_EQ(wrapper->priority(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), UNKNOWN_VALUE);
+    EXPECT_EQ(wrapper->multiarch(), UNKNOWN_VALUE);
+}
+
+// The classifier looks for the substring anywhere in the path, so it must not
+// be fooled by a bundle whose own name merely contains the word. This case
+// fails against a classifier rewritten as a prefix or a whole-name match.
+TEST_F(PKGWrapperTest, SourceBundleNamedLikeUtilities)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "PKGWrapperTest_MyUtilities.app" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "MyUtilities");
+    EXPECT_EQ(wrapper->source(), "applications");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package + "/" + APP_INFO_PATH);
+}
+
+// A folder whose name merely starts with the word (e.g. a vendor's own "Utilities Pro")
+// must not be classified as the system Utilities folder. Only an exact "Utilities"
+// path component should count, not any folder name containing it as a prefix.
+TEST_F(PKGWrapperTest, SourceFolderNamedLikeUtilitiesButNotExactly)
+{
+    const std::string parentDir { m_tempDir + "/Utilities Pro" };
+    const std::string package { "PKGWrapperTest_NotUtilities.app" };
+    const std::string contentsDir { parentDir + "/" + package + "/Contents" };
+    ASSERT_TRUE(std::filesystem::create_directories(contentsDir));
+
+    std::ofstream file { contentsDir + "/Info.plist" };
+    file << "<plist></plist>";
+    file.close();
+
+    PackageContext ctx { parentDir, package, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    EXPECT_EQ(wrapper->source(), "applications");
+}
+
+TEST_F(PKGWrapperTest, pkgVersionXML)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "com.wazuh.pkg.wazuh-agent.plist" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "wazuh-agent");
+    EXPECT_EQ(wrapper->version(), "4.10.1");
+    EXPECT_EQ(wrapper->groups(), " ");
+    EXPECT_EQ(wrapper->description(), "com.wazuh.pkg.wazuh-agent");
+    EXPECT_EQ(wrapper->architecture(), " ");
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "receipts");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package);
+    EXPECT_EQ(wrapper->vendor(), "Wazuh");
+    EXPECT_EQ(wrapper->priority(), " ");
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), "2024-11-07T08:58:38Z");
+    EXPECT_EQ(wrapper->multiarch(), " ");
+}
+
+TEST_F(PKGWrapperTest, pkgVersionBin)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "us.zoom.pkg.videomeeting.plist" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "videomeeting");
+    EXPECT_EQ(wrapper->version(), "6.2.6.41824");
+    EXPECT_EQ(wrapper->groups(), " ");
+    EXPECT_EQ(wrapper->description(), "us.zoom.pkg.videomeeting");
+    EXPECT_EQ(wrapper->architecture(), " ");
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "receipts");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package);
+    EXPECT_EQ(wrapper->vendor(), "Zoom");
+    EXPECT_EQ(wrapper->priority(), " ");
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), "2024-11-08T11:44:04Z");
+    EXPECT_EQ(wrapper->multiarch(), " ");
+}
+
+TEST_F(PKGWrapperTest, pkgVersionLong)
+{
+    std::string inputPath;
+    inputPath += currentWorkingDirectory();
+    inputPath += "/input_files";
+    std::string package { "org.R-project.x86_64.R.GUI.pkg.plist" };
+
+    struct PackageContext ctx
+    {
+        inputPath, package, ""
+    };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "R.GUI");
+    EXPECT_EQ(wrapper->version(), "1.81");
+    EXPECT_EQ(wrapper->groups(), " ");
+    EXPECT_EQ(wrapper->description(), "org.R-project.x86_64.R.GUI.pkg");
+    EXPECT_EQ(wrapper->architecture(), " ");
+    EXPECT_EQ(wrapper->format(), "pkg");
+    EXPECT_EQ(wrapper->osPatch(), "");
+    EXPECT_EQ(wrapper->source(), "receipts");
+    EXPECT_EQ(wrapper->location(), inputPath + "/" + package);
+    EXPECT_EQ(wrapper->vendor(), "R-project");
+    EXPECT_EQ(wrapper->priority(), " ");
+    EXPECT_EQ(wrapper->size(), std::nullopt);
+    EXPECT_EQ(wrapper->install_time(), "2024-11-13T10:59:10Z");
+    EXPECT_EQ(wrapper->multiarch(), " ");
+}
+
+namespace
+{
+    // Minimal helper to write a synthetic XML receipt next to the test
+    // executable, mirroring the layout sysInfoMac.cpp passes to PKGWrapper.
+    void writeReceiptPlist(const std::string& path,
+                           const std::string& pkgId,
+                           const std::string& version,
+                           const std::string& installDate,
+                           const std::string& installPrefixPath = "")
+    {
+        std::ofstream out { path, std::ios::trunc };
+        out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            << "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            << "<plist version=\"1.0\">\n"
+            << "<dict>\n"
+            << "  <key>PackageIdentifier</key><string>" << pkgId << "</string>\n"
+            << "  <key>PackageVersion</key><string>" << version << "</string>\n"
+            << "  <key>InstallDate</key><string>" << installDate << "</string>\n";
+
+        if (!installPrefixPath.empty())
+        {
+            out << "  <key>InstallPrefixPath</key><string>" << installPrefixPath << "</string>\n";
+        }
+
+        out << "</dict>\n"
+            << "</plist>\n";
+    }
+}
+
+TEST_F(PKGWrapperTest, ReceiptKeptWhenLivenessCheckerReturnsTrue)
+{
+    // Override the SetUp default with an explicit always-live checker that
+    // also records the arguments it received, so we can confirm wiring.
+    std::string seenPath;
+    std::string seenPrefix;
+    PKGWrapper::setReceiptLivenessChecker(
+        [&](const std::string & p, const std::string & prefix)
+    {
+        seenPath = p;
+        seenPrefix = prefix;
+        return true;
+    });
+
+    const std::string dir { currentWorkingDirectory() + "/input_files" };
+    const std::string package { "com.wazuh.pkg.wazuh-agent.plist" };
+    PackageContext ctx { dir, package, "" };
+
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "wazuh-agent");
+    EXPECT_EQ(wrapper->location(), dir + "/" + package);
+
+    // The wrapper must have asked the checker about this exact receipt.
+    EXPECT_EQ(seenPath, dir + "/" + package);
+    // No InstallPrefixPath in the fixture → default "/".
+    EXPECT_EQ(seenPrefix, "/");
+}
+
+TEST_F(PKGWrapperTest, ReceiptDroppedWhenLivenessCheckerReturnsFalse)
+{
+    PKGWrapper::setReceiptLivenessChecker(
+        [](const std::string&, const std::string&)
+    {
+        return false;
+    });
+
+    const std::string dir { currentWorkingDirectory() + "/input_files" };
+    const std::string package { "com.wazuh.pkg.wazuh-agent.plist" };
+    PackageContext ctx { dir, package, "" };
+
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    // Empty name is the contract that tells sysInfoMac.cpp to skip this row.
+    EXPECT_EQ(wrapper->name(), "");
+    // The other fields are still parsed (we only clear the name) — the caller
+    // never reads them in this case.
+    EXPECT_EQ(wrapper->source(), "receipts");
+}
+
+TEST_F(PKGWrapperTest, JavaResidualReceiptIsDroppedByDefaultChecker)
+{
+    // Reproduces the bug exactly: synthetic com.oracle.jre receipt with
+    // version 1.1, no companion BOM. The default checker must classify it
+    // as dead.
+    PKGWrapper::resetReceiptLivenessChecker();
+
+    const std::string plistName { "com.oracle.jre.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.oracle.jre", "1.1", "2022-08-16T15:30:00Z");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    // No BOM → default checker returns false → wrapper drops the entry.
+    EXPECT_EQ(wrapper->name(), "");
+}
+
+TEST_F(PKGWrapperTest, ReceiptWithoutBomIsDroppedByDefaultChecker)
+{
+    PKGWrapper::resetReceiptLivenessChecker();
+
+    const std::string plistName { "no_bom.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.example.nobom", "9.9", "2024-01-01T00:00:00Z");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    EXPECT_EQ(wrapper->name(), "");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: InstallPrefixPath = "." is normalised to "/"
+// ---------------------------------------------------------------------------
+TEST_F(PKGWrapperTest, DotPrefixIsNormalisedToRoot)
+{
+    std::string seenPrefix;
+    PKGWrapper::setReceiptLivenessChecker(
+        [&](const std::string&, const std::string & prefix)
+    {
+        seenPrefix = prefix;
+        return true;
+    });
+
+    const std::string plistName { "dot_prefix.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.example.dotprefix", "1.0", "2024-01-01T00:00:00Z", ".");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    // "." must be normalised to "/" before reaching the checker.
+    EXPECT_EQ(seenPrefix, "/");
+    EXPECT_EQ(wrapper->name(), "dotprefix");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: InstallPrefixPath = "/" is passed through unchanged
+// ---------------------------------------------------------------------------
+TEST_F(PKGWrapperTest, SlashPrefixIsPassedThrough)
+{
+    std::string seenPrefix;
+    PKGWrapper::setReceiptLivenessChecker(
+        [&](const std::string&, const std::string & prefix)
+    {
+        seenPrefix = prefix;
+        return true;
+    });
+
+    const std::string plistName { "slash_prefix.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.example.slashprefix", "2.0", "2024-01-01T00:00:00Z", "/");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    EXPECT_EQ(seenPrefix, "/");
+    EXPECT_EQ(wrapper->name(), "slashprefix");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: custom InstallPrefixPath (e.g. /Library/Java) is preserved
+// ---------------------------------------------------------------------------
+TEST_F(PKGWrapperTest, CustomPrefixIsPreserved)
+{
+    std::string seenPrefix;
+    PKGWrapper::setReceiptLivenessChecker(
+        [&](const std::string&, const std::string & prefix)
+    {
+        seenPrefix = prefix;
+        return true;
+    });
+
+    const std::string plistName { "custom_prefix.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.example.custom", "3.0", "2024-01-01T00:00:00Z", "/Library/Java");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    EXPECT_EQ(seenPrefix, "/Library/Java");
+    EXPECT_EQ(wrapper->name(), "custom");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: missing InstallPrefixPath defaults to "/"
+// ---------------------------------------------------------------------------
+TEST_F(PKGWrapperTest, MissingPrefixDefaultsToRoot)
+{
+    std::string seenPrefix;
+    PKGWrapper::setReceiptLivenessChecker(
+        [&](const std::string&, const std::string & prefix)
+    {
+        seenPrefix = prefix;
+        return true;
+    });
+
+    const std::string plistName { "no_prefix.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.example.noprefix", "4.0", "2024-01-01T00:00:00Z");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    EXPECT_EQ(seenPrefix, "/");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: a live receipt retains all fields
+// ---------------------------------------------------------------------------
+TEST_F(PKGWrapperTest, LiveReceiptRetainsAllFields)
+{
+    PKGWrapper::setReceiptLivenessChecker(
+        [](const std::string&, const std::string&)
+    {
+        return true;
+    });
+
+    const std::string plistName { "live_receipt.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.vendor.product", "5.6.7", "2025-03-15T12:00:00Z", "/");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    EXPECT_EQ(wrapper->name(), "product");
+    EXPECT_EQ(wrapper->version(), "5.6.7");
+    EXPECT_EQ(wrapper->vendor(), "Vendor");
+    EXPECT_EQ(wrapper->description(), "com.vendor.product");
+    EXPECT_EQ(wrapper->source(), "receipts");
+    EXPECT_EQ(wrapper->install_time(), "2025-03-15T12:00:00Z");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: a dead receipt clears name; other fields remain populated.
+// The caller (sysInfoMac.cpp) skips entries with empty name.
+// ---------------------------------------------------------------------------
+TEST_F(PKGWrapperTest, DeadReceiptClearsNameOnly)
+{
+    PKGWrapper::setReceiptLivenessChecker(
+        [](const std::string&, const std::string&)
+    {
+        return false;
+    });
+
+    const std::string plistName { "dead_receipt.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    writeReceiptPlist(plistPath, "com.vendor.deadpkg", "1.0", "2025-01-01T00:00:00Z", "/");
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+
+    // Name cleared → sysInfoMac.cpp will skip this entry.
+    EXPECT_EQ(wrapper->name(), "");
+    // Other fields are still populated from the plist parsing phase.
+    EXPECT_EQ(wrapper->source(), "receipts");
+    EXPECT_EQ(wrapper->version(), "1.0");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: the file behind a package path is not a plain regular file.
+// A per-user ~/Applications is untrusted input, so these three shapes must
+// all be rejected (empty name, no throw, no hang) instead of parsed.
+// ---------------------------------------------------------------------------
+TEST_F(PKGWrapperTest, RejectsAFifoInsteadOfBlocking)
+{
+    const std::string plistName { "fifo.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    ASSERT_EQ(0, ::mkfifo(plistPath.c_str(), 0644));
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+
+    // The point of the test: opening a FIFO with no writer must not block
+    // this construction forever, which is exactly what it would do without
+    // the O_NONBLOCK open used to read the file.
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "");
+}
+
+TEST_F(PKGWrapperTest, RejectsASymlinkToACharacterDevice)
+{
+    const std::string plistName { "devzero.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    ASSERT_EQ(0, ::symlink("/dev/zero", plistPath.c_str()));
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "");
+}
+
+TEST_F(PKGWrapperTest, RejectsAFileLargerThanTheSizeLimit)
+{
+    // A sparse file: its logical size is huge but it occupies no real disk
+    // space, the same shape as the attack this size check defends against.
+    const std::string plistName { "huge_receipt.plist" };
+    const std::string plistPath { m_tempDir + "/" + plistName };
+    {
+        std::ofstream file { plistPath, std::ios::binary };
+    }
+    ASSERT_EQ(0, ::truncate(plistPath.c_str(), MAX_PLIST_SIZE + 1));
+
+    PackageContext ctx { m_tempDir, plistName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->name(), "");
+}
+
+TEST_F(PKGWrapperTest, FollowsASymlinkToAnOrdinaryReceiptFile)
+{
+    const std::string realName { "real_receipt.plist" };
+    const std::string realPath { m_tempDir + "/" + realName };
+    writeReceiptPlist(realPath, "com.example.symlinked", "3.2.1", "2025-06-01T00:00:00Z", "/");
+
+    const std::string linkName { "receipt_via_symlink.plist" };
+    const std::string linkPath { m_tempDir + "/" + linkName };
+    ASSERT_EQ(0, ::symlink(realPath.c_str(), linkPath.c_str()));
+
+    // A symlink to an ordinary file must still be accepted and parsed like the
+    // real file: only the resolved target's type matters, not whether the
+    // final path component is itself a symlink.
+    PackageContext ctx { m_tempDir, linkName, "" };
+    std::shared_ptr<PKGWrapper> wrapper;
+    EXPECT_NO_THROW(wrapper = std::make_shared<PKGWrapper>(ctx));
+    EXPECT_EQ(wrapper->version(), "3.2.1");
+    EXPECT_EQ(wrapper->source(), "receipts");
+}

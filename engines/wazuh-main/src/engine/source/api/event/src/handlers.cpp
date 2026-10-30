@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#include <api/event/handlers.hpp>
+#include <api/event/identityWarningGate.hpp>
+#include <api/event/ndJsonParser.hpp>
+#include <base/json.hpp>
+#include <base/logging.hpp>
+
+#include <fastmetrics/registry.hpp>
+
+namespace api::event::handlers
+{
+adapter::RouteHandler pushEvent(const std::shared_ptr<::router::IRouterAPI>& orchestrator,
+                                const std::shared_ptr<::dumper::IDumper>& dumper,
+                                std::shared_ptr<agentcache::AgentMetadataCache> agentMetadataCache)
+{
+    auto lambdaName = logging::getLambdaName(__FUNCTION__, "apiHandler");
+    auto weakOrchestrator = std::weak_ptr(orchestrator);
+
+    // Cache metric pointers (one-time map lookup)
+    auto bytesReceivedCounter = fastmetrics::manager().getOrCreateCounter(fastmetrics::names::SERVER_BYTES_RECEIVED);
+    auto eventsReceivedCounter = fastmetrics::manager().getOrCreateCounter(fastmetrics::names::SERVER_EVENTS_RECEIVED);
+
+    auto identityRejectedCounter =
+        fastmetrics::manager().getOrCreateCounter(fastmetrics::names::AGENT_CACHE_REJECTED_IDENTITY);
+    auto identityWarningGate = std::make_shared<IdentityWarningGate>();
+    // Malformed batches (invalid H-line JSON, broken framing) are throttled the same way: one producer
+    // sending them continuously must not flood the log.
+    auto parseWarningGate = std::make_shared<IdentityWarningGate>();
+
+    return [lambdaName = std::move(lambdaName),
+            weakOrchestrator = std::move(weakOrchestrator),
+            weakDump = std::weak_ptr(dumper),
+            agentMetadataCache = std::move(agentMetadataCache),
+            bytesReceivedCounter,
+            eventsReceivedCounter,
+            identityRejectedCounter,
+            identityWarningGate,
+            parseWarningGate](const auto& req, auto& res)
+    {
+        auto orchestratorRef = weakOrchestrator.lock();
+        if (!orchestratorRef)
+        {
+            LOG_ERROR_L(lambdaName.c_str(), "[API::Event] Received request but orchestrator is not available");
+            res.status = httplib::StatusCode::InternalServerError_500;
+            res.set_content("{\"error\": \"Internal server error\", \"code\": 500}", "application/json");
+            return;
+        }
+
+        // Dump the batch, stripping trailing newline to prevent blank lines between batches.
+
+        if (auto dumpRef = weakDump.lock(); dumpRef)
+        {
+            std::string_view batchToDump = req.body;
+            if (!batchToDump.empty() && batchToDump.back() == '\n')
+            {
+                batchToDump.remove_suffix(1);
+            }
+            dumpRef->dump(batchToDump);
+        }
+
+        // Track bytes received (entire HTTP body size)
+        bytesReceivedCounter->add(req.body.size());
+
+        const auto carrierCount = req.get_header_value_count("X-Wazuh-Agent-Id");
+        const std::string agentId = carrierCount == 1 ? req.get_header_value("X-Wazuh-Agent-Id")
+                                                      : (carrierCount == 0 ? "<missing>" : "<repeated>");
+        const auto badRequest = [&res](std::string_view message)
+        {
+            json::Json body;
+            body.setString(message, "/error");
+            body.setInt(400, "/code");
+            res.status = httplib::StatusCode::BadRequest_400;
+            res.set_content(body.str(), "application/json");
+        };
+
+        try
+        {
+            if (carrierCount != 1)
+            {
+                throw agentcache::IdentityError {
+                    fmt::format(protocol::PARSER_ERROR_MSG, "Expected exactly one X-Wazuh-Agent-Id header")};
+            }
+            if (!agentcache::isCanonicalAgentId(agentId))
+            {
+                throw agentcache::IdentityError {
+                    fmt::format(protocol::PARSER_ERROR_MSG, "X-Wazuh-Agent-Id must be canonical")};
+            }
+            protocol::EventHook enqueueHook =
+                [orchestratorRef, eventsReceivedCounter](router::IngestEvent&& ingestEvent)
+            {
+                eventsReceivedCounter->add(1);
+                orchestratorRef->postEvent(std::move(ingestEvent));
+            };
+
+            protocol::parseNDJson(req.body, agentId, enqueueHook, agentMetadataCache);
+        }
+        catch (const agentcache::IdentityError& e)
+        {
+            identityRejectedCounter->add(1);
+            if (identityWarningGate->allow(std::chrono::steady_clock::now()))
+            {
+                json::Json context;
+                context.setString(std::string_view(agentId).substr(0, 64), "/agent_id");
+                LOG_WARNING_L(lambdaName.c_str(), "[API::Event] Identity rejected {}: {}", context.str(), e.what());
+            }
+            badRequest(e.what());
+            return;
+        }
+        catch (const std::exception& e)
+        {
+            if (parseWarningGate->allow(std::chrono::steady_clock::now()))
+            {
+                json::Json context;
+                context.setString(std::string_view(agentId).substr(0, 64), "/agent_id");
+                LOG_WARNING_L(
+                    lambdaName.c_str(), "[API::Event] Failed to parse request {}: '{}'", context.str(), e.what());
+            }
+            badRequest(e.what());
+            return;
+        }
+
+        res.status = httplib::StatusCode::OK_200;
+    };
+}
+} // namespace api::event::handlers

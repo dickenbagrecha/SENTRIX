@@ -1,0 +1,14 @@
+{
+  "name": "dynamic-conversation-ids",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "server": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "uuid": "^14.0.0",
+    "openai": "^7.20.0"
+  }
+}

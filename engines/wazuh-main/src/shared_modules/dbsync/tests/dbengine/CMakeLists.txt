@@ -1,0 +1,73 @@
+cmake_minimum_required(VERSION 3.12.4)
+
+project(dbengine_unit_test)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT DEFINED WAZUH_MAIN_PROJECT)
+  get_filename_component(SRC_FOLDER ${CMAKE_SOURCE_DIR}/../../ ABSOLUTE)
+endif()
+
+include_directories(${SRC_FOLDER}/shared_modules/dbsync/include/)
+link_directories(${CMAKE_BINARY_DIR}/lib)
+
+file(GLOB DBENGINE_UNITTEST_SRC "*.cpp")
+
+file(GLOB SQLITE_ENGINE_SRC
+     "${SRC_FOLDER}/shared_modules/dbsync/src/sqlite/sqlite_dbengine.cpp"
+     "${SRC_FOLDER}/shared_modules/dbsync/src/sqlite/sqlite_wrapper.cpp")
+
+add_executable(dbengine_unit_test ${DBENGINE_UNITTEST_SRC} ${SQLITE_ENGINE_SRC})
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  target_link_libraries(
+    dbengine_unit_test
+    debug
+    gtestd
+    debug
+    gmockd
+    debug
+    gtest_maind
+    debug
+    gmock_maind
+    optimized
+    gtest
+    optimized
+    gmock
+    optimized
+    gtest_main
+    optimized
+    gmock_main
+    pthread
+    sqlite3
+    cjson
+    -static-libgcc
+    -static-libstdc++)
+else()
+  target_link_libraries(
+    dbengine_unit_test
+    debug
+    gtestd
+    debug
+    gmockd
+    debug
+    gtest_maind
+    debug
+    gmock_maind
+    optimized
+    gtest
+    optimized
+    gmock
+    optimized
+    gtest_main
+    optimized
+    gmock_main
+    pthread
+    sqlite3
+    cjson
+    dl)
+endif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+
+add_test(NAME dbengine_unit_test COMMAND dbengine_unit_test)
+
+set_tests_properties(dbengine_unit_test PROPERTIES LABELS "dbsync")

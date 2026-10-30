@@ -1,0 +1,307 @@
+import { stat } from 'fs/promises';
+import path from 'path';
+
+import { globSync } from 'glob';
+import logger from '../logger';
+import { isJavascriptFile } from '../util/fileExtensions';
+import { parsePathOrGlob } from '../util/index';
+import invariant from '../util/invariant';
+import { PromptSchema } from '../validators/prompts';
+import { processCsvPrompts } from './processors/csv';
+import { processExecutableFile } from './processors/executable';
+import { processJsFile } from './processors/javascript';
+import { processJsonFile } from './processors/json';
+import { processJsonlFile } from './processors/jsonl';
+import { processPythonFile } from './processors/python';
+import { processString } from './processors/string';
+import { processTemplateFile, processTxtFile } from './processors/text';
+import { processYamlFile } from './processors/yaml';
+import { maybeFilePath, normalizeInput } from './utils';
+
+import type { EvaluateTestSuite, Prompt, PromptFunction, TestSuite } from '../types/index';
+
+export * from './grading';
+export { DEFAULT_WEB_SEARCH_PROMPT } from './grading';
+
+/** Reads the prompts in one file, choosing the processor by its extension. */
+async function processPromptFile(
+  filePath: string,
+  prompt: Partial<Prompt>,
+  extension: string | undefined,
+  functionName: string | undefined,
+  labelPath: string,
+): Promise<Prompt[]> {
+  if (extension === '.csv') {
+    return processCsvPrompts(filePath, prompt);
+  }
+  if (extension === '.j2') {
+    return processTemplateFile(filePath, prompt, labelPath);
+  }
+  if (extension === '.json') {
+    return processJsonFile(filePath, prompt, labelPath);
+  }
+  if (extension === '.jsonl') {
+    return processJsonlFile(filePath, prompt, labelPath);
+  }
+  if (extension && isJavascriptFile(extension)) {
+    return processJsFile(filePath, prompt, functionName, labelPath);
+  }
+  if (extension === '.md') {
+    return processTemplateFile(filePath, prompt, labelPath);
+  }
+  if (extension === '.py') {
+    return processPythonFile(filePath, prompt, functionName, labelPath);
+  }
+  if (extension === '.txt') {
+    return processTxtFile(filePath, prompt, labelPath);
+  }
+  if (extension && ['.yml', '.yaml'].includes(extension)) {
+    return processYamlFile(filePath, prompt, labelPath);
+  }
+  // Handle common executable extensions
+  if (
+    extension &&
+    ['.sh', '.bash', '.exe', '.bat', '.cmd', '.ps1', '.rb', '.pl'].includes(extension)
+  ) {
+    return await processExecutableFile(filePath, prompt, functionName, labelPath);
+  }
+  // If no extension matched but file exists and is executable, treat it as an executable
+  try {
+    const stats = await stat(filePath);
+    if (stats.isFile() && (stats.mode & 0o111) !== 0) {
+      // File is executable
+      return await processExecutableFile(filePath, prompt, functionName, labelPath);
+    }
+  } catch (_e) {
+    // File doesn't exist or can't be accessed, fall through
+  }
+  return [];
+}
+
+/**
+ * Processes a raw prompt based on its content type and path.
+ * @param prompt - The raw prompt data.
+ * @param basePath - Base path for file resolution.
+ * @param maxRecursionDepth - Maximum recursion depth for globbing.
+ * @param labelBasePath - When set, files are labeled as if read from this base instead.
+ * @returns Promise resolving to an array of processed prompts.
+ */
+async function processPrompt(
+  prompt: Partial<Prompt>,
+  basePath: string = '',
+  maxRecursionDepth: number = 1,
+  labelBasePath?: string,
+): Promise<Prompt[]> {
+  const getLabelPath = (filePath: string) =>
+    labelBasePath === undefined
+      ? filePath
+      : path.join(labelBasePath, path.relative(basePath, filePath));
+
+  invariant(
+    typeof prompt.raw === 'string',
+    `prompt.raw must be a string, but got ${JSON.stringify(prompt.raw)}`,
+  );
+
+  // Handling when the prompt is a raw function (e.g. javascript function)
+  if (prompt.function) {
+    return [prompt as Prompt];
+  }
+
+  // Handle exec: prefix for executable prompts
+  if (prompt.raw.startsWith('exec:')) {
+    const execSpec = prompt.raw.substring(5); // Remove 'exec:' prefix
+    const { filePath, functionName } = parsePathOrGlob(basePath, execSpec);
+    return processExecutableFile(filePath, prompt, functionName, getLabelPath(filePath));
+  }
+
+  if (!maybeFilePath(prompt.raw)) {
+    return processString(prompt);
+  }
+
+  const {
+    extension,
+    functionName,
+    isPathPattern,
+    filePath,
+  }: {
+    extension?: string;
+    functionName?: string;
+    isPathPattern: boolean;
+    filePath: string;
+  } = parsePathOrGlob(basePath, prompt.raw);
+
+  if (isPathPattern && maxRecursionDepth > 0) {
+    const globbedPath = globSync(filePath.replace(/\\/g, '/'), {
+      windowsPathsNoEscape: true,
+    });
+    logger.debug(
+      `Expanded prompt ${prompt.raw} to ${filePath} and then to ${JSON.stringify(globbedPath)}`,
+    );
+    const prompts: Prompt[] = [];
+    for (const globbedFilePath of globbedPath) {
+      // The match already includes the base, so resolve it before the base is applied again.
+      const matchedPath = path.resolve(globbedFilePath);
+      const rawPath = functionName ? `${matchedPath}:${functionName}` : matchedPath;
+      const relativePath = path.relative(basePath, matchedPath).replace(/\\/g, '/');
+      const processedPrompts = await processPrompt(
+        {
+          ...prompt,
+          raw: rawPath,
+          id: prompt.id && `${prompt.id}:${relativePath}`,
+          // Text files append their path and chunk text in their processor.
+          label:
+            prompt.label &&
+            (path.extname(matchedPath) === '.txt'
+              ? prompt.label
+              : `${prompt.label}: ${relativePath}`),
+        },
+        basePath,
+        maxRecursionDepth - 1,
+        labelBasePath,
+      );
+      const expandedId = prompt.id && `${prompt.id}:${relativePath}`;
+      prompts.push(
+        ...processedPrompts.map((processedPrompt, index) => ({
+          ...processedPrompt,
+          ...(expandedId && !processedPrompt.id
+            ? { id: processedPrompts.length > 1 ? `${expandedId}:${index + 1}` : expandedId }
+            : {}),
+        })),
+      );
+    }
+    if (prompts.length === 0) {
+      // There was nothing at this filepath, so treat it as a prompt string.
+      logger.debug(
+        `Attempted to load file at "${prompt.raw}", but no file found. Using raw string.`,
+      );
+      prompts.push(...processString(prompt));
+    }
+    return prompts;
+  }
+
+  return processPromptFile(filePath, prompt, extension, functionName, getLabelPath(filePath));
+}
+
+/**
+ * Reads and processes prompts from a specified path or glob pattern.
+ * @param promptPathOrGlobs - The path or glob pattern.
+ * @param basePath - Base path for file resolution.
+ * @param labelBasePath - When set, prompt files are labeled as if read from this base. Labels
+ *   identify prompts, so they should not depend on where the project is checked out even
+ *   when `basePath` is absolute.
+ * @param sourceBasePaths - Per-input source directories when combining configuration files.
+ * @returns Promise resolving to an array of processed prompts.
+ */
+export async function readPrompts(
+  promptPathOrGlobs: string | (string | Partial<Prompt>)[] | Record<string, string>,
+  basePath: string = '',
+  labelBasePath?: string,
+  sourceBasePaths?: readonly string[],
+): Promise<Prompt[]> {
+  logger.debug(`Reading prompts from ${JSON.stringify(promptPathOrGlobs)}`);
+  const promptPartials: Partial<Prompt>[] = normalizeInput(promptPathOrGlobs);
+  const prompts: Prompt[] = [];
+  for (const [index, prompt] of promptPartials.entries()) {
+    const sourceBasePath = sourceBasePaths?.[index];
+    const promptBatch = await processPrompt(
+      prompt,
+      sourceBasePath ?? basePath,
+      1,
+      sourceBasePath === undefined ? labelBasePath : path.relative(process.cwd(), sourceBasePath),
+    );
+    if (promptBatch.length === 0) {
+      throw new Error(`There are no prompts in ${JSON.stringify(prompt.raw)}`);
+    }
+    prompts.push(...promptBatch);
+  }
+  return prompts;
+}
+
+export async function processPrompts(
+  prompts: EvaluateTestSuite['prompts'],
+  basePath?: string,
+): Promise<TestSuite['prompts']> {
+  return (
+    await Promise.all(
+      prompts.map(async (promptInput: EvaluateTestSuite['prompts'][number]) => {
+        if (typeof promptInput === 'function') {
+          return {
+            raw: promptInput.toString(),
+            label: promptInput?.name ?? promptInput.toString(),
+            function: promptInput as PromptFunction,
+          };
+        } else if (typeof promptInput === 'string') {
+          return readPrompts(promptInput, basePath);
+        }
+        try {
+          return PromptSchema.parse(promptInput);
+        } catch (error) {
+          logger.warn(
+            `Prompt input is not a valid prompt schema: ${error}\nFalling back to serialized JSON as raw prompt.`,
+          );
+          return {
+            raw: JSON.stringify(promptInput),
+            label: JSON.stringify(promptInput),
+          };
+        }
+      }),
+    )
+  ).flat();
+}
+
+// G-Eval prompts
+export const GEVAL_PROMPT_STEPS = `
+Given evaluation criteria that outline how you should judge a piece of text, generate 3-4 concise evaluation steps applicable to any text based on the criteria below and designed to check whether the criteria are satisfied by the text.
+
+**EVALUATION CRITERIA**
+{{criteria}}
+
+**OUTPUT FORMAT**
+IMPORTANT:
+- Return output ONLY as a minified JSON object (no code fences).
+- The JSON object must contain a single key, "steps", whose value is a list of strings.
+- Each string must represent one evaluation step.
+- Do NOT include any explanations, commentary, extra text, or additional formatting.
+
+Format:
+{"steps": <list_of_strings>}
+
+Example:
+{"steps":["<Evaluation Step 1>","<Evaluation Step 2>","<Evaluation Step 3>","<Evaluation Step 4>"]}
+
+Here are the 3-4 concise evaluation steps, formatted as required in a minified JSON:
+JSON:
+`;
+
+export const GEVAL_PROMPT_EVALUATE = `
+You will be given one Reply for a Prompt below. Your task is to rate the Reply on one metric.
+Please make sure you read and understand these instructions carefully. Please keep this document open while reviewing, and refer to it as needed.
+
+**Evaluation Criteria**
+{{criteria}}
+
+**Evaluation Steps**
+- {{steps}}
+Given the evaluation steps, return a JSON with two keys: 
+  1) a "score" key that MUST be an integer from 0 to {{maxScore}}, where {{maxScore}} indicates that the condition described by the Evaluation Criteria is fully and clearly observed in the Reply according to the Evaluation Steps, and 0 indicates that it is not observed at all;
+  2) a "reason" key, a reason for the given score, but DO NOT QUOTE THE SCORE in your reason. Please mention specific information from Prompt and Reply in your reason, but be very concise with it!
+
+**Prompt**
+{{input}}
+
+**Reply**
+{{output}}
+
+**OUTPUT FORMAT**
+IMPORTANT: 
+- Return output ONLY as a minified JSON object (no code fences).
+- The JSON object must contain exactly two keys: "score" and "reason".
+- No additional words, explanations, or formatting are needed.
+- Absolutely no additional text, explanations, line breaks, or formatting outside the JSON object are allowed.
+
+Example JSON:
+{"score":0,"reason":"The text of reply does not follow the evaluation criteria provided."}
+
+Here is the final evaluation in the required minified JSON format:
+JSON:
+`;

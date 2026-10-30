@@ -1,0 +1,166 @@
+#!/bin/bash
+# Copyright (C) Wazuh Inc.
+#
+# This program is a free software; you can redistribute it
+# and/or modify it under the terms of the GNU General Public
+# License (version 2) as published by the FSF - Free Software
+# Foundation.
+
+set -euo pipefail
+
+WAZUH_HOST_DIR=/wazuh_host
+WAZUH_ROOT_DIR=/wazuh #Important: Do not change this path
+WAZUH_INSTALLDIR=/var/wazuh-manager
+CPYTHON_DIR=$WAZUH_ROOT_DIR/src/external/cpython
+OUTPUT_DIR=/output
+
+main() {
+    # Parse script arguments
+    parse_args "$@" || exit 1
+    # Get wazuh repository
+    get_wazuh_repo
+    # Download wazuh precompiled dependencies. When cpython is built here its pool
+    # ref may not exist yet, so it is left out of the download.
+    if $BUILD_CPYTHON; then
+        local external_res
+        external_res="$(make -s -C "$WAZUH_ROOT_DIR/src" print-EXTERNAL_RES | sed -E 's/(^| )cpython( |$)/ /')"
+        make -C "$WAZUH_ROOT_DIR/src" PYTHON_SOURCE=y deps -j EXTERNAL_RES="$external_res"
+    else
+        make -C "$WAZUH_ROOT_DIR/src" PYTHON_SOURCE=y deps -j
+    fi
+
+    PYTHON_VERSION=$(cat $WAZUH_ROOT_DIR/framework/.python-version)
+
+    if $BUILD_CPYTHON; then
+        # Build CPython from sources
+        rm -rf "$CPYTHON_DIR"
+        download_cpython
+        customize_cpython
+        build_cpython
+    fi
+
+    if $BUILD_DEPS || $BUILD_CPYTHON; then
+        download_wheels
+    fi
+
+    mimic_full_wazuh_installation
+    generate_artifacts
+    record_toolchain
+}
+
+get_wazuh_repo() {
+    if [ -z "${WAZUH_BRANCH:-}" ]; then
+        cp -rf $WAZUH_HOST_DIR $WAZUH_ROOT_DIR
+        # Clean previous builds
+        find "$WAZUH_ROOT_DIR/src/external" -mindepth 1 -maxdepth 1 ! -name 'CMakeLists.txt' -exec rm -rf {} +
+        make clean -j -C "$WAZUH_ROOT_DIR/src"
+    else
+        git clone --branch "$WAZUH_BRANCH" --depth 1 https://github.com/wazuh/wazuh.git  "$WAZUH_ROOT_DIR"
+    fi
+}
+
+# The release tarball of the inventory entry, checked against its upstream_sha256: a tag can move.
+download_cpython() {
+    command -v python3 >/dev/null 2>&1 || yum install python3 -y
+    local url sha256 got
+    read -r url sha256 < <(python3 - "$WAZUH_ROOT_DIR/packages/externals/dependencies.json" <<'PY'
+import json, sys
+entry = next(e for e in json.load(open(sys.argv[1]))["entries"] if e["name"] == "cpython")
+url = entry["url"].replace("{version}", entry["version"]).replace("{revision}", entry["revision"])
+if "{" in url:
+    sys.exit("cpython: unexpanded placeholder in " + url)
+print(url, entry["upstream_sha256"])
+PY
+    )
+    curl -fsSL --retry 3 -o "$WAZUH_ROOT_DIR/cpython-src.tar.gz" "$url"
+    got="$(sha256sum "$WAZUH_ROOT_DIR/cpython-src.tar.gz" | cut -d' ' -f1)"
+    if [ "$got" != "$sha256" ]; then
+        echo "sha256 mismatch for $url: expected $sha256, got $got" >&2
+        exit 1
+    fi
+    mkdir -p "$CPYTHON_DIR"
+    tar -xzf "$WAZUH_ROOT_DIR/cpython-src.tar.gz" -C "$CPYTHON_DIR" --strip-components=1
+    rm -f "$WAZUH_ROOT_DIR/cpython-src.tar.gz"
+}
+
+customize_cpython() {
+    cp -f $WAZUH_ROOT_DIR/framework/cpython/custom/Setup.local $CPYTHON_DIR/Modules
+    cp -f $WAZUH_ROOT_DIR/framework/cpython/custom/Setup.stdlib.in $CPYTHON_DIR/Modules
+}
+
+build_cpython() {
+    make -j -C "$WAZUH_ROOT_DIR/src" build_python TARGET=manager INSTALLDIR=$WAZUH_INSTALLDIR OPTIMIZE_CPYTHON=yes
+}
+
+mimic_full_wazuh_installation() {
+    # Force build of libwazuhext
+    make -j -C "$WAZUH_ROOT_DIR/src" build-external TARGET=manager INSTALLDIR=$WAZUH_INSTALLDIR
+    # Install only libwazuhext to avoid full server compilation & installation
+    mkdir -p "$WAZUH_INSTALLDIR/lib"
+    install -m 0750 $WAZUH_ROOT_DIR/src/build/lib/libwazuhext.so "$WAZUH_INSTALLDIR/lib"
+    # Install python interpreter and its dependencies
+    make -j -C "$WAZUH_ROOT_DIR/src" install_dependencies INSTALLDIR=$WAZUH_INSTALLDIR
+}
+
+generate_artifacts() {
+    # Compress built cpython
+    cd $WAZUH_ROOT_DIR/src/external && tar -zcf "$OUTPUT_DIR/cpython_$ARCH.tar.gz" --owner=0 --group=0 cpython
+    # Compress ready-to-use CPython
+    cd $WAZUH_INSTALLDIR/framework/python && tar -zcf "$OUTPUT_DIR/cpython.tar.gz" --owner=0 --group=0 .
+}
+
+# What the build installed on the fly; the pool manifest of cpython records it.
+record_toolchain() {
+    {
+        echo "gcc: $(gcc --version 2>/dev/null | head -n1)"
+        echo "python3: $(python3 --version 2>&1)"
+        echo "pip: $(python3 -m pip --version 2>/dev/null)"
+        echo "piprepo: $(python3 -m pip show piprepo 2>/dev/null | sed -n 's/^Version: //p')"
+    } > "$OUTPUT_DIR/toolchain.txt"
+}
+
+download_wheels() {
+    # Install Python3 to download wheels
+    yum install python3 -y
+    python3 -m pip install --upgrade pip
+    # Remove existing dependencies
+    rm -rf "$CPYTHON_DIR/Dependencies"
+    # Create dependencies directory
+    mkdir -p "$CPYTHON_DIR/Dependencies"
+    # Download wheels
+    python3 -m pip download --requirement "$WAZUH_ROOT_DIR/framework/requirements.txt"  --no-deps --dest "$CPYTHON_DIR/Dependencies"  --python-version "$PYTHON_VERSION" --no-cache-dir
+    # Create index
+    python3 -m pip install piprepo && piprepo build "$CPYTHON_DIR/Dependencies"
+}
+
+parse_args() {
+    BUILD_CPYTHON=false
+    BUILD_DEPS=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --build-cpython)
+                BUILD_CPYTHON=true
+                ;;
+            --build-deps)
+                BUILD_DEPS=true
+                ;;
+            --wazuh-branch)
+                if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                    echo "ERROR: --wazuh-branch requires a branch name" >&2
+                    return 1
+                fi
+                WAZUH_BRANCH="$2"
+                # Consume the value too; the shift below consumes the option
+                shift
+                ;;
+            *)
+                echo "ERROR: Unrecognized parameter: $1" >&2
+                return 1
+                ;;
+        esac
+        shift
+    done
+}
+
+main "$@"

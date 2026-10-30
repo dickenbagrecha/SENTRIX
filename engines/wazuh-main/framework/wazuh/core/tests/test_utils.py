@@ -1,0 +1,2496 @@
+#!/usr/bin/env python
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+import datetime
+import os
+import re
+from collections.abc import KeysView
+from io import StringIO
+from shutil import copyfile
+from tempfile import TemporaryDirectory, NamedTemporaryFile
+from unittest.mock import call, MagicMock, Mock, mock_open, patch, ANY, sentinel
+from xml.etree.ElementTree import Element
+
+import pytest
+from defusedxml.ElementTree import parse
+from freezegun import freeze_time
+
+with patch('wazuh.core.common.wazuh_uid'):
+    with patch('wazuh.core.common.wazuh_gid'):
+        from wazuh import WazuhException
+        from wazuh.core.agent import WazuhDBQueryAgents, WazuhDBQueryGroup
+        from wazuh.core import utils, exception
+        from wazuh.core.common import WAZUH_PATH
+
+# all necessary params
+
+test_data_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'data')
+test_files_path = os.path.join(test_data_path, 'utils')
+
+# input data for testing q filter
+input_array = [
+    {
+        "count": 3,
+        "name": "default",
+        "mergedSum": "a7d19a28cd5591eade763e852248197b",
+        "configSum": "ab73af41699f13fdd81903b5f23d8d00"
+    },
+    {
+        "count": 0,
+        "name": "dmz",
+        "mergedSum": "dd77862c4a41ae1b3854d67143f3d3e4",
+        "configSum": "ab73af41699f13fdd81903b5f23d8d00"
+    },
+    {
+        "count": 0,
+        "name": "testsagentconf",
+        "mergedSum": "2acdb385658097abb9528aa5ec18c490",
+        "configSum": "297b4cea942e0b7d2d9c59f9433e3e97"
+    },
+    {
+        "count": 0,
+        "name": "testsagentconf2",
+        "mergedSum": "391ae29c1b0355c610f45bf133d5ea55",
+        "configSum": "297b4cea942e0b7d2d9c59f9433e3e97"
+    },
+    {
+        "count": 0,
+        "name": "test_nested1",
+        "mergedSum": {
+            "nestedSum1": "value"
+        },
+        "configSum": "0000000000000000000000000000000"
+    },
+    {
+        "count": 0,
+        "name": "test@nested2",
+        "mergedSum": {
+            "nestedSum1": "value"
+        },
+        "configSum": {
+            "nestedSum1": {
+                "nestedSum11": "value"
+            },
+            "nestedSum2": [
+                {
+                    "nestedSum21": "value1"
+                },
+                {
+                    "nestedSum21": "value2"
+                }
+
+            ]
+        }
+    }]
+
+
+# MOCK DATA
+
+class ClassTest(object):
+    """__init__() functions as the class constructor"""
+
+    def __init__(self, name=None, job=None):
+        self.name = name
+        self.job = job
+
+    def to_dict(self):
+        return {'name': self.name, 'job': self.job}
+
+
+mock_array = [{'rx': {'bytes': 447914, 'packets': 1077}, 'scan': {'id': 396115592, 'time': '2019/05/29 07:26:26'},
+               'mac': '02:42:ac:14:00:01', 'agent_id': '003'}]
+mock_sort_by = ['mac']
+mock_array_order_by_mac = [
+    {'rx': {'bytes': 447914, 'packets': 1077}, 'scan': {'id': 396115592, 'time': '2019/05/29 07:26:26'},
+     'mac': '02:42:ac:14:00:01', 'agent_id': '003'}]
+mock_array_class = [ClassTest("Payne", "coach")]
+mock_array_missing_key = [
+    {
+        "description": "GReAT. (2017, April 3). Lazarus Under the Hood. Retrieved April 17, 2019.",
+        "id": "intrusion-set--00f67a77-86a4-4adf-be26-1a54fc713340",
+    },
+    {
+        "description": "FireEye. (2018, October 03). APT38: Un-usual Suspects. Retrieved November 6, 2018.",
+        "id": "intrusion-set--00f67a77-86a4-4adf-be26-1a54fc713340",
+    },
+    {
+        "description": None,
+        "id": "intrusion-set--00f67a77-86a4-4adf-be26-1a54fc713340",
+    }]
+
+mock_keys = ['rx_bytes', 'rx_packets', 'scan_id', 'scan_time', 'mac', 'agent_id']
+
+mock_not_nested_dict = {
+    "ram_free": "1669524",
+    "board_serial": "BSS-0123456789",
+    "cpu_name": "Intel(R) Core(TM) i7-4700MQ CPU @ 2.40GHz",
+    "cpu_cores": "4",
+    "ram_total": "2045956",
+    "cpu_mhz": "2394.464"
+}
+
+mock_nested_dict = {
+    "ram": {
+        "total": "2045956",
+        "free": "1669524"
+    },
+    "cpu": {
+        "cores": "4",
+        "mhz": "2394.464",
+        "name": "Intel(R) Core(TM) i7-4700MQ CPU @ 2.40GHz"
+    },
+    "board_serial": "BSS-0123456789"
+}
+
+test_xml = '''
+<!-- Local rules -->
+
+<!-- Modify it at your will. -->
+
+<!-- Example -->
+'''
+
+
+@pytest.mark.parametrize('array, limit', [
+    (['one', 'two', 'three'], 2),
+    (['one', 'two', 'three'], None),
+    ([], None),
+    ([], 1)
+])
+@patch('wazuh.core.utils.common.MAXIMUM_DATABASE_LIMIT', new=10)
+def test_cut_array(array, limit):
+    """Test cut_array function."""
+    result = utils.cut_array(array=array, limit=limit, offset=0)
+
+    assert isinstance(result, list)
+
+
+@pytest.mark.parametrize('limit, offset, expected_exception', [
+    (11, 0, 1405),
+    (0, 0, 1406),
+    (5, -1, 1400),
+    (-1, 0, 1401)
+])
+@patch('wazuh.core.utils.common.MAXIMUM_DATABASE_LIMIT', new=10)
+def test_cut_array_ko(limit, offset, expected_exception):
+    """Test cut_array function for all exceptions.
+
+    Cases:
+
+        * Limit is greater than MAXIMUM_DATABASE_LIMIT
+        * Limit is equal to 0
+        * Offset is less than 0
+        * Limit is less than 0
+    """
+    with pytest.raises(exception.WazuhException, match=f'.* {expected_exception} .*'):
+        utils.cut_array(array=['one', 'two', 'three'], limit=limit, offset=offset)
+
+
+@pytest.mark.parametrize(
+    'array, q, filters, limit, search_text, select, sort_by, distinct, expected_items, expected_total_items',
+    [
+        # Test cases with queries
+        ([{'item': 'value_2', 'datetime': '2017-10-25T14:48:53.732000Z'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z'}],
+         'datetime=2017-10-25T14:48:53.732000Z', None, None, None, None, None, False,
+         [{'item': 'value_2', 'datetime': '2017-10-25T14:48:53.732000Z'}], 1),
+
+        ([{'name': 'W', 'datetime': '2017-10-25T14:48:53.732000Z'},
+          {'name': 'I', 'datetime': '2018-05-15T12:34:12.544000Z'}],
+         '(name=W,name=I)', None, None, None, None, None, False,
+         [{'name': 'W', 'datetime': '2017-10-25T14:48:53.732000Z'},
+          {'name': 'I', 'datetime': '2018-05-15T12:34:12.544000Z'}], 2),
+
+        ([{'item': 'value_2', 'datetime': '2017-10-25T14:48:53.732000Z'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z'}],
+         'datetime<2017-10-26', None, None, None, None, None, False,
+         [{'item': 'value_2', 'datetime': '2017-10-25T14:48:53.732000Z'}], 1),
+
+        ([{'item': 'value_2', 'datetime': '2017-10-25T14:48:53.732000Z'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z'}],
+         'datetime>2019-10-26,datetime<2017-10-26', None, None, None, None, None, False,
+         [{'item': 'value_2', 'datetime': '2017-10-25T14:48:53.732000Z'}], 1),
+
+        ([{'item': 'value_2', 'datetime': '2017-10-25T14:48:53.732000Z'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z'}],
+         'datetime>2017-10-26;datetime<2018-05-15T12:34:12.644000Z', None, None, None, None, None, False,
+         [{'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z'}], 1),
+
+        ([{'item': 'value_2', 'datetime': '2017-10-25T14:48:53Z'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12Z'}],
+         'datetime>2017-10-26;datetime<2018-05-15T12:34:12.001000Z', None, None, None, None, None, False,
+         [{'item': 'value_1', 'datetime': '2018-05-15T12:34:12Z'}], 1),
+
+        ([{'name': 'value_1', 'status': 'disabled'},
+          {'name': 'value_2', 'status': 'enabled'},
+          {'name': 'value_3', 'status': 'enabled'}],
+         'status=enabled;(name=value_1,name=value_3)', None, None, None, None, None, False,
+         [{'name': 'value_3', 'status': 'enabled'}], 1),
+
+        # Test cases with filters, limit and search
+        ([{'item': 'value_1', 'some': 't'}, {'item': 'value_2', 'some': 'a'}, {'item': 'value_3', 'some': 'b'}],
+         None, {'item': 'value_1', 'some': 't'}, 1, None, None, None, False,
+         [{'item': 'value_1', 'some': 't'}], 1),
+
+        ([{'item': 'value_1'}, {'item': 'value_1'}, {'item': 'value_3'}],
+         None, None, 1, 'e_1', None, None, False,
+         [{'item': 'value_1'}], 2),
+
+        ([{'item': 'value_1'}, {'item': 'value_1'}, {'item': 'value_3'}],
+         None, None, 2, 'e_1', None, None, False,
+         [{'item': 'value_1'}, {'item': 'value_1'}], 2),
+
+        # Test cases with sort
+        ([{'item': 'value_2'}, {'item': 'value_1'}, {'item': 'value_3'}],
+         None, None, None, None, None, ['item'], False,
+         [{'item': 'value_1'}, {'item': 'value_2'}, {'item': 'value_3'}], 3),
+
+        # Test cases with distinct
+        ([{'item': 'value_1', 'component': 'framework'},
+           {'item': 'value_2', 'component': 'API'},
+           {'item': 'value_1', 'component': 'framework'}],
+         None, None, None, None, None, None, True,
+         [{'item': 'value_1', 'component': 'framework'}, {'item': 'value_2', 'component': 'API'}], 2),
+         (['framework', 'API', 'API'],
+         None, None, None, None, None, None, True,
+         ['framework', 'API'], 2),
+
+        # Complex test cases
+        ([{'item': 'value_1', 'datetime': '2017-10-25T14:48:53.732000Z', 'component': 'framework'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z', 'component': 'API'}],
+         'datetime~2017', {'item': 'value_1'}, 1, 'frame', None, None, False,
+         [{'item': 'value_1', 'datetime': '2017-10-25T14:48:53.732000Z',
+           'component': 'framework'}], 1),
+
+        ([{'item': 'value_1', 'datetime': '2017-10-25T14:48:53.732000Z', 'component': 'framework'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z', 'component': 'API'}],
+         'datetime~2019', {'item': 'value_1'}, 1, None, None, None, False,
+         [], 0),
+
+        ([{'item': 'value_1', 'datetime': '2017-10-25T14:48:53.732000Z', 'component': 'framework'},
+          {'item': 'value_1', 'datetime': '2018-05-15T12:34:12.544000Z', 'component': 'API'}],
+         'datetime~2017', {'item': 'value_1'}, 1, None, ['component', 'item'], None, False,
+         [{'item': 'value_1', 'component': 'framework'}], 1),
+    ])
+def test_process_array(array, q, filters, limit, search_text, sort_by, select, distinct, expected_items,
+                       expected_total_items):
+    """Test that the process_array function is working properly with simple and complex examples.
+
+    Parameters
+    ----------
+    array : list
+        List of values on which to apply the processing.
+    q : str
+        Query used to filter the array.
+    filters : dict
+        Define the required field filters. Format: {"field1":"value1", "field2":["value2","value3"]}
+    limit : int
+        Maximum number of elements to return.
+    search_text : str
+        String representing the text to search in the array.
+    select : list
+        List of fields to select.
+    sort_by : list
+        List of fields to sort by.
+    distinct: bool
+        Look for distinct values.
+    expected_items : list
+        List of items expected after having applied the processing.
+    expected_total_items : int
+        Total items expected after having applied the processing.
+    """
+    result = utils.process_array(array=array, filters=filters, limit=limit, offset=0, search_text=search_text,
+                                 select=select, sort_by=sort_by, q=q, distinct=distinct)
+
+    assert result == {'items': expected_items, 'totalItems': expected_total_items}
+
+
+@patch('wazuh.core.utils.len', return_value=1)
+@patch('wazuh.core.utils.cut_array')
+@patch('wazuh.core.utils.select_array', return_value=ANY)
+@patch('wazuh.core.utils.filter_array_by_query', return_value=ANY)
+@patch('wazuh.core.utils.search_array', return_value=ANY)
+@patch('wazuh.core.utils.sort_array', return_value=ANY)
+def test_process_array_ops_order(mock_sort_array, mock_search_array, mock_filter_array_by_query, mock_select_array,
+                                 mock_cut_array, mock_len):
+    """Test that the process_array function calls the sort, search, filter by query, select and cut operations in the
+    expected order and with the expected parameters."""
+    manager_mock = Mock()
+    manager_mock.attach_mock(mock_sort_array, 'mock_sort_array')
+    manager_mock.attach_mock(mock_search_array, 'mock_search_array')
+    manager_mock.attach_mock(mock_filter_array_by_query, 'mock_filter_array_by_query')
+    manager_mock.attach_mock(mock_select_array, 'mock_select_array')
+    manager_mock.attach_mock(mock_cut_array, 'mock_cut_array')
+
+    utils.process_array(array=[{'item': 'value_1'}, {'item': 'value_2'}, {'item': 'value_3'}],
+                        filters={'item': 'value_1'}, limit=1, offset=0, search_text='e_1', select=['item'],
+                        sort_by=['item'], q='item~value')
+
+    # The array in the sort_array function parameter is the initial one after the filters
+    # The array parameter of the other functions is ANY
+    assert manager_mock.mock_calls == [
+        call.mock_sort_array([{'item': 'value_1'}], sort_by=['item'], sort_ascending=True, allowed_sort_fields=None),
+        call.mock_search_array(ANY, search_text='e_1', complementary_search=False, search_in_fields=None),
+        call.mock_filter_array_by_query('item~value', ANY),
+        call.mock_select_array(ANY, select=['item'], required_fields=None, allowed_select_fields=None),
+        call.mock_cut_array(ANY, offset=0, limit=1)
+    ]
+
+
+def test_sort_array_type():
+    """Test sort_array function."""
+    assert isinstance(utils.sort_array(mock_array, mock_sort_by), list)
+    assert isinstance(utils.sort_array(mock_array, None), list)
+
+
+@pytest.mark.parametrize('array, sort_by, order, expected_exception', [
+    ([{'test': 'test'}], None, 'asc', 1402),
+    ('{}', None, 'random', 1402),
+    (mock_array, ['test'], False, 1403)
+])
+def test_sort_array_error(array, sort_by, order, expected_exception):
+    """Tests sort_array function for all exceptions.
+
+    Cases:
+
+        * List with a dictionary and no sort parameter
+        * Order type different to 'asc' or 'desc'
+        * Sort parameter not allow
+    """
+    with pytest.raises(exception.WazuhException, match=f'.* {expected_exception} .*'):
+        utils.sort_array(array, sort_by, order)
+
+
+@pytest.mark.parametrize('array, sort_by, order, allowed_sort_field, output', [
+    ('', None, True, None, ''),
+    ([4005, 4006, 4019, 36], None, True, None, [36, 4005, 4006, 4019]),
+    ([4005, 4006, 4019, 36], None, False, None, [4019, 4006, 4005, 36]),
+    (mock_array, mock_sort_by, True, mock_sort_by, mock_array_order_by_mac),
+    (mock_array_class, ['name'], False, ['name'], mock_array_class),
+    (mock_array_missing_key, ['description'], False, ['description'], mock_array_missing_key)
+])
+def test_sort_array(array, sort_by, order, allowed_sort_field, output):
+    """Test sort_array function.
+
+    Cases:
+        * Empty list
+        * Sorted list with values
+        * Sorted list with order parameter 'desc'
+        * Sorted list with dict, sorted by one nester parameter
+        * Sorted list with dict, sorted by different parameter
+        * Sorted list with class
+    """
+    assert utils.sort_array(array, sort_by, order, allowed_sort_field) == output
+
+
+@pytest.mark.parametrize('object, fields', [
+    ({'test': 'test'}, None),
+    ({'test': 'test'}, ['test']),
+    (['test', 'name'], None),
+    (ClassTest("Payne", "coach"), None)
+])
+def test_get_values(object, fields):
+    """Test get_values function."""
+    result = utils.get_values(o=object, fields=fields)
+
+    assert isinstance(result, list)
+    assert isinstance(result[0], str)
+
+
+@pytest.mark.parametrize('object, expected', [
+    ({'revoked': True}, ['true']),
+    ({'revoked': False}, ['false']),
+    ({'count': 3}, ['3']),
+    # None renders as '', not the string 'none' -- otherwise search=no/none would match
+    # every record with a null field.
+    ({'description': None}, [''])
+])
+def test_get_values_non_str(object, expected):
+    """Test that get_values lowercases non-str values, which search_array compares against a
+    lowercased query, and that a None value never becomes a searchable substring."""
+    assert utils.get_values(o=object) == expected
+
+
+@pytest.mark.parametrize('array, text, negation, length', [
+    (['test', 'name'], 'e', False, 2),
+    (['test', 'name'], 'name', False, 1),
+    (['test', 'name'], 'unknown', False, 0),
+    (['test', 'name'], 'test', True, 1),
+    (['test', 'name'], 'unknown', True, 2),
+    # Boolean field values: search_array lowercases the query, so the candidates must be
+    # lowercased too for a bool to be searchable at all.
+    ([{'revoked': True}, {'revoked': False}], 'true', False, 1),
+    ([{'revoked': True}, {'revoked': False}], 'True', False, 1),
+    ([{'revoked': True}, {'revoked': False}], 'false', False, 1),
+    ([{'revoked': True}, {'revoked': False}], 'true', True, 1)
+])
+def test_search_array(array, text, negation, length):
+    """Test search_array function."""
+    result = utils.search_array(array=array, search_text=text, complementary_search=negation)
+
+    assert isinstance(result, list)
+    assert len(result) == length
+
+
+def test_tail():
+    """Test tail function."""
+    result = utils.tail(os.path.join(test_data_path, 'test_log.log'))
+
+    assert isinstance(result, list)
+    assert len(result) == 20
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_kills_stale_orphan(mock_process, mock_kill):
+    """A pidfile whose PID predates the file and matches the daemon's cmdline is killed."""
+    with TemporaryDirectory() as tmp_dir:
+        pid_file = os.path.join(tmp_dir, 'wazuh-manager-apid_auth-123.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write('123\n')
+
+        mock_process.return_value.cmdline.return_value = \
+            ['python3', '/var/wazuh-manager/api/scripts/wazuh_manager_apid.py']
+        mock_process.return_value.create_time.return_value = os.path.getmtime(pid_file) - 10
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_called_once_with(123, utils.SIGKILL)
+        assert not os.path.exists(pid_file)
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_does_not_kill_recycled_pid(mock_process, mock_kill):
+    """Regression for wazuh/wazuh#38695.
+
+    A live process whose PID matches a stale pidfile but was created after the file
+    was written recycled that PID from the kernel; it is not the process that wrote
+    the file (for example, it can be the daemon's own freshly started instance) and
+    must not be killed.
+    """
+    with TemporaryDirectory() as tmp_dir:
+        pid_file = os.path.join(tmp_dir, 'wazuh-manager-apid_auth-456.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write('456\n')
+
+        mock_process.return_value.cmdline.return_value = \
+            ['python3', '/var/wazuh-manager/api/scripts/wazuh_manager_apid.py']
+        mock_process.return_value.create_time.return_value = os.path.getmtime(pid_file) + 10
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_not_called()
+        assert not os.path.exists(pid_file)
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_does_not_kill_itself(mock_process, mock_kill):
+    """The calling process must never be treated as its own orphan child."""
+    with TemporaryDirectory() as tmp_dir:
+        own_pid = os.getpid()
+        pid_file = os.path.join(tmp_dir, f'wazuh-manager-apid_auth-{own_pid}.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write(f'{own_pid}\n')
+
+        mock_process.return_value.cmdline.return_value = \
+            ['python3', '/var/wazuh-manager/api/scripts/wazuh_manager_apid.py']
+        mock_process.return_value.create_time.return_value = os.path.getmtime(pid_file) - 10
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_not_called()
+        assert not os.path.exists(pid_file)
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_handles_access_denied(mock_process, mock_kill):
+    """A PID recycled by a process owned by another user must not crash the daemon's startup.
+
+    psutil.AccessDenied is not an OSError subclass, so it needs its own coverage: reading
+    cmdline() for a process this daemon can't introspect must be treated the same as not
+    being able to identify it, not left to propagate and abort the caller's startup.
+    """
+    with TemporaryDirectory() as tmp_dir:
+        pid_file = os.path.join(tmp_dir, 'wazuh-manager-apid_auth-789.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write('789\n')
+
+        mock_process.return_value.cmdline.side_effect = utils.psutil.AccessDenied(pid=789)
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_not_called()
+        assert not os.path.exists(pid_file)
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_handles_empty_cmdline(mock_process, mock_kill):
+    """A PID recycled by a process with no argv (e.g. a kernel thread) must not crash startup.
+
+    cmdline() can legitimately return an empty list; joined into an empty string it never
+    matches the daemon name, so the process is treated as not belonging to the daemon.
+    """
+    with TemporaryDirectory() as tmp_dir:
+        pid_file = os.path.join(tmp_dir, 'wazuh-manager-apid_auth-321.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write('321\n')
+
+        mock_process.return_value.cmdline.return_value = []
+        mock_process.return_value.create_time.return_value = os.path.getmtime(pid_file) + 10
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_not_called()
+        assert not os.path.exists(pid_file)
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_handles_kill_failure(mock_process, mock_kill, capsys):
+    """A confirmed orphan whose SIGKILL itself fails must be reported as a kill failure,
+    not folded into the generic 'could not identify' message used for identification
+    failures (psutil errors raised before the process is confirmed to be a stale owner).
+    """
+    with TemporaryDirectory() as tmp_dir:
+        pid_file = os.path.join(tmp_dir, 'wazuh-manager-apid_auth-654.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write('654\n')
+
+        mock_process.return_value.cmdline.return_value = \
+            ['python3', '/var/wazuh-manager/api/scripts/wazuh_manager_apid.py']
+        mock_process.return_value.create_time.return_value = os.path.getmtime(pid_file) - 10
+        mock_kill.side_effect = OSError('No such process')
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_called_once_with(654, utils.SIGKILL)
+        assert not os.path.exists(pid_file)
+        output = capsys.readouterr().out
+        assert 'identified but could not be terminated' in output
+        assert 'Could not identify process' not in output
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_kills_stale_orphan_started_with_debug_flag(mock_process, mock_kill):
+    """A stale orphan started with '-d' (persisted debug mode) is still recognized and killed.
+
+    cmdline()'s last argument is '-d' in that case, not the script path; matching against
+    the joined cmdline instead of only its last element is what keeps this case working.
+    """
+    with TemporaryDirectory() as tmp_dir:
+        pid_file = os.path.join(tmp_dir, 'wazuh-manager-apid_auth-987.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write('987\n')
+
+        mock_process.return_value.cmdline.return_value = \
+            ['python3', '/var/wazuh-manager/api/scripts/wazuh_manager_apid.py', '-d']
+        mock_process.return_value.create_time.return_value = os.path.getmtime(pid_file) - 10
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_called_once_with(987, utils.SIGKILL)
+        assert not os.path.exists(pid_file)
+
+
+@patch('wazuh.core.utils.os.kill')
+@patch('wazuh.core.utils.psutil.Process')
+def test_clean_pid_files_tolerates_vanished_pidfile(mock_process, mock_kill):
+    """A pidfile removed by someone else while it is being inspected must not abort the startup."""
+    with TemporaryDirectory() as tmp_dir:
+        pid_file = os.path.join(tmp_dir, 'wazuh-manager-apid_auth-135.pid')
+        with open(pid_file, 'w') as fp:
+            fp.write('135\n')
+
+        def vanish(_path):
+            os.remove(pid_file)
+            raise FileNotFoundError(pid_file)
+
+        mock_process.return_value.cmdline.return_value = \
+            ['python3', '/var/wazuh-manager/api/scripts/wazuh_manager_apid.py']
+        mock_process.return_value.create_time.return_value = 0
+
+        with patch('wazuh.core.utils.common.OSSEC_PIDFILE_PATH', tmp_dir), \
+                patch('wazuh.core.utils.path.getmtime', side_effect=vanish):
+            utils.clean_pid_files('wazuh-manager-apid')
+
+        mock_kill.assert_not_called()
+        assert not os.path.exists(pid_file)
+
+
+@patch('wazuh.core.utils.chmod')
+def test_chmod_r(mock_chmod):
+    """Tests chmod_r function."""
+    with TemporaryDirectory() as tmpdirname:
+        tmpfile = NamedTemporaryFile(dir=tmpdirname, delete=False)
+        dummy_tmp = TemporaryDirectory(dir=tmpdirname)
+        utils.chmod_r(tmpdirname, 0o777)
+        mock_chmod.assert_any_call(tmpdirname, 0o777)
+        mock_chmod.assert_any_call(os.path.join(tmpdirname, tmpfile.name), 0o777)
+
+
+@patch('wazuh.core.utils.chown')
+def test_chown_r(mock_chown):
+    """Test chown_r function."""
+    with TemporaryDirectory() as tmp_dirname:
+        tmp_file = NamedTemporaryFile(dir=tmp_dirname, delete=False)
+        dummy_tmp = TemporaryDirectory(dir=tmp_dirname)
+        utils.chown_r(tmp_dirname, 'test_user', 'test_group')
+        mock_chown.assert_any_call(tmp_dirname, 'test_user', 'test_group')
+        mock_chown.assert_any_call(os.path.join(tmp_dirname, tmp_file.name), 'test_user', 'test_group')
+
+
+@pytest.mark.parametrize('ownership, time, permissions',
+                         [((1000, 1000), None, None),
+                          ((1000, 1000), (12345, 12345), None),
+                          ((1000, 1000), None, 0o660),
+                          ((1000, 1000), (12345, 12345), 0o660)]
+                         )
+@patch('wazuh.core.utils.chown')
+@patch('wazuh.core.utils.chmod')
+@patch('wazuh.core.utils.utime')
+def test_safe_move(mock_utime, mock_chmod, mock_chown, ownership, time, permissions):
+    """Test safe_move function."""
+    with TemporaryDirectory() as tmpdirname:
+        tmp_file = NamedTemporaryFile(dir=tmpdirname, delete=False)
+        target_file = os.path.join(tmpdirname, 'target')
+        utils.safe_move(tmp_file.name, target_file, ownership=ownership, time=time, permissions=permissions)
+        assert (os.path.exists(target_file))
+
+        tmp_path = os.path.join(os.path.dirname(tmp_file.name), ".target.tmp")
+        mock_chown.assert_called_once_with(tmp_path, *ownership)
+        if time is not None:
+            mock_utime.assert_called_once_with(tmp_path, time)
+        if permissions is not None:
+            mock_chmod.assert_called_once_with(tmp_path, permissions)
+
+
+@patch('wazuh.core.utils.chown')
+@patch('wazuh.core.utils.chmod')
+@patch('wazuh.core.utils.utime')
+def test_safe_move_exception(mock_utime, mock_chmod, mock_chown):
+    """Test safe_move function."""
+    with TemporaryDirectory() as tmpdirname:
+        tmp_file = NamedTemporaryFile(dir=tmpdirname, delete=False)
+        target_file = os.path.join(tmpdirname, 'target')
+        with patch('wazuh.core.utils.rename', side_effect=OSError(1)):
+            utils.safe_move(tmp_file.name, target_file, ownership=(1000, 1000), time=(12345, 12345), permissions=0o660)
+        assert (os.path.exists(target_file))
+
+
+@pytest.mark.parametrize('dir_name, path_exists', [
+    ('/var/test_path', True),
+    ('./var/test_path/', False)
+])
+@patch('wazuh.core.utils.chmod')
+@patch('wazuh.core.utils.mkdir')
+@patch('wazuh.core.utils.curdir', new='var')
+def test_mkdir_with_mode(mock_mkdir, mock_chmod, dir_name, path_exists):
+    """Test mkdir_with_mode function."""
+    with patch('wazuh.core.utils.path.exists', return_value=path_exists):
+        utils.mkdir_with_mode(dir_name)
+        mock_chmod.assert_any_call(dir_name, 0o770)
+        mock_mkdir.assert_any_call(dir_name, 0o770)
+
+
+@pytest.mark.parametrize('dir_name, exists', [
+    ('/var/test_path', True),
+    ('/var/test_path/', False)
+
+])
+@patch('wazuh.core.utils.mkdir', side_effect=OSError)
+def test_mkdir_with_mode_ko(mock_mkdir, dir_name, exists):
+    """Test mkdir_with_mode function errors work."""
+    with patch('wazuh.core.utils.path.exists', return_value=exists):
+        with pytest.raises(OSError):
+            utils.mkdir_with_mode(dir_name)
+
+
+@patch('wazuh.core.utils.open')
+@patch('wazuh.core.utils.iter', return_value=['1', '2'])
+def test_md5(mock_iter, mock_open):
+    """Test md5 function."""
+    with patch('wazuh.core.utils.hashlib.md5') as md:
+        md.return_value.update.side_effect = None
+        result = utils.md5('test')
+
+        assert isinstance(result, MagicMock)
+        assert isinstance(result.return_value, MagicMock)
+        mock_open.assert_called_once_with('test', 'rb')
+
+
+@patch('wazuh.core.utils.open')
+@patch('wazuh.core.utils.iter', return_value=['1', '2'])
+def test_blake2b(mock_iter, mock_open):
+    """Test md5 function."""
+    with patch('wazuh.core.utils.hashlib.blake2b') as blake2b_mock:
+        blake2b_mock.return_value.update.side_effect = None
+        result = utils.blake2b('test')
+
+        assert isinstance(result, MagicMock)
+        assert isinstance(result.return_value, MagicMock)
+        mock_open.assert_called_once_with('test', 'rb')
+
+
+def test_protected_get_hashing_algorithm_ko():
+    """Test _get_hashing_algorithm function exception."""
+    with pytest.raises(exception.WazuhException, match=".* 1723 .*"):
+        utils.get_hash(filename='test_file', hash_algorithm='test')
+
+
+@patch('wazuh.core.utils.open')
+def test_get_hash(mock_open):
+    """Test get_hash function."""
+    with patch('wazuh.core.utils.iter', return_value=['1', '2']):
+        with patch('wazuh.core.utils.hashlib.new') as md:
+            md.return_value.update.side_effect = None
+            result = utils.get_hash(filename='test_file')
+
+            assert isinstance(result, MagicMock)
+            assert isinstance(result.return_value, MagicMock)
+            mock_open.assert_called_once_with('test_file', 'rb')
+
+    with patch('wazuh.core.utils.iter', return_value=[]):
+        result = utils.get_hash(filename='test_file', return_hex=False)
+
+        assert type(result) == bytes
+
+
+@patch('wazuh.core.utils.open')
+@patch('wazuh.core.utils.iter', return_value=['1', '2'])
+def test_get_hash_ko(mock_iter, mock_open):
+    """Test get_hash function error work."""
+    with patch('wazuh.core.utils.hashlib.new') as md:
+        md.return_value.update.side_effect = IOError
+        result = utils.get_hash(filename='test_file')
+
+        assert result is None
+        mock_open.assert_called_once_with('test_file', 'rb')
+
+
+def test_get_fields_to_nest():
+    """Test get_fields_to_nest function."""
+    result_nested, result_non_nested = utils.get_fields_to_nest(mock_keys)
+
+    assert isinstance(result_nested, list)
+    assert isinstance(result_non_nested, set)
+    assert result_nested[0][0] + '_' + list(result_nested[0][1])[0][0] == list(result_nested[0][1])[0][1]
+
+
+def test_plain_dict_to_nested_dict():
+    """Test plain_dict_to_nested_dict function work."""
+    result = utils.plain_dict_to_nested_dict(data=mock_not_nested_dict)
+
+    assert isinstance(result, dict)
+    assert result == mock_nested_dict
+
+
+@patch('wazuh.core.utils.compile', return_value='Something')
+def test_basic_load_wazuh_xml(mock_compile):
+    """Test basic load_wazuh_xml functionality."""
+    with patch('wazuh.core.utils.open') as f:
+        f.return_value.__enter__.return_value = StringIO(test_xml)
+        result = utils.load_wazuh_xml('test_file')
+
+        assert isinstance(result, Element)
+
+
+def test_load_wazuh_xml():
+    """Test load_wazuh_xml function."""
+
+    def elements_equal(e1, e2):
+        if e1.tag != e2.tag: return False
+        if e1.text != e2.text: return False
+        if e1.attrib != e2.attrib: return False
+        if len(e1) != len(e2): return False
+        return all(elements_equal(c1, c2) for c1, c2 in zip(e1, e2))
+
+    for rule_file in os.listdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data/test_load_wazuh_xml')):
+        path = os.path.join(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data/test_load_wazuh_xml'),
+                            rule_file)
+        original = parse(path).getroot()
+        result = utils.load_wazuh_xml(path)
+
+        assert elements_equal(original, result.find('dummy_tag'))
+
+def test_load_wazuh_xml_sanitizes_only_comment_bodies():
+    """Test load_wazuh_xml replaces -- inside each comment and leaves text matching a comment body untouched."""
+    data = '<!-- a--b --><item>a--b</item><!------><other>-- a--b --</other>'
+    result = utils.load_wazuh_xml(None, data)
+
+    assert result.find('item').text == 'a--b'
+    assert result.find('other').text == '-- a--b --'
+
+
+@pytest.mark.parametrize('data, expected', [
+    ('<item>a < b</item>', 'a < b'),
+    ('<item>a < b > c</item>', 'a < b > c'),
+    ('<item>\n<\n</item>', '\n<\n'),
+    ('<item>a <!b</item>', 'a <!b'),
+])
+def test_load_wazuh_xml_escapes_lt_outside_tags(data, expected):
+    """Test load_wazuh_xml escapes a < that does not start a tag or a comment."""
+    assert utils.load_wazuh_xml(None, data).find('item').text == expected
+
+
+def test_load_wazuh_xml_many_comments_and_tags():
+    """Test load_wazuh_xml keeps every element of a document with many comments and a long single line."""
+    data = ''.join(f'<!-- comment {i} -- -->\n' for i in range(20000)) + '<item/>' * 20000
+    result = utils.load_wazuh_xml(None, data)
+
+    assert len(result.findall('item')) == 20000
+
+
+@pytest.mark.parametrize('expected_exception', [
+    (1113)
+])
+def test_load_wazuh_xml_ko(expected_exception):
+    """Test load_wazuh_xml fails gracefully when reading an invalid utf-8 character sequence"""
+    file_path = os.path.join(test_data_path, 'test_load_wazuh_xml_ko/invalid_utf8.xml')
+    with pytest.raises(WazuhException, match=f'.* {expected_exception} .*'):
+        utils.load_wazuh_xml(file_path)
+
+@pytest.mark.parametrize('version1, version2', [
+    ('Wazuh v3.5.0', 'Wazuh v3.5.2'),
+    ('Wazuh v3.6.1', 'Wazuh v3.6.3'),
+    ('Wazuh v3.7.2', 'Wazuh v3.8.0'),
+    ('Wazuh v3.8.0', 'Wazuh v3.8.1'),
+    ('Wazuh v3.9.0', 'Wazuh v3.9.2'),
+    ('Wazuh v3.9.10', 'Wazuh v3.9.14'),
+    ('Wazuh v3.10.1', 'Wazuh v3.10.10'),
+    ('Wazuh v4.10.10', 'Wazuh v4.11.0'),
+    ('Wazuh v5.1.15', 'Wazuh v5.2.0'),
+    ('v3.6.0', 'v3.6.1'),
+    ('v3.9.1', 'v3.9.2'),
+    ('v4.0.0', 'v4.0.1'),
+    ('3.6.0', '3.6.1'),
+    ('3.9.0', '3.9.2'),
+    ('4.0.0', '4.0.1')
+])
+def test_version_ok(version1, version2):
+    """Test WazuhVersion class."""
+    current_version = utils.WazuhVersion(version1)
+    new_version = utils.WazuhVersion(version2)
+
+    assert current_version < new_version
+    assert current_version <= new_version
+    assert new_version > current_version
+    assert new_version >= current_version
+    assert current_version != new_version
+    assert not (current_version == new_version)
+
+
+@pytest.mark.parametrize('version1, version2', [
+    ('v3.6.0', 'v.3.6.1'),
+    ('Wazuh v4', 'Wazuh v5'),
+    ('Wazuh v3.9', 'Wazuh v3.10'),
+    ('ABC v3.10.1', 'ABC v3.10.12'),
+    ('Wazuhv3.9.0', 'Wazuhv3.9.2'),
+    ('3.9', '3.10'),
+    ('3.9.0', '3.10'),
+    ('3.10', '4.2'),
+    ('3', '3.9.1')
+])
+def test_version_ko(version1, version2):
+    """Test WazuhVersion class."""
+    try:
+        utils.WazuhVersion(version1)
+        utils.WazuhVersion(version2)
+    except ValueError:
+        return
+
+
+@pytest.mark.parametrize('version1, version2', [
+    ('Wazuh v3.10.10', 'Wazuh v3.10.10'),
+    ('Wazuh v5.1.15', 'Wazuh v5.1.15'),
+    ('v3.6.0', 'v3.6.0'),
+    ('v3.9.2', 'v3.9.2')
+])
+def test_same_version(version1, version2):
+    """Test WazuhVersion class."""
+    current_version = utils.WazuhVersion(version1)
+    new_version = utils.WazuhVersion(version2)
+
+    assert current_version == new_version
+    assert not (current_version < new_version)
+    assert current_version <= new_version
+    assert not (new_version > current_version)
+    assert new_version >= current_version
+    assert not (current_version != new_version)
+
+
+def test_WazuhVersion__str__():
+    """Test WazuhVersion.__str__ function."""
+    version = utils.WazuhVersion('Wazuh v3.10.0-alpha4')
+
+    assert isinstance(version.__str__(), str)
+
+
+@pytest.mark.parametrize('version1, version2', [
+    ('Wazuh v3.5.2', 'Wazuh v4.0.0'),
+    ('Wazuh v3.10.0-alpha', 'Wazuh v3.10.0'),
+    ('Wazuh v3.10.0-alpha4', 'Wazuh v3.10.0-beta4'),
+    ('Wazuh v3.10.0-alpha3', 'Wazuh v3.10.0-alpha4'),
+])
+def test_WazuhVersion__ge__(version1, version2):
+    """Test WazuhVersion.__ge__ function."""
+    current_version = utils.WazuhVersion(version1)
+    new_version = utils.WazuhVersion(version2)
+
+    assert not current_version >= new_version
+
+
+@pytest.mark.parametrize('time, expected_seconds', [
+    ('10s', 10),
+    ('20m', 1200),
+    ('30h', 108000),
+    ('5d', 432000),
+    ('10', 10),
+    ('0s', 0),
+    ('1d2h3m4s', 93784)
+])
+def test_get_timeframe_in_seconds(time, expected_seconds):
+    """Test get_timeframe_in_seconds function."""
+    result = utils.get_timeframe_in_seconds(time)
+
+    assert result == expected_seconds
+
+
+@pytest.mark.parametrize('time', [
+    'error',
+    'soon',
+    'yesterday',
+    '1x',
+    'm',
+    '',
+    '1d2x',
+    '1d ',
+    '1D',
+    '-1d'
+])
+def test_failed_test_get_timeframe_in_seconds(time):
+    """Test get_timeframe_in_seconds function exceptions."""
+    with pytest.raises(exception.WazuhException, match=".* 1411 .*"):
+        utils.get_timeframe_in_seconds(time)
+
+
+@pytest.mark.parametrize('query_filter, expected_query_filter, expected_wef', [
+    ({'operator': 'LIKE', 'value': 'user\'s'}, {'operator': 'LIKE', 'value': 'user_s'}, set()),
+    ({'operator': '=', 'value': 'user\'s', 'field': 'description'},
+     {'operator': 'LIKE', 'value': 'user_s', 'field': 'description'}, {'description'}),
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.common.MAXIMUM_DATABASE_LIMIT', new=10)
+def test_WazuhDBQuery_protected_clean_filter(mock_socket_conn, mock_conn_db, mock_glob, mock_exists,
+                                             query_filter, expected_query_filter, expected_wef):
+    """Test WazuhDBQuery._clean_filter function."""
+    query = utils.WazuhDBQuery(offset=0, limit=500, table='agent', sort=None,
+                               search=None, select=None, filters=None,
+                               fields={'1': None, '2': None},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+
+    query._clean_filter(query_filter)
+    assert query_filter == expected_query_filter, 'query_filter should have been updated, but it was not'
+    assert query.wildcard_equal_fields == expected_wef
+
+
+@pytest.mark.parametrize('limit, error, expected_exception', [
+    (1, False, None),
+    (0, True, 1406),
+    (100, True, 1405),
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.common.MAXIMUM_DATABASE_LIMIT', new=10)
+def test_WazuhDBQuery_protected_add_limit_to_query(mock_socket_conn, mock_conn_db, mock_glob, mock_exists,
+                                                   limit, error, expected_exception):
+    """Test WazuhDBQuery._add_limit_to_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=limit, table='agent', sort=None,
+                               search=None, select=None, filters=None,
+                               fields={'1': None, '2': None},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+
+    if error:
+        with pytest.raises(exception.WazuhException, match=f'.* {expected_exception} .*'):
+            query._add_limit_to_query()
+    else:
+        query._add_limit_to_query()
+
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_sort_query(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Tests WazuhDBQuery._sort_query function works"""
+
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent',
+                               sort={'order': 'asc'}, search=None, select=None,
+                               filters=None, fields={'1': None, '2': None},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1), count=5,
+                               get_data=None)
+
+    assert isinstance(query._sort_query('1'), str)
+    mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('sort, expected_exception', [
+    (None, None),
+    ({'order': 'asc', 'fields': None}, None),
+    ({'order': 'asc', 'fields': ['1']}, None),
+    ({'order': 'asc', 'fields': ['bad_field']}, 1403),
+    ({'order': 'asc', 'fields': ['1', '2', '3', '4']}, None),
+    ({'order': 'asc', 'fields': ['internal_key']}, 1403)
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_add_sort_to_query(mock_socket_conn, mock_conn_db, mock_glob, mock_exists,
+                                                  sort, expected_exception):
+    """Test WazuhDBQuery._add_sort_to_query function."""
+    fields = {'1': 'one', '2': 'two', '3': 'three', '4': 'four'}
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=sort,
+                               search=None, select=None, filters=None,
+                               fields=fields,
+                               extra_fields={'internal_key'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+
+    if expected_exception:
+        with pytest.raises(exception.WazuhException, match=f'.* {expected_exception} .*'):
+            query._add_sort_to_query()
+    else:
+        query._add_sort_to_query()
+
+    # Check the fields list maintains its original order after adding it to the query
+    if not expected_exception and sort:
+        sort_string_added = ','.join(f"{fields[field]} {sort['order']}" for field in sort['fields']) if sort['fields'] \
+            else f"None {sort['order']}"
+        assert query.query.endswith(f"ORDER BY {sort_string_added}")
+
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_add_search_to_query(mock_socket_conn, mock_conn_db, mock_glob,
+                                                    mock_exists):
+    """Test WazuhDBQuery._add_search_to_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search={"negation": True, "value": "1"}, select=None,
+                               filters=None, fields={'1': 'one', '2': 'two'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+
+    query._add_search_to_query()
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_add_search_to_query_skips_extra_fields(mock_socket_conn, mock_conn_db, mock_glob,
+                                                                       mock_exists):
+    """Test WazuhDBQuery._add_search_to_query function does not search on extra fields."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search={"negation": False, "value": "1"}, select=None,
+                               filters=None, fields={'1': 'one', '2': 'two', 'secret': 'secret_col'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None, extra_fields={'secret'})
+
+    query._add_search_to_query()
+    assert '(one LIKE :search AND one IS NOT NULL)' in query.query
+    assert '(two LIKE :search AND two IS NOT NULL)' in query.query
+    assert 'secret_col' not in query.query
+
+
+@pytest.mark.parametrize('selector_fields, error, expected_exception', [
+    (None, False, None),
+    (['1'], False, None),
+    (['bad_field'], True, 1724)
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('glob.glob', return_value=True)
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_parse_select_filter(mock_socket_conn, mock_glob, mock_conn_db, mock_exists,
+                                                    selector_fields, error, expected_exception):
+    """Test WazuhDBQuery._parse_select_filter function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None, filters=None,
+                               fields={'1': None, '2': None},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+
+    if error:
+        with pytest.raises(exception.WazuhException, match=f'.* {expected_exception} .*'):
+            query._parse_select_filter(selector_fields)
+    elif not selector_fields:
+        assert isinstance(query._parse_select_filter(selector_fields), KeysView)
+    else:
+        assert isinstance(query._parse_select_filter(selector_fields), set)
+
+        mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.WazuhDBQuery._parse_select_filter')
+def test_WazuhDBQuery_protected_add_select_to_query(mock_parse, mock_socket_conn, mock_conn_db, mock_glob,
+                                                    mock_exists):
+    """Test WazuhDBQuery._add_select_to_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent',
+                               sort={'order': 'asc'}, search=None, select=None,
+                               filters=None, fields={'1': None, '2': None},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+
+    query._add_select_to_query()
+    mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('q, expected_query_filters', [
+    # Simple cases
+    ('os.name=ubuntu;os.version>12e',
+     [{'value': 'ubuntu', 'operator': '=', 'field': 'os.name$0', 'separator': 'AND', 'level': 0},
+      {'value': '12e', 'operator': '>', 'field': 'os.version$0', 'separator': '', 'level': 0}]),
+    # Simple cases with brackets in values
+    ('name=Mozilla Firefox 53.0 (x64 en-US)',
+     [{'value': 'Mozilla Firefox 53.0 (x64 en-US)', 'operator': '=', 'field': 'name$0', 'separator': '', 'level': 0}]),
+    ('name=(x64 en-US) Mozilla Firefox 53.0 (x64 en-US)',
+     [{'value': '(x64 en-US) Mozilla Firefox 53.0 (x64 en-US)', 'operator': '=', 'field': 'name$0', 'separator': '',
+       'level': 0}]),
+    ('name=Mozilla Firefox 53.0 ()',
+     [{'value': 'Mozilla Firefox 53.0 ()', 'operator': '=', 'field': 'name$0', 'separator': '', 'level': 0}]),
+    ('name=Mozilla Firefox 53.0 (x64 en-US)()',
+     [{'value': 'Mozilla Firefox 53.0 (x64 en-US)()', 'operator': '=', 'field': 'name$0', 'separator': '',
+       'level': 0}]),
+    # Simple cases with lists in values
+    ('references=["https://example-link@<>=,%?"]',
+     [{'value': '["https://example-link@<>=,%?"]', 'operator': '=', 'field': 'references$0', 'separator': '',
+       'level': 0}]),
+    # Complex cases
+    ('(log=test,status=outstanding);cis=5.2 Debian Linux,pci_dss=2',
+     [{'value': 'test', 'operator': '=', 'field': 'log$0', 'separator': 'OR', 'level': 1},
+      {'value': 'outstanding', 'operator': '=', 'field': 'status$0', 'separator': 'AND', 'level': 0},
+      {'value': '5.2 Debian Linux', 'operator': '=', 'field': 'cis$0', 'separator': 'OR', 'level': 0},
+      {'value': '2', 'operator': '=', 'field': 'pci_dss$0', 'separator': '', 'level': 0}]),
+    # Complex cases with brackets in values
+    ('(name=Mozilla Firefox 53.0 (x64 en-US),version!=53.0);architecture=x64',
+     [{'value': 'Mozilla Firefox 53.0 (x64 en-US)', 'operator': '=', 'field': 'name$0', 'separator': 'OR', 'level': 1},
+      {'value': '53.0', 'operator': '!=', 'field': 'version$0', 'separator': 'AND', 'level': 0},
+      {'value': 'x64', 'operator': '=', 'field': 'architecture$0', 'separator': '', 'level': 0}]),
+    ('(log!=example,name=Mozilla Firefox 53.0 (x64 en-US) (test));cve_id<1000',
+     [{'value': 'example', 'operator': '!=', 'field': 'log$0', 'separator': 'OR', 'level': 1},
+      {'value': 'Mozilla Firefox 53.0 (x64 en-US) (test)', 'operator': '=', 'field': 'name$0', 'separator': 'AND',
+       'level': 0},
+      {'value': '1000', 'operator': '<', 'field': 'cve_id$0', 'separator': '', 'level': 0}]),
+    # Complex cases with lists in values
+    ('cve_id=CVE-2021-3996;(external_references=["https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-3996",'
+     '"https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.37/v2.37.3-ReleaseNotes",'
+     '"https://ubuntu.com/security/CVE-2021-3996","https://ubuntu.com/security/notices/USN-5279-1",'
+     '"https://www.openwall.com/lists/oss-security/2022/01/24/2"],name~Kernel)',
+     [{'value': 'CVE-2021-3996', 'operator': '=', 'field': 'cve_id$0', 'separator': 'AND', 'level': 0},
+      {'value': '["https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-3996",'
+                '"https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.37/v2.37.3-ReleaseNotes",'
+                '"https://ubuntu.com/security/CVE-2021-3996","https://ubuntu.com/security/notices/USN-5279-1",'
+                '"https://www.openwall.com/lists/oss-security/2022/01/24/2"]',
+       'operator': '=', 'field': 'external_references$0', 'separator': 'OR', 'level': 1},
+      {'value': 'Kernel', 'operator': 'LIKE', 'field': 'name$0', 'separator': '', 'level': 0}]),
+    # Cases with $
+    ('file=/test$/test.txt;(type=file,type=registry_key)',
+     [
+        {"value": "/test$/test.txt", "operator": "=", "field": "file$0", "separator": "AND", "level": 0},
+        {"value": "file", "operator": "=", "field": "type$0", "separator": "OR", "level": 1},
+        {"value": "registry_key", "operator": "=", "field": "type$1", "separator": "", "level": 0}
+     ]),
+    ('file=/$test/test.txt;(type=file,type=registry_key)',
+     [
+         {"value": "/$test/test.txt", "operator": "=", "field": "file$0", "separator": "AND", "level": 0},
+         {"value": "file", "operator": "=", "field": "type$0", "separator": "OR", "level": 1},
+         {"value": "registry_key", "operator": "=", "field": "type$1", "separator": "", "level": 0}
+     ]),
+    ('file=/tes$t/test.txt;(type=file,type=registry_key)',
+     [
+         {"value": "/tes$t/test.txt", "operator": "=", "field": "file$0", "separator": "AND", "level": 0},
+         {"value": "file", "operator": "=", "field": "type$0", "separator": "OR", "level": 1},
+         {"value": "registry_key", "operator": "=", "field": "type$1", "separator": "", "level": 0}
+     ]),
+    # Nested queries
+    ('(status=active;(group=default2,group=default3))',
+     [{'value': 'active', 'operator': '=', 'field': 'status$0', 'separator': 'AND', 'level': 1},
+      {'value': 'default2', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 2},
+      {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': '', 'level': 0}]),
+    ('((group=default2,group=default3));status=active',
+     [{'value': 'default2', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 2},
+      {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': 'AND', 'level': 0},
+      {'value': 'active', 'operator': '=', 'field': 'status$0', 'separator': '', 'level': 0}]),
+    ('(status=active,((group=default,group=default3)))',
+     [{'value': 'active', 'operator': '=', 'field': 'status$0', 'separator': 'OR', 'level': 1},
+      {'value': 'default', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 3},
+      {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': '', 'level': 0}]),
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+def test_WazuhDBQuery_protected_parse_query_regex(mock_backend_connect, mock_exists, q, expected_query_filters):
+    """Test WazuhDBQuery._parse_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None, filters=None,
+                               fields={query_filter['field'].replace('$0', ''): None
+                                       for query_filter in expected_query_filters},
+                               default_sort_field=None, query=q,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+    query._parse_query()
+    query_filters = query.query_filters
+    assert query_filters == expected_query_filters, f"The query filters are {query_filters}. " \
+                                                    f"Expected: {expected_query_filters}"
+
+
+@pytest.mark.parametrize('q, error, expected_exception', [
+    ('os.name=ubuntu;os.version>12e', False, None),
+    ('(os.name=debian;os.version>12e),(os.name=ubuntu;os.version>12e)', False, None),
+    ('os.name=debian;os.version>12e),(os.name=ubuntu;os.version>12e)', True, 1407),
+    ('(os.name=debian;os.version>12e', True, 1407),
+    ('bad_query', True, 1407),
+    ('os.name=Amazon Linux, 2023', True, 1407),
+    ('os.name=ubuntu;', True, 1407),
+    ('os.bad_field=ubuntu', True, 1408),
+    ('os.name=!ubuntu', True, 1409),
+    ('internal_key=test', True, 1408)
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_parse_query(mock_socket_conn, mock_conn_db, mock_glob, mock_exists,
+                                            q, error, expected_exception):
+    """Test WazuhDBQuery._parse_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None, filters=None,
+                               fields={'os.name': None, 'os.version': None, 'internal_key': None},
+                               extra_fields={'internal_key'},
+                               default_sort_field=None, query=q,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data=None)
+
+    if error:
+        with pytest.raises(exception.WazuhException, match=f'.* {expected_exception} .*'):
+            query._parse_query()
+    else:
+        # with patch('re.compile.return_value.findall', return_value=[True, 'os.name', '=', 'ubuntu', True, ';']):
+        query._parse_query()
+
+    mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('filter_', [
+    {'os.name': 'ubuntu,windows'},
+    {'name': 'value1,value2'}
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_parse_legacy_filters(mock_socket_conn, mock_conn_db, mock_glob,
+                                                     mock_exists, filter_):
+    """Test WazuhDBQuery._parse_legacy_filters function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None, filters=filter_,
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0),
+                               count=5, get_data=None)
+
+    query._parse_legacy_filters()
+
+    mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('filter, q', [
+    ({'os.name': 'ubuntu,windows'}, 'os.name=ubuntu'),
+    ({'name': 'value1,value2'}, 'os.version>12e')
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.WazuhDBQuery._parse_legacy_filters')
+@patch('wazuh.core.utils.WazuhDBQuery._parse_query')
+def test_WazuhDBQuery_parse_filters(mock_query, mock_filter, mock_socket_conn, mock_conn_db, mock_glob,
+                                    mock_exists, filter, q):
+    """Test WazuhDBQuery._parse_filters function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search={"negation": True, "value": "1"}, select=None,
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=q,
+                               backend=utils.WazuhDBBackend(agent_id=0),
+                               count=5, get_data=None)
+
+    query._parse_legacy_filters()
+    query._parse_query()
+
+    mock_conn_db.assert_called_once_with()
+    mock_query.assert_called_once_with()
+    mock_filter.assert_called_once_with()
+
+
+@pytest.mark.parametrize('field_name, field_filter, q_filter', [
+    ('status', 'field', {'value': 'active', 'operator': 'LIKE', 'field': 'status$0'}),
+    ('date1', None, {'value': '1', 'operator': None}),
+    ('os.name', 'field', {'value': '2019-07-16 09:21:56', 'operator': 'LIKE', 'field': 'status$0'}),
+    ('os.name', None, {'value': None, 'operator': 'LIKE', 'field': 'status$0'}),
+    ('os.name', 'field', {'value': '2019-07-16 09:21:56', 'operator': 'LIKE', 'field': 'status$0'})
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.WazuhDBQuery._filter_status')
+@patch('wazuh.core.utils.WazuhDBQuery._filter_date')
+def test_WazuhDBQuery_protected_process_filter(mock_date, mock_status, mock_socket_conn, mock_conn_db,
+                                               mock_glob, mock_exists, field_name, field_filter, q_filter):
+    """Tests WazuhDBQuery._process_filter."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None,
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04', 'status': 'active'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0), count=5,
+                               get_data=None, date_fields=['date1', 'date2'])
+
+    query._process_filter(field_name, field_filter, q_filter)
+
+    mock_conn_db.assert_called_once_with()
+    if field_name in ['date1', 'date2']:
+        mock_date.assert_any_call(q_filter, field_name)
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.WazuhDBQuery._process_filter')
+def test_WazuhDBQuery_protected_add_filters_to_query(mock_process, mock_socket_conn,
+                                                     mock_conn_db, mock_glob, mock_exists):
+    """Test WazuhDBQuery._add_filters_to_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=['os.name'],
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query='os.name=ubuntu',
+                               backend=utils.WazuhDBBackend(agent_id=0), distinct=True,
+                               count=5, get_data=None, filters={'os.name': 'ubuntu'},
+                               date_fields=['date1', 'date2'])
+
+    query.query_filters = [{'field': 'os.name', 'value': 'ubuntu', 'level': 0, 'separator': ';'}]
+    query._add_filters_to_query()
+
+    mock_conn_db.assert_called_once_with()
+
+@pytest.mark.parametrize('filters, expected_query', [
+    (
+        [
+            {'value': '001', 'operator': '!=', 'field': 'id$0', 'separator': 'AND', 'level': 0},
+            {'value': 'active', 'operator': '=', 'field': 'status$0', 'separator': 'AND', 'level': 1},
+            {'value': 'default2', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 2},
+            {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': '', 'level': 0}
+        ],
+        'SELECT {0} FROM agent WHERE (id != :id$0 COLLATE NOCASE) AND ((status = :status$0 COLLATE ' + \
+        'NOCASE) AND ((group = :group$0 COLLATE NOCASE) OR (group = :group$1 COLLATE NOCASE)))',
+    ),
+    (
+        [
+            {'value': 'default2', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 2},
+            {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': 'AND', 'level': 1},
+            {'value': '001', 'operator': '!=', 'field': 'id$0', 'separator': 'AND', 'level': 0},
+            {'value': 'active', 'operator': '=', 'field': 'status$0', 'separator': '', 'level': 0}
+        ],
+        'SELECT {0} FROM agent WHERE (((group = :group$0 COLLATE NOCASE) OR (group = :group$1 COLLATE ' + \
+        'NOCASE)) AND (id != :id$0 COLLATE NOCASE)) AND (status = :status$0 COLLATE NOCASE)',
+    ),
+    (
+        [
+            {'value': 'default2', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 3},
+            {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': 'OR', 'level': 2},
+            {'value': '001', 'operator': '=', 'field': 'id$0', 'separator': 'OR', 'level': 1},
+            {'value': '002', 'operator': '!=', 'field': 'id$1', 'separator': 'AND', 'level': 0},
+            {'value': 'active', 'operator': '=', 'field': 'status$0', 'separator': '', 'level': 0}
+        ],
+        'SELECT {0} FROM agent WHERE ((((group = :group$0 COLLATE NOCASE) OR (group = :group$1 COLLATE ' + \
+        'NOCASE)) OR (id = :id$0 COLLATE NOCASE)) OR (id != :id$1 COLLATE NOCASE)) AND ' + \
+        '(status = :status$0 COLLATE NOCASE)',
+    ),
+    (
+        [
+            {'value': 'default2', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 1},
+            {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': '', 'level': 0},
+        ],
+        'SELECT {0} FROM agent WHERE ((group = :group$0 COLLATE NOCASE) OR (group = :group$1 COLLATE NOCASE))',
+    ),
+    (
+        [
+            {'value': 'active', 'operator': '=', 'field': 'status$0', 'separator': 'OR', 'level': 1},
+            {'value': '001', 'operator': '!=', 'field': 'id$0', 'separator': 'AND', 'level': 2},
+            {'value': 'default', 'operator': '=', 'field': 'group$0', 'separator': 'OR', 'level': 3},
+            {'value': 'default3', 'operator': '=', 'field': 'group$1', 'separator': '', 'level': 0}
+        ],
+        'SELECT {0} FROM agent WHERE ((status = :status$0 COLLATE NOCASE) OR ((id != :id$0 COLLATE NOCASE) ' \
+        'AND ((group = :group$0 COLLATE NOCASE) OR (group = :group$1 COLLATE NOCASE))))',
+    ),
+])
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('wazuh.core.utils.path.exists', return_value=True)
+def test_WazuhDBQuery_protected_add_filters_to_query_final_query(mock_conn_db, mock_file_exists,
+                                                                 filters, expected_query):
+    """Test WazuhDBQuery._add_filters_to_query final query."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None, search=None, select=None,
+                               fields={'id': 'id', 'status': 'status', 'group': 'group'},
+                               default_sort_field=None, query='', backend=utils.WazuhDBBackend(agent_id=0),
+                               count=5, get_data=None)
+
+    query.query_filters = filters
+    query._add_filters_to_query()
+
+    assert query.query.rstrip(' ') == expected_query
+
+
+@pytest.mark.parametrize('q, valid', [
+    ('id=001', True),
+    ('(id=001,id=002);status=active', True),
+    ('((id=001),(id=002))', True),
+    ('name=Mozilla Firefox 53.0 (x64 en-US)', True),
+    ('id=001),(id=002', False),
+    ('(id=001', False),
+    ('id=001)', False),
+    ('(id=001));(status=active', False),
+    ('name~Amazon Linux', True),
+    ('name=[a,b];id=001', True),
+    ('name~Amazon Linux, 2023', False),
+    ('name=agent-1,foo', False),
+    ('name~ux;foo', False),
+    ('name~ux(,id~ux(', False),
+    ('id=001,', False),
+    ('id=001;', False),
+    ('(id=001)(id=002)', False),
+    (' id=001', False),
+    ('bad_query', False),
+])
+def test_validate_query(q, valid):
+    """Test that validate_query rejects a q that is not a sequence of terms joined by separators, or whose groups
+    are not closed after being opened."""
+    if valid:
+        utils.validate_query(q)
+    else:
+        with pytest.raises(exception.WazuhError, match='.* 1407 .*'):
+            utils.validate_query(q)
+
+
+@pytest.mark.parametrize('filters, q, expected_where', [
+    # An OR in q stays inside the q group instead of splitting the legacy filters off
+    ({'status': 'active'}, 'id=001,id=002',
+     "(status = :status$0 COLLATE NOCASE) AND ((id = :id$0 COLLATE NOCASE) OR (id = :id$1 COLLATE NOCASE))"),
+    # A level drop of two that stays above zero opens its own parenthesis
+    ({'status': 'active'}, '(((id=001,id=002)),id=003)',
+     "(status = :status$0 COLLATE NOCASE) AND (((((id = :id$0 COLLATE NOCASE) OR (id = :id$1 COLLATE NOCASE))) "
+     "OR (id = :id$2 COLLATE NOCASE)))"),
+    # Without legacy filters q is still one group
+    (None, 'id=001,id=002', "((id = :id$0 COLLATE NOCASE) OR (id = :id$1 COLLATE NOCASE))"),
+    # Without q nothing is added
+    ({'status': 'active'}, '', "(status = :status$0 COLLATE NOCASE)"),
+])
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('wazuh.core.utils.path.exists', return_value=True)
+def test_WazuhDBQuery_protected_add_filters_to_query_groups_q(mock_conn_db, mock_file_exists,
+                                                              filters, q, expected_where):
+    """Test that the q filters are rendered as one balanced group ANDed with the legacy filters."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None, search=None, select=None,
+                               fields={'id': 'id', 'status': 'status'}, filters=filters,
+                               default_sort_field=None, query=q, backend=utils.WazuhDBBackend(agent_id=0),
+                               count=5, get_data=None)
+
+    query._add_filters_to_query()
+
+    where = query.query.split(' WHERE ', 1)[1].rstrip()
+    assert where == expected_where
+    assert where.count('(') == where.count(')')
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_get_total_items(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Test WazuhDBQuery._get_total_items function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None,
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0), count=5,
+                               get_data=None, date_fields=['date1', 'date2'])
+
+    query._add_select_to_query()
+    query._get_total_items()
+
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_get_total_items_mitre(mock_socket_conn, mock_conn_db, mock_glob,
+                                                      mock_exists):
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None,
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0, query_format='mitre'), count=5,
+                               get_data=None, date_fields=['date1', 'date2'])
+
+    query._add_select_to_query()
+    query._get_total_items()
+
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Test utils.WazuhDBQuery._get_total_items function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select=None,
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0), count=5,
+                               get_data=None, date_fields=['date1', 'date2'])
+    query.request = {'testing': 'testing'}
+
+    query._add_select_to_query()
+    query._get_total_items()
+
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_values(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Strings are quoted, ints and floats are not, whether scalar or inside a list."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    assert backend._substitute_params("a = :a AND b = :b", {'a': 'hello', 'b': 5}) == "a = 'hello' AND b = 5"
+    assert backend._substitute_params("id IN (:ids)", {'ids': ['001', '002', 'abc']}) == "id IN ('001','002','abc')"
+    assert backend._substitute_params("name IN (:names)", {'names': ['007']}) == "name IN ('007')"
+    assert backend._substitute_params("name NOT IN (:names)", {'names': ['00', '0123']}) == "name NOT IN ('00','0123')"
+    assert backend._substitute_params("id IN (:ids)", {'ids': ['007', 5, 1.5]}) == "id IN ('007',5,1.5)"
+    assert backend._substitute_params("no placeholders", {}) == "no placeholders"
+    with pytest.raises(TypeError):
+        backend._substitute_params("x = :x", {'x': object()})
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_prefix_collision(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """A placeholder that is a prefix of another is not matched partially."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    result = backend._substitute_params("name LIKE :search OR id LIKE :search_id",
+                                        {'search': '%foo%', 'search_id': 'foo'})
+    assert result == "name LIKE '%foo%' OR id LIKE 'foo'"
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_single_pass(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """A value equal to another placeholder name is not substituted a second time."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    # A key with '$' (as the query builder produces) whose value looks like the ':b' placeholder.
+    result = backend._substitute_params("x = :a$0 AND y = :b", {'a$0': ':b', 'b': 'value_b'})
+    # ':a$0' resolves to the literal ':b'; the replacement text is not scanned again for :b.
+    assert result == "x = ':b' AND y = 'value_b'"
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_substitute_params_quote_escaping(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Single quotes in a value are escaped by doubling so a value cannot terminate its literal."""
+    backend = utils.WazuhDBBackend(agent_id=0)
+    assert backend._substitute_params("name = :n", {'n': "O'Brien"}) == "name = 'O''Brien'"
+    assert backend._substitute_params("name = :n", {'n': "a'b'c"}) == "name = 'a''b''c'"
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_format_data_into_dictionary(mock_socket_conn, mock_conn_db, mock_glob,
+                                                            mock_exists):
+    """Test utils.WazuhDBQuery._format_data_into_dictionary."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select={'fields': set(['os.name'])},
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0), count=5,
+                               get_data=None, min_select_fields=set(['os.version']))
+
+    query._data = []
+
+    query._format_data_into_dictionary()
+
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_filter_status(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Test utils.WazuhDBQuery._filter_status function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select={'fields': set(['os.name'])},
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0),
+                               count=5, get_data=None,
+                               min_select_fields=set(['os.version']))
+
+    with pytest.raises(NotImplementedError):
+        query._filter_status('status')
+
+        mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('date_filter, filter_db_name, time, error', [
+    ({'value': '7d', 'operator': '<', 'field': 'time'}, 'os.name', 10, False),
+    ({'value': '2019-08-13', 'operator': '<', 'field': 'time'}, 'os.name', 10, False),
+    ({'value': 'bad_value'}, 'os.name', 10, True)
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_filter_date(mock_socket_conn, mock_conn_db, mock_glob, mock_exists,
+                                            date_filter, filter_db_name, time, error):
+    """Test utils.WazuhDBQuery._filter_date function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select={'fields': set(['os.name'])},
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0), count=5,
+                               get_data=None)
+
+    query.request = {'time': None}
+
+    with patch('wazuh.core.utils.get_timeframe_in_seconds', return_value=time):
+        if error:
+            with pytest.raises(exception.WazuhException, match=".* 1412 .*"):
+                query._filter_date(date_filter, filter_db_name)
+        else:
+            query._filter_date(date_filter, filter_db_name)
+
+        mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('execute_value, expected_result', [
+    ([{'id': 99}, {'id': 100}], {'items': [{'id': '099'}, {'id': '100'}], 'totalItems': 0}),
+    ([{'id': 1}], {'items': [{'id': '001'}], 'totalItems': 0}),
+    ([{'id': i} for i in range(30000)], {'items': [{'id': str(i).zfill(3)} for i in range(30000)], 'totalItems': 0})
+])
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_general_run(mock_socket_conn, execute_value, expected_result):
+    """Test utils.WazuhDBQuery.general_run function."""
+    with patch('wazuh.core.utils.WazuhDBBackend.execute', return_value=execute_value):
+        query = WazuhDBQueryAgents(offset=0, limit=None, sort=None, search=None, select={'id'},
+                                   query=None, count=False, get_data=True, remove_extra_fields=False)
+
+        assert query.general_run() == expected_result
+
+
+@pytest.mark.parametrize('execute_value, rbac_ids, negate, expected_ids, final_rbac_ids, expected_result', [
+    ([{'id': 99}, {'id': 100}], ['001', '099', '101'], False, [99], [{'id': 99}],
+     {'items': [{'id': '099'}], 'totalItems': 1}),
+    ([{'id': 1}], [], True, [1], [{'id': 1}], {'items': [{'id': '001'}], 'totalItems': 1}),
+    ([{'id': i} for i in range(30000)], [str(i).zfill(3) for i in range(15001)], True,
+     list(range(15001, 30000)), [{'id': i} for i in range(15001, 30000)],
+     {'items': [{'id': str(i).zfill(3)} for i in range(15001, 30000)], 'totalItems': 14999})
+])
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_oversized_run(mock_socket_conn, execute_value, rbac_ids, negate, expected_ids,
+                                    final_rbac_ids, expected_result):
+    """Test utils.WazuhDBQuery.oversized_run function.
+
+    The second pass must select the allowed ids with IN, whatever the original filter was.
+    """
+    with patch('wazuh.core.utils.WazuhDBBackend.execute', side_effect=[execute_value, final_rbac_ids]) as execute:
+        query = WazuhDBQueryAgents(offset=0, limit=None, sort=None, search=None, select={'id'},
+                                   query=None, count=True, get_data=True, remove_extra_fields=False)
+        query.legacy_filters['rbac_ids'] = rbac_ids
+        query.rbac_negate = negate
+
+        assert query.oversized_run() == expected_result
+
+        second_query, second_request = execute.call_args_list[1].args
+        assert 'id IN (:rbac_id)' in second_query
+        assert 'NOT IN' not in second_query
+        assert second_request['rbac_id'] == expected_ids
+        assert query.rbac_negate == negate
+
+
+@pytest.mark.parametrize('data, expected_result', [
+    (True, {'items': [], 'totalItems': 0}),
+    (False, {'totalItems': 0}),
+])
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_oversized_run_nothing_allowed(mock_socket_conn, data, expected_result):
+    """Test utils.WazuhDBQuery.oversized_run returns nothing when every resource is denied.
+
+    An empty RBAC filter is dropped from the query, so running the second pass would return every agent.
+    """
+    with patch('wazuh.core.utils.WazuhDBBackend.execute', side_effect=[[{'id': 1}, {'id': 2}]]) as execute:
+        query = WazuhDBQueryAgents(offset=0, limit=None, sort=None, search=None, select={'id'},
+                                   query=None, count=True, get_data=data, remove_extra_fields=False)
+        query.legacy_filters['rbac_ids'] = ['001', '002']
+        query.rbac_negate = True
+
+        assert query.oversized_run() == expected_result
+        execute.assert_called_once()
+
+
+@pytest.mark.parametrize('negate, rbac_ids', [
+    (False, [str(i).zfill(3) for i in range(2, 10)]),
+    (True, ['000', '001']),
+])
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_oversized_run_offset(mock_socket_conn, negate, rbac_ids):
+    """Test utils.WazuhDBQuery.oversized_run keeps every allowed id up to the end of the requested page."""
+    with patch('wazuh.core.utils.WazuhDBBackend.execute',
+               side_effect=[[{'id': i} for i in range(10)], [{'id': 5}, {'id': 6}]]) as execute:
+        query = WazuhDBQueryAgents(offset=3, limit=2, sort=None, search=None, select={'id'},
+                                   query=None, count=True, get_data=True, remove_extra_fields=False)
+        query.legacy_filters['rbac_ids'] = rbac_ids
+        query.rbac_negate = negate
+
+        assert query.oversized_run() == {'items': [{'id': '005'}, {'id': '006'}], 'totalItems': 8}
+
+        _, second_request = execute.call_args_list[1].args
+        # Agent ids are sent to wazuh-db as integers, not as zero-padded strings
+        assert second_request['rbac_id'] == [2, 3, 4, 5, 6]
+        assert second_request['offset'] == 3
+        assert second_request['limit'] == 2
+
+
+@pytest.mark.parametrize('negate, rbac_ids', [
+    (False, ['cd']),
+    (True, ['ab']),
+])
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_oversized_run_groups(mock_socket_conn, negate, rbac_ids):
+    """Test utils.WazuhDBQuery.oversized_run on groups, whose names must not be zero-padded."""
+    with patch('wazuh.core.utils.WazuhDBBackend.execute',
+               side_effect=[[{'name': 'ab', 'count': 1}, {'name': 'cd', 'count': 2}],
+                            [{'name': 'cd', 'count': 2}]]) as execute:
+        query = WazuhDBQueryGroup(count=True, get_data=True)
+        query.legacy_filters['rbac_ids'] = rbac_ids
+        query.rbac_negate = negate
+
+        assert query.oversized_run() == {'items': [{'name': 'cd', 'count': 2}], 'totalItems': 1}
+
+        second_query, second_request = execute.call_args_list[1].args
+        assert 'name IN (:rbac_name)' in second_query
+        assert 'NOT IN' not in second_query
+        assert second_request['rbac_name'] == ['cd']
+
+
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_oversized_run_unsupported(mock_socket_conn):
+    """Test utils.WazuhDBQuery.oversized_run raises 1123 on a query with no RBAC field."""
+    query = WazuhDBQueryAgents(offset=0, limit=None, sort=None, search=None, select={'id'},
+                               query=None, count=True, get_data=True, remove_extra_fields=False)
+    query.oversized_rbac_field = None
+    query.legacy_filters['rbac_ids'] = ['001']
+
+    with pytest.raises(exception.WazuhInternalError, match='.* 1123 .*'):
+        query.oversized_run()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.WazuhDBQuery._default_query')
+def test_WazuhDBQuery_reset(mock_query, mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Test utils.WazuhDBQuery.reset function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select={'os.name'},
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=0),
+                               count=5, get_data='data')
+
+    query.reset()
+
+    mock_conn_db.assert_called_once_with()
+    mock_query.assert_called_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_default_query(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Test utils.WazuhDBQuery._default_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select={'fields': set(['os.name'])},
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None, count=5,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               get_data='data')
+
+    result = query._default_query()
+
+    assert result == "SELECT {0} FROM " + query.table
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_default_count_query(mock_socket_conn, mock_conn_db, mock_glob,
+                                                    mock_exists):
+    """Test utils.WazuhDBQuery._default_count_query function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select={'fields': set(['os.name'])},
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data='data')
+
+    result = query._default_count_query()
+
+    assert result == "SELECT COUNT(*) FROM ({0})"
+    mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('value', [
+    'all',
+    'other_filter'
+])
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQuery_protected_pass_filter(mock_socket_conn, mock_conn_db, mock_glob, mock_exists,
+                                            value):
+    """Test utils.WazuhDBQuery._pass_filter function."""
+    query = utils.WazuhDBQuery(offset=0, limit=1, table='agent', sort=None,
+                               search=None, select={'fields': {'os.name'}},
+                               fields={'os.name': 'ubuntu', 'os.version': '18.04'},
+                               default_sort_field=None, query=None,
+                               backend=utils.WazuhDBBackend(agent_id=1),
+                               count=5, get_data='data')
+
+    result = query._pass_filter('os.name', value)
+
+    assert isinstance(result, bool)
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+def test_WazuhDBQueryGroupBy__init__(mock_socket_conn, mock_conn_db, mock_glob, mock_exists):
+    """Tests utils.WazuhDBQueryGroupBy.__init__ function works"""
+    utils.WazuhDBQueryGroupBy(filter_fields=None, offset=0, limit=1, table='agent',
+                              sort=None, search=None, select={'fields': ['name']},
+                              filters=None, fields={'name': '`group`'},
+                              default_sort_field=None, default_sort_order='ASC',
+                              query=None, min_select_fields=None, count=True,
+                              backend=utils.WazuhDBBackend(agent_id=0), get_data=None,
+                              date_fields={'lastKeepAlive', 'dateAdd'},
+                              extra_fields={'internal_key'})
+
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.WazuhDBQuery._get_total_items')
+def test_WazuhDBQueryGroupBy_protected_get_total_items(mock_total, mock_socket_conn, mock_conn_db,
+                                                       mock_glob, mock_exists):
+    """Test utils.WazuhDBQueryGroupBy._get_total_items function."""
+    query = utils.WazuhDBQueryGroupBy(filter_fields={'fields': ['name']}, offset=0,
+                                      limit=1, table='agent', sort=None, search=None,
+                                      select={'name'}, filters=None,
+                                      fields={'name': '`group`'}, query=None,
+                                      default_sort_field=None, get_data=None,
+                                      default_sort_order='ASC',
+                                      min_select_fields=None, count=True,
+                                      backend=utils.WazuhDBBackend(agent_id=0),
+                                      date_fields={'lastKeepAlive', 'dateAdd'},
+                                      extra_fields={'internal_key'})
+
+    query._get_total_items()
+    mock_conn_db.assert_called_once_with()
+
+
+@patch('wazuh.core.utils.path.exists', return_value=True)
+@patch('glob.glob', return_value=True)
+@patch('wazuh.core.utils.WazuhDBBackend.connect_to_db')
+@patch('socket.socket.connect')
+@patch('wazuh.core.utils.WazuhDBQuery._add_select_to_query')
+@patch('wazuh.core.utils.WazuhDBQuery._parse_select_filter')
+def test_WazuhDBQueryGroupBy_protected_add_select_to_query(mock_parse, mock_add, mock_socket_conn,
+                                                           mock_conn_db, mock_glob, mock_exists):
+    """Test utils.WazuhDBQueryGroupBy._add_select_to_query function."""
+    query = utils.WazuhDBQueryGroupBy(filter_fields={'fields': ['name']}, offset=0,
+                                      limit=1, table='agent', sort=None, search=None,
+                                      select={'name'}, filters=None,
+                                      fields={'name': '`group`'}, query=None,
+                                      default_sort_field=None,
+                                      default_sort_order='ASC',
+                                      min_select_fields=None,
+                                      count=True, get_data=None,
+                                      backend=utils.WazuhDBBackend(agent_id=0),
+                                      date_fields={'lastKeepAlive', 'dateAdd'},
+                                      extra_fields={'internal_key'})
+
+    query._add_select_to_query()
+    mock_conn_db.assert_called_once_with()
+
+
+@pytest.mark.parametrize('q, return_length', [
+    ('name=firewall', 0),
+    ('count=1', 0),
+    ('name~a', 3),
+    ('count<0', 0),
+    ('count>3', 0),
+    ('count=3;name~test', 0),
+    ('count!=0;count!=3', 0),
+    ('wrong_param=default', 0),
+    ('wrong_param!=default', 0),
+    ('wrong_param2~test', 0),
+    ('name~test;mergedSum~2acdb', 1),
+    ('name=dmz', 1),
+    ('name~def', 1),
+    ('count=3', 1),
+    ('count>2', 1),
+    ('count>0', 1),
+    ('count!=0', 1),
+    ('name~test;mergedSum~2acdb,name=dmz', 2),
+    ('name=dmz,name=default', 2),
+    ('name~test', 4),
+    ('count<3;name~test', 4),
+    ('name~d', 4),
+    ('name!=dmz;name!=default', 4),
+    ('count=0;name!=dmz', 4),
+    ('count=0', 5),
+    ('count<3', 5),
+    ('count<1', 5),
+    ('count!=3', 5),
+    ('count>10,count<3', 5),
+    ('configSum~29,count=3', 3),
+    ('name~test,count>0', 5),
+    ('count<4', 6),
+    ('count>0,count<4', 6),
+    ('name~def,count=0', 6),
+    ('configSum~29,configSum~ab', 4),
+    ('nameGfirewall', -1),
+    ('mergedSum.nestedSum1=value', 2),
+    ('configSum.nestedSum1.nestedSum11=value', 1),
+    ('configSum.nestedSum2.nestedSum21=value1', 1),
+    ('configSum.nestedSum2.nestedSum21=value2', 1),
+    ('name=test@nested2', 1),
+])
+def test_filter_array_by_query(q, return_length):
+    """Test filter by query in an array."""
+    if return_length == -1:
+        with pytest.raises(exception.WazuhError, match='.* 1407 .*'):
+            utils.filter_array_by_query(q='nameGfirewall', input_array=input_array)
+        return
+
+    result = utils.filter_array_by_query(q, input_array)
+    for item in result:
+        # check fields returned in result
+        item_keys = set(item.keys())
+        assert (len(item_keys) == len(input_array[0]))
+        assert (item_keys == set(input_array[0].keys()))
+
+    assert (len(result) == return_length)
+
+
+# Array whose `created` field is a real `datetime`, the shape enrollment tokens' `created`/`expires`
+# reach filter_array_by_query with.
+typed_input_array = [
+    {
+        'id': 'first',
+        'created': datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    },
+    {
+        'id': 'second',
+        'created': datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+    }]
+
+
+@pytest.mark.parametrize('q, expected_ids', [
+    ('created>2026-03-01', ['second']),
+    ('created<2026-03-01', ['first']),
+    ('created=2026-01-01', ['first']),
+    ('created!=2026-01-01', ['second']),
+    ('created>2026-01-01T00:00:00Z', ['second'])
+])
+def test_filter_array_by_query_typed_fields(q, expected_ids):
+    """Test filtering by query on a field whose value is a real datetime object."""
+    result = utils.filter_array_by_query(q, typed_input_array)
+
+    assert [item['id'] for item in result] == expected_ids
+
+
+@pytest.mark.parametrize('q, expected_ids', [
+    # The shape a response body renders a timestamp in, passed back as-is.
+    ('created=2026-01-01T00:00:00+00:00', ['first']),
+    ('created!=2026-01-01T00:00:00+00:00', ['second']),
+    ('created>2026-01-01T00:00:00+00:00', ['second']),
+    ('created<2026-06-01T00:00:00+00:00', ['first']),
+    ('created=2026-01-01T00:00:00.000000+00:00', ['first']),
+    ('created=2026-01-01 00:00:00+0000', ['first']),
+    # A non-UTC offset is converted to UTC, not relabelled: 2025-12-31T21:00:00-03:00 is midnight UTC.
+    ('created=2025-12-31T21:00:00-03:00', ['first']),
+    ('created>2025-12-31T21:00:00-03:00', ['second']),
+    ('created=2026-01-01T02:00:00+02:00', ['first']),
+    ('created<2026-01-01T02:00:00+02:00', []),
+])
+def test_filter_array_by_query_typed_fields_offset_literal(q, expected_ids):
+    """Test that a date literal with a numeric UTC offset is compared as an aware datetime by every operator."""
+    result = utils.filter_array_by_query(q, typed_input_array)
+
+    assert [item['id'] for item in result] == expected_ids
+
+
+def test_filter_array_by_query_offset_literal_against_string_dates():
+    """Test that offset-bearing literals and stored strings in either form compare as the same instant."""
+    array = [{'id': 'first', 'created': '2026-01-01T00:00:00Z'},
+             {'id': 'second', 'created': '2026-06-01T03:00:00+03:00'}]
+
+    assert [item['id'] for item in utils.filter_array_by_query('created=2026-06-01T00:00:00Z', array)] == ['second']
+    assert [item['id'] for item in utils.filter_array_by_query('created<2026-01-01T01:00:00+01:00', array)] == []
+    assert [item['id'] for item in utils.filter_array_by_query('created>2025-12-31T23:00:00-01:00', array)] == \
+        ['second']
+
+
+# Array whose `revoked` field is a real `bool`, the shape enrollment tokens' `revoked`/`credential`
+# reach filter_array_by_query with. Also carries `created` so a combined date+bool query can be
+# exercised without needing a third fixture.
+bool_typed_input_array = [
+    {
+        'id': 'first',
+        'created': datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+        'revoked': False
+    },
+    {
+        'id': 'second',
+        'created': datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc),
+        'revoked': True
+    }]
+
+
+@pytest.mark.parametrize('q, expected_ids', [
+    ('revoked=true', ['second']),
+    ('revoked=false', ['first']),
+    ('revoked!=true', ['first']),
+    ('revoked=1', ['second']),
+    ('revoked=0', ['first']),
+    ('revoked=true;created>2026-03-01', ['second']),
+    # A date-shaped literal is parsed as a date before the boolean coercion, so it matches
+    # nothing at all -- but it no longer raises.
+    ('revoked=2026-01-01', [])
+])
+def test_filter_array_by_query_typed_fields_bool(q, expected_ids):
+    """Test filtering by query on a field whose value is a real bool object."""
+    result = utils.filter_array_by_query(q, bool_typed_input_array)
+
+    assert [item['id'] for item in result] == expected_ids
+
+
+def test_filter_array_by_query_typed_fields_bool_rejects_unrecognized_literal():
+    """A literal other than true/false/1/0 against a bool field raises WazuhError(1407) instead
+    of silently being read as false (the complement of what was asked)."""
+    with pytest.raises(exception.WazuhError, match='.* 1407 .*'):
+        utils.filter_array_by_query('revoked=maybe', bool_typed_input_array)
+
+
+@pytest.mark.parametrize('q, array, expected_ids', [
+    # A date-shaped literal against a field that is not itself a date falls through to Python's
+    # own cross-type comparison: `!=` is unconditionally True, so every record matches.
+    ('revoked!=2026-01-01', bool_typed_input_array, ['first', 'second']),
+    # Same mismatch, a None field this time (e.g. `description`, nullable per the API schema).
+    ('description!=2026-01-01',
+     [{'id': 'first', 'description': None}, {'id': 'second', 'description': 'x'}],
+     ['first', 'second']),
+])
+def test_filter_array_by_query_date_shaped_literal_ne_mismatched_field(q, array, expected_ids):
+    """`!=` with a date-shaped literal against a non-date field matches every record. A literal
+    whose type the field cannot address is not on its own a malformed query: it only becomes one
+    when no record in the array can evaluate the clause at all."""
+    result = utils.filter_array_by_query(q, array)
+
+    assert [item['id'] for item in result] == expected_ids
+
+
+def test_filter_array_by_query_date_shaped_literal_eq_mismatched_field():
+    """The `=` side of the same mismatch is a silent no-match, as documented in api-reference.md:
+    operator.eq on mismatched types is unconditionally False."""
+    result = utils.filter_array_by_query('revoked=2026-01-01', bool_typed_input_array)
+
+    assert result == []
+
+
+@pytest.mark.parametrize('q, array, expected_ids', [
+    # `~` only cast an int value to str; a bool or datetime value raised TypeError
+    # (`value2 in val` on a non-iterable) instead of matching or not.
+    ('revoked~True', [{'id': 'a', 'revoked': True}, {'id': 'b', 'revoked': False}], ['a']),
+    ('revoked~alse', [{'id': 'a', 'revoked': True}, {'id': 'b', 'revoked': False}], ['b']),
+    ('created~2026-01',
+     [{'id': 'a', 'created': datetime.datetime(2026, 1, 1)},
+      {'id': 'b', 'created': datetime.datetime(2027, 1, 1)}],
+     ['a']),
+])
+def test_filter_array_by_query_contains_non_str(q, array, expected_ids):
+    """Test that `~` renders a bool or datetime value as text before the substring match, the way
+    it already does for an int; a dict or a list keeps its own membership semantics."""
+    result = utils.filter_array_by_query(q, array)
+
+    assert [item['id'] for item in result] == expected_ids
+
+
+# Array whose `created` (datetime) and `uses` (int) fields mirror an enrollment token, to exercise
+# a `q` literal that doesn't match either field's type.
+type_mismatch_input_array = [{
+    'id': 'first',
+    'created': datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+    'uses': 0
+}]
+
+
+@pytest.mark.parametrize('q', ['uses>=1', 'uses<=5', 'uses==0', 'uses<>1'])
+def test_filter_array_by_query_unsupported_operator(q):
+    """The clause regex matches any two operator characters, so `>=`, `<=`, `==` and `<>` parse as
+    an operator `check_clause` has no entry for. That is a malformed query, reported as
+    WazuhError(1407) whatever the collection holds, not a KeyError escaping as a 500."""
+    with pytest.raises(exception.WazuhError, match='.* 1407 .*'):
+        utils.filter_array_by_query(q, [{'id': 'first', 'uses': 0}])
+
+
+@pytest.mark.parametrize('q', [
+    'created>foo',
+    'created>1',
+    'created>2026-13-01',
+    'uses=abc',
+    'uses=2026-01-01',
+])
+def test_filter_array_by_query_type_mismatch(q):
+    """Test that a `q` literal incompatible with the target field's type raises WazuhError(1407)
+    instead of an unhandled TypeError/ValueError."""
+    with pytest.raises(exception.WazuhError, match='.* 1407 .*'):
+        utils.filter_array_by_query(q, type_mismatch_input_array)
+
+
+# One record has a null `description`; the other has a real one. Used to check that a present-but-
+# null field under an ordering operator doesn't poison the whole query -- it should just not match,
+# the same as a record missing the field entirely, instead of raising WazuhError(1407) for every
+# record because ONE of them can't satisfy the comparison.
+null_field_input_array = [
+    {'id': 'null_description', 'description': None},
+    {'id': 'has_description', 'description': 'b'},
+]
+
+
+@pytest.mark.parametrize('q, expected_ids', [
+    ('description>a', ['has_description']),
+    ('description<c', ['has_description']),
+    # `=`/`!=` never raise on None to begin with (operator.eq/ne accept any types), so a null
+    # field already behaved correctly for these -- kept here to pin that it still does.
+    ('description=b', ['has_description']),
+    ('description!=b', ['null_description']),
+])
+def test_filter_array_by_query_null_field_ordering(q, expected_ids):
+    """A null field under `<`/`>` is excluded like a missing field, not a query-wide 400."""
+    result = utils.filter_array_by_query(q, null_field_input_array)
+
+    assert [item['id'] for item in result] == expected_ids
+
+
+def test_filter_array_by_query_nested_falsy_candidate():
+    """A nested field's `False`/`0`/`''` value must still reach check_clause -- only a `None`
+    candidate (the nested field is itself null) should be dropped before comparing."""
+    array = [
+        {'id': 'disabled', 'config': {'enabled': False}},
+        {'id': 'enabled', 'config': {'enabled': True}},
+        {'id': 'null_nested', 'config': {'enabled': None}},
+    ]
+
+    result = utils.filter_array_by_query('config.enabled=false', array)
+
+    assert [item['id'] for item in result] == ['disabled']
+
+
+@pytest.mark.parametrize('array', [
+    # matching candidate first
+    [{'id': 'a', 'x': [{'y': 'abc'}, {'y': 0}]}],
+    # matching candidate last
+    [{'id': 'a', 'x': [{'y': 0}, {'y': 'abc'}]}],
+])
+def test_filter_array_by_query_nested_mixed_type_candidates_matches(array):
+    """A sibling candidate the literal's type cannot address (int vs. a str literal) must not
+    abort a match still reachable through another, differently-typed candidate, regardless of
+    which one is evaluated first."""
+    result = utils.filter_array_by_query('x.y=abc', array)
+
+    assert [item['id'] for item in result] == ['a']
+
+
+def test_filter_array_by_query_nested_mixed_type_candidates_no_match_still_raises():
+    """When every non-null candidate's type mismatches the literal, the clause is still
+    malformed -- WazuhError(1407) is raised rather than silently excluding the record."""
+    array = [{'id': 'a', 'x': [{'y': 0}, {'y': 5}]}]
+
+    with pytest.raises(exception.WazuhError, match='.* 1407 .*'):
+        utils.filter_array_by_query('x.y=abc', array)
+
+
+@pytest.mark.parametrize('select, required_fields, expected_result', [
+    (['single_select', 'nested1.nested12.nested121'], {'required'}, {'required': None,
+                                                                     'single_select': None,
+                                                                     'nested1': {
+                                                                         'nested12': {
+                                                                             'nested121': None
+                                                                         }
+                                                                     }}),
+    (['single_select', 'noexists'], None, {'single_select': None}),
+    (['required.noexists1.noexists2'], None, None)
+])
+def test_select_array(select, required_fields, expected_result):
+    array = [
+        {
+            'required': None,
+            'single_select': None,
+            'nested1': {
+                'nested12': {
+                    'nested121': None
+                }
+            },
+            'nested2': {
+                'nested21': None
+            }
+        },
+        {
+            'required': None,
+            'single_select': None,
+            'nested1': {
+                'nested12': {
+                    'nested121': None
+                }
+            },
+            'whatever': {
+                'whatever1': None
+            }
+        },
+    ]
+
+    try:
+        result = utils.select_array(array, select=select, required_fields=required_fields)
+        for element in result:
+            assert element == expected_result
+    except utils.WazuhError as e:
+        assert e.code == 1724
+
+
+@pytest.mark.parametrize('select, invalid', [
+    (['tag.x0', 'tag.x1'], 'tag.x0, tag.x1'),
+    (['level', 'tag.x0'], 'tag.x0'),
+    (['bad', 'bad.x0'], 'bad, bad.x0'),
+])
+def test_select_array_rejects_nested_fields_outside_the_allowed_ones(select, invalid):
+    """A nested select field must hang from an allowed field; the error lists only the invalid ones."""
+    array = [{'timestamp': 't', 'level': 'info', 'description': {'x0': 'd'}}]
+
+    with pytest.raises(utils.WazuhError, match=f'.* 1724 .*: {invalid}$'):
+        utils.select_array(array, select=select, allowed_select_fields=['timestamp', 'level', 'description'])
+
+
+def test_select_array_accepts_nested_fields_of_allowed_ones():
+    """A nested field of an allowed field, or one allowed by its full name, is selected."""
+    array = [{'timestamp': 't', 'level': 'info', 'description': {'x0': 'd'}, 'os': {'name': 'n'}}]
+
+    result = utils.select_array(array, select=['description.x0', 'os.name'],
+                                allowed_select_fields=['timestamp', 'description', 'os.name'])
+
+    assert result == [{'description': {'x0': 'd'}, 'os': {'name': 'n'}}]
+
+
+@pytest.mark.parametrize('q, array', [
+    ('name=a,nameGfirewall', [{'name': 'a'}]),
+    ('nameGfirewall', []),
+    ('name>=1', []),
+])
+def test_filter_array_by_query_malformed_clause_is_reported_whatever_the_array_holds(q, array):
+    """The query is parsed before the array is walked: a malformed clause is reported even when the
+    array is empty or every element already matched an earlier OR clause."""
+    with pytest.raises(exception.WazuhError, match='.* 1407 .*'):
+        utils.filter_array_by_query(q, array)
+
+
+def test_filter_array_by_query_parses_each_clause_once():
+    """Each clause is matched once, however many elements the array holds."""
+    real_compile = re.compile
+    compiled = []
+
+    def spying_compile(*args, **kwargs):
+        compiled.append(MagicMock(wraps=real_compile(*args, **kwargs)))
+        return compiled[-1]
+
+    with patch('wazuh.core.utils.re.compile', side_effect=spying_compile):
+        result = utils.filter_array_by_query('name=a;id=1,name=b', [{'name': 'c', 'id': '1'} for _ in range(50)])
+
+    assert result == []
+    assert sum(regex.match.call_count for regex in compiled) == 3
+
+
+def test_to_relative_path():
+    """Test to_relative_path function."""
+    path = 'etc/wazuh-manager.conf'
+    assert utils.to_relative_path(os.path.join(WAZUH_PATH, path)) == path
+
+    assert utils.to_relative_path(path, prefix='etc') == os.path.basename(path)
+
+
+def test_full_copy():
+    """Test `full_copy` function.
+
+    This function will copy a file with all its metadata.
+    """
+    test_file = os.path.join(test_data_path, 'test_file.txt')
+    copied_test_file = os.path.join(test_data_path, 'test_file_copy.txt')
+    non_copyable_attributes = {'st_atime', 'st_atime_ns', 'st_ctime', 'st_ctime_ns', 'st_ino'}
+    try:
+        with open(test_file, 'w') as f:
+            f.write('test')
+
+        os.chmod(test_file, 0o660)
+
+        original_stat = os.stat(test_file)
+        utils.full_copy(test_file, copied_test_file)
+        copy_stat = os.stat(copied_test_file)
+
+        for attribute in dir(original_stat):
+            if attribute.startswith('st_') and attribute not in non_copyable_attributes:
+                assert getattr(original_stat, attribute) == getattr(copy_stat, attribute), f'Attribute {attribute} ' \
+                                                                                           'is not equal between' \
+                                                                                           ' original and copy files'
+    finally:
+        os.path.exists(test_file) and os.remove(test_file)
+        os.path.exists(copied_test_file) and os.remove(copied_test_file)
+
+
+@patch('wazuh.core.utils.copy2', new=copyfile)
+def test_full_copy_ko():
+    """Test `full_copy` function using mutation testing."""
+    with pytest.raises(AssertionError):
+        test_full_copy()
+
+
+@freeze_time('1970-01-01')
+def test_get_date_from_timestamp():
+    """Test if the result is the expected date."""
+
+    date = utils.get_date_from_timestamp(0)
+    assert date == datetime.datetime(1970, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+@freeze_time('1970-01-01')
+def test_get_utc_now():
+    """Test if the result is the expected date."""
+
+    date = utils.get_utc_now()
+    assert date == datetime.datetime.now(datetime.timezone.utc)
+
+@pytest.mark.parametrize('is_at_utc', [True, False])
+@patch('wazuh.core.utils.get_localtime')
+def test_get_utc_strptime(mock_get_localtime, is_at_utc):
+    """Test if the result is the expected date."""
+
+    mock_date = '2026/01/28 03:30:15'
+    mock_tz =  datetime.timezone.utc if is_at_utc else datetime.timezone(datetime.timedelta(hours=-3))
+    mock_get_localtime.return_value = mock_tz
+    date_str_format = "%Y/%m/%d %H:%M:%S"
+
+    date = utils.get_utc_strptime(mock_date, date_str_format, is_at_utc)
+    assert isinstance(date, datetime.datetime)
+
+    if is_at_utc:
+        assert date == datetime.datetime(2026, 1, 28, 3, 30, 15, tzinfo=datetime.timezone.utc)
+    else:
+        assert date == datetime.datetime(2026, 1, 28, 6, 30, 15, tzinfo=datetime.timezone.utc)
+
+@pytest.mark.parametrize(
+    'system_localtime',
+    [
+        pytest.param(sentinel.system_tz, id='system'),
+        pytest.param(None, id='utc_fallback'),
+    ]
+)
+@patch('wazuh.core.utils.gettz')
+def test_get_localtime(mock_gettz, system_localtime):
+    """Test that the system timezone is returned, or UTC when none is found."""
+
+    mock_gettz.return_value = system_localtime
+
+    result = utils.get_localtime()
+
+    mock_gettz.assert_called_once_with()
+    assert result is (system_localtime if system_localtime is not None else datetime.timezone.utc)

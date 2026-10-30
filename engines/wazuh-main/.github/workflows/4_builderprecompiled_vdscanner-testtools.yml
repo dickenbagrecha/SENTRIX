@@ -1,0 +1,28 @@
+name: 4.X - VD Scanner tools Delivery
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/wazuh_modules/vulnerability_scanner/testtool/**"
+      - "src/wazuh_modules/vulnerability_scanner/src/**"
+      - "src/wazuh_modules/vulnerability_scanner/include/**"
+      - ".github/workflows/4_builderprecompiled_vdscanner-testtools.yml"
+      - "src/wazuh_modules/vulnerability_scanner/schemas/**"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+env:
+  TOOLS_DIR: ${{github.workspace}}/src/wazuh_modules/vulnerability_scanner/build/testtool/
+  TOOLS_FILE_NAME: legacy_vdscanner_testtools
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."

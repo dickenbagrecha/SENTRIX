@@ -1,0 +1,91 @@
+name: (sub) Bats / Postgres
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "Functional tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      database:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: "secret"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready -u postgres
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+
+    - name: "Install pg_dump v16"
+      # we can remove this when it's released on ubuntu-latest
+      run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/trusted.gpg.d/pgdg.asc &>/dev/null
+          sudo apt update
+          sudo apt -qq -y -o=Dpkg::Use-Pty=0 install postgresql-client-16
+
+    - name: "Force machineid"
+      run: |
+          sudo chmod +w /etc/machine-id
+          echo githubciXXXXXXXXXXXXXXXXXXXXXXXX | sudo tee /etc/machine-id
+
+    - name: "Check out CrowdSec repository"
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        submodules: true
+        persist-credentials: false
+
+    - name: "Set up Go"
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+
+    - name: "Install bats dependencies"
+      env:
+        GOBIN: /usr/local/bin
+      run: |
+        sudo apt -qq -y -o=Dpkg::Use-Pty=0 install build-essential daemonize jq libre2-dev
+
+    - name: "Build crowdsec and fixture (DB_BACKEND: pgx)"
+      run: |
+        make clean bats-build bats-fixture BUILD_STATIC=1
+      env:
+        # fetch the hub index from a git clone to avoid cdn-hub rate limiting (403)
+        TEST_HUB_CLONE: "true"
+        DB_BACKEND: pgx
+        PGHOST: 127.0.0.1
+        PGPORT: 5432
+        PGPASSWORD: "secret"
+        PGUSER: postgres
+
+    - name: "Run tests (DB_BACKEND: pgx)"
+      run: ./test/run-tests ./test/bats --formatter $(pwd)/test/lib/color-formatter
+      env:
+        DB_BACKEND: pgx
+        PGHOST: 127.0.0.1
+        PGPORT: 5432
+        PGPASSWORD: "secret"
+        PGUSER: postgres
+
+    - name: "Show stack traces"
+      run: for file in $(find /tmp/crowdsec-crash.*.txt); do echo ">>>>> $file"; cat $file; echo; done
+      if: ${{ always() }}
+
+    - name: "Show crowdsec logs"
+      run: for file in $(find ./test/local/var/log -type f); do echo ">>>>> $file"; cat $file; echo; done
+      if: ${{ always() }}
+
+    - name: "Show database logs"
+      run: docker logs "${{ job.services.database.id }}"
+      if: ${{ always() }}

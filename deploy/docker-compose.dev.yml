@@ -1,0 +1,18 @@
+version: '3.8'
+
+# Lightweight development configuration excluding resource-heavy Wazuh Manager
+# Designed for rapid iteration on Windows 11 + WSL2 or local developer machines.
+
+services:
+  sentrix-core:
+    environment:
+      - SENTRIX_LOG_LEVEL=debug
+      - SENTRIX_ENV=development
+
+  sentrix-waf-coraza:
+    environment:
+      - WAF_MODE=DetectionOnly
+
+  sentrix-crowdsec:
+    environment:
+      - CROWDSEC_LOG_LEVEL=debug

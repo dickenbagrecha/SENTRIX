@@ -1,0 +1,2003 @@
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+import errno
+import hashlib
+import json
+import operator
+import os
+import re
+import sys
+import typing
+from copy import deepcopy
+from datetime import datetime, timezone, tzinfo
+from dateutil.tz import gettz
+from functools import wraps
+from itertools import groupby, chain
+from os import chmod, chown, listdir, mkdir, curdir, rename, utime, remove, path
+import psutil
+from shutil import Error, move, copy2
+from signal import signal, alarm, SIGALRM, SIGKILL
+from xml.etree.ElementTree import Element  # nosec B405
+
+from cachetools import cached, TTLCache
+from defusedxml.ElementTree import fromstring
+
+import wazuh.core.results as results
+from wazuh.core import common
+from wazuh.core.exception import WazuhError, WazuhInternalError
+from wazuh.core.wdb import WazuhDBConnection
+
+# Python 2/3 compatibility
+if sys.version_info[0] == 3:
+    unicode = str
+
+# Temporary cache
+t_cache = TTLCache(maxsize=4500, ttl=60)
+
+
+def clean_pid_files(daemon: str) -> None:
+    """Check the existence of '.pid' files for a specified daemon.
+
+    A PID file only proves that some process had that PID at the time the file was
+    written. If the PID has since been recycled by an unrelated process (or by this
+    same daemon's own new instance), killing it blindly can terminate the wrong
+    process. A process is only treated as the stale owner of the file when it was
+    already alive before the file's mtime.
+
+    Parameters
+    ----------
+    daemon : str
+        Daemon's name.
+    """
+    own_pid = os.getpid()
+    regex = rf'{daemon}[\w_]*-(\d+).pid'
+    for pid_file in os.listdir(common.OSSEC_PIDFILE_PATH):
+        if match := re.match(regex, pid_file):
+            pid = int(match.group(1))
+            full_path = path.join(common.OSSEC_PIDFILE_PATH, pid_file)
+            try:
+                process = psutil.Process(pid)
+                command = ' '.join(process.cmdline())
+                belongs_to_daemon = daemon.replace('-', '_') in command
+                predates_file = process.create_time() <= path.getmtime(full_path)
+
+                if pid != own_pid and belongs_to_daemon and predates_file:
+                    try:
+                        os.kill(pid, SIGKILL)
+                        print(f"{daemon}: Orphan child process {pid} was terminated.")
+                    except OSError as kill_error:
+                        print(f"{daemon}: Orphan child process {pid} was identified but could not "
+                              f"be terminated ({kill_error}), removing from {common.WAZUH_PATH}/var/run...")
+                elif pid == own_pid:
+                    print(f"{daemon}: Process {pid} is this process's own PID, recycled from a stale "
+                          f"pidfile, removing from {common.WAZUH_PATH}/var/run...")
+                elif not belongs_to_daemon:
+                    print(f"{daemon}: Process {pid} does not belong to {daemon}, removing from {common.WAZUH_PATH}/var/run...")
+                else:
+                    print(f"{daemon}: Process {pid} belongs to {daemon} but was created after its stale "
+                          f"pidfile (PID recycled), removing from {common.WAZUH_PATH}/var/run...")
+
+            except (OSError, psutil.Error):
+                # psutil.Error also covers AccessDenied (the PID was recycled by a process
+                # owned by another user) and ZombieProcess. Neither means the file's
+                # original owner is still around, so it's still safe to drop it.
+                print(f'{daemon}: Could not identify process {pid}, removing from {common.WAZUH_PATH}/var/run...')
+            finally:
+                try:
+                    os.remove(full_path)
+                except OSError as remove_error:
+                    # The owner's exit handler or the control script may have removed it meanwhile;
+                    # a leftover pidfile is never a reason to abort the startup.
+                    print(f'{daemon}: Could not remove {full_path} ({remove_error}).')
+
+
+def process_array(array: list, search_text: str = None, complementary_search: bool = False,
+                  search_in_fields: list = None, select: list = None, sort_by: list = None,
+                  sort_ascending: bool = True, allowed_sort_fields: list = None, offset: int = 0, limit: int = None,
+                  q: str = '', required_fields: list = None, allowed_select_fields: list = None,
+                  filters: dict = None, distinct: bool = False) -> dict:
+    """Process a Wazuh framework data array.
+
+    Parameters
+    ----------
+    array : list
+        Array to process.
+    search_text : str
+        Text to search and search type.
+    complementary_search : bool
+        Perform a complementary search.
+    search_in_fields : list
+        Fields to search in.
+    select : list
+        Select fields to return.
+    sort_by : list
+        Fields to sort_by. Will sort the array directly if [''] is received.
+    sort_ascending : bool
+        Sort order ascending or descending.
+    allowed_sort_fields : list
+        Allowed fields to sort_by.
+    offset : int
+        First element to return.
+    limit : int
+        Maximum number of elements to return.
+    q : str
+        Query to filter by.
+    required_fields : list
+        Required fields that must appear in the response.
+    allowed_select_fields: list
+        List of fields allowed to select from.
+    filters : dict
+        Defines required field filters. Format: {"field1":"value1", "field2":["value2","value3"]}
+    distinct : bool
+        Look for distinct values.
+
+    Returns
+    -------
+    dict
+        Dictionary: {'items': Processed array, 'totalItems': Number of items, before applying offset and limit)}
+    """
+    if not array:
+        return {'items': [], 'totalItems': 0}
+
+    if isinstance(filters, dict) and len(filters.keys()) > 0:
+        new_array = []
+        for element in array:
+            for key, value in filters.items():
+                if element[key] in value:
+                    new_array.append(element)
+                    break
+
+        array = new_array
+
+    if sort_by == [""]:
+        array = sort_array(array, sort_ascending=sort_ascending)
+    elif sort_by:
+        array = sort_array(array, sort_by=sort_by, sort_ascending=sort_ascending,
+                           allowed_sort_fields=allowed_sort_fields)
+
+    if search_text:
+        array = search_array(array, search_text=search_text, complementary_search=complementary_search,
+                             search_in_fields=search_in_fields)
+
+    if q:
+        array = filter_array_by_query(q, array)
+
+    if select:
+        # Do not force the inclusion of any fields when we are looking for distinct values
+        required_fields = set() if distinct else required_fields
+        array = select_array(array, select=select, required_fields=required_fields,
+                             allowed_select_fields=allowed_select_fields)
+
+    if distinct:
+        distinct_array = []
+        for element in array:
+            if element not in distinct_array:
+                distinct_array.append(element)
+
+        array = distinct_array
+
+    return {'items': cut_array(array, offset=offset, limit=limit), 'totalItems': len(array)}
+
+
+def cut_array(array: list, offset: int = 0, limit: int = common.DATABASE_LIMIT) -> list:
+    """Return a part of the array: from offset to offset + limit.
+
+    Parameters
+    ----------
+    array : list
+        Array to cut.
+    offset : int
+        First element to return.
+    limit : int
+        Maximum number of elements to return. 0 means no cut array.
+
+    Raises
+    ------
+    WazuhError(1400)
+        Invalid offset.
+    WazuhError(1401)
+        Invalid limit.
+    WazuhError(1405)
+        Limit exceeding the maximum permitted.
+    WazuhError(1406)
+        Invalid limit (0).
+
+    Returns
+    -------
+    list
+        Cut array.
+    """
+
+    if limit is not None:
+        if limit > common.MAXIMUM_DATABASE_LIMIT:
+            raise WazuhError(1405, extra_message=str(limit))
+        elif limit == 0:
+            raise WazuhError(1406)
+
+    elif not array or limit is None:
+        return array
+
+    offset = int(offset)
+    limit = int(limit)
+
+    if offset < 0:
+        raise WazuhError(1400)
+    elif limit < 1:
+        raise WazuhError(1401)
+    else:
+        return array[offset:offset + limit]
+
+
+def sort_array(array: list, sort_by: list = None, sort_ascending: bool = True,
+               allowed_sort_fields: list = None) -> list:
+    """Sort an array.
+
+    Parameters
+    ----------
+    array : list
+        Array to sort.
+    sort_by : list
+        Array of fields.
+    sort_ascending : bool
+        Ascending if true and descending if false.
+    allowed_sort_fields : list
+        Check sort_by with allowed_sort_fields (array).
+
+    Raises
+    ------
+    WazuhError(1403)
+        Not a valid sort field.
+    WazuhError(1402)
+        Invalid sort_ascending field.
+
+    Returns
+    -------
+    list
+        Sorted array.
+    """
+
+    def check_sort_fields(allowed_sort_fields, sort_by):
+        # Check if every element in sort['fields'] is in allowed_sort_fields
+        if not sort_by.issubset(allowed_sort_fields):
+            incorrect_fields = ', '.join(sort_by - allowed_sort_fields)
+            raise WazuhError(1403, extra_remediation='Allowed sort fields: {0}. '
+                                                     'Wrong fields: {1}'.format(', '.join(allowed_sort_fields),
+                                                                                incorrect_fields))
+
+    if not array:
+        return array
+
+    if not isinstance(sort_ascending, bool):
+        raise WazuhError(1402)
+
+    is_sort_valid = False
+    if allowed_sort_fields:
+        check_sort_fields(set(allowed_sort_fields), set(sort_by))
+        is_sort_valid = True
+
+    if sort_by:  # array should be a dictionary or a Class
+        if type(array[0]) is dict:
+            not is_sort_valid and check_sort_fields(set(array[0].keys()), set(sort_by))
+            try:
+                return sorted(array,
+                              key=lambda o: tuple(
+                                  o.get(a).lower() if type(o.get(a)) in (str, unicode) else o.get(a) for a in sort_by),
+                              reverse=not sort_ascending)
+            except TypeError:
+                items_with_missing_keys = list()
+                copy_array = deepcopy(array)
+                for item in array:
+                    set(sort_by) & set(item.keys()) and items_with_missing_keys.append(
+                        copy_array.pop(copy_array.index(item)))
+
+                sorted_array = sorted(copy_array, key=lambda o: tuple(
+                    o.get(a).lower() if type(o.get(a)) in (str, unicode) else o.get(a) for a in sort_by),
+                                      reverse=not sort_ascending)
+
+                if not sort_ascending:
+                    items_with_missing_keys.extend(sorted_array)
+                    return items_with_missing_keys
+                else:
+                    sorted_array.extend(items_with_missing_keys)
+                    return sorted_array
+
+        else:
+            return sorted(array,
+                          key=lambda o: tuple(
+                              getattr(o, a).lower() if type(getattr(o, a)) in (str, unicode) else getattr(o, a)
+                              for a in sort_by),
+                          reverse=not sort_ascending)
+    else:
+        if type(array) is set or (type(array[0]) is not dict and 'class \'wazuh' not in str(type(array[0]))):
+            return sorted(array, reverse=not sort_ascending)
+        else:
+            return array
+
+
+def get_values(o: object, fields: list = None) -> list:
+    """Convert the values of an object to an array of strings.
+
+    Parameters
+    ----------
+    o : object
+        Object.
+    fields : list
+        Fields to get values of (only for dictionaries).
+
+    Returns
+    -------
+    list
+        Array of strings.
+    """
+    strings = []
+
+    try:
+        obj = o.to_dict()  # Rule, Decoder, Agent...
+    except:
+        obj = o
+
+    if type(obj) is list:
+        for o in obj:
+            strings.extend(get_values(o))
+    elif type(obj) is dict:
+        for key in obj:
+            if not fields or key in fields:
+                strings.extend(get_values(obj[key]))
+    else:
+        strings.append(obj.lower() if isinstance(obj, str) or isinstance(obj, unicode)
+                       else ('' if obj is None else str(obj).lower()))
+
+    return strings
+
+
+def search_array(array, search_text: str = None, complementary_search: bool = False,
+                 search_in_fields: list = None) -> list:
+    """Look for the string 'text' in the elements of the array.
+
+    Parameters
+    ----------
+    array : list
+        Array.
+    search_text : str
+        Text to search.
+    complementary_search : bool
+        The text must not be in the array.
+    search_in_fields : list
+        Fields of the array to search in.
+
+    Returns
+    -------
+    list
+        Filtered array.
+    """
+
+    found = []
+
+    for item in array:
+
+        values = get_values(o=item, fields=search_in_fields)
+
+        if not complementary_search:
+            for v in values:
+                if search_text.lower() in v:
+                    found.append(item)
+                    break
+        else:
+            not_in_values = True
+            for v in values:
+                if search_text.lower() in v:
+                    not_in_values = False
+                    break
+            if not_in_values:
+                found.append(item)
+
+    return found
+
+
+def select_array(array: list, select: list = None, required_fields: set = None,
+                 allowed_select_fields: list = None) -> list:
+    """Get only those values from each element in the array that matches the select values.
+
+    Parameters
+    ----------
+    array : list
+        Array of elements. It contains all the results without any filter.
+    select : list of str, optional
+        List of select fields. These can be nested fields of n depth levels. Default `None`
+        Example: ['select1', 'select2.select21.select22', 'select3.select31']
+    required_fields : set, optional
+        Set of fields that must be in the response. These depends on the framework function.
+    allowed_select_fields: list
+        List of fields allowed to select from.
+
+    Raises
+    ------
+    WazuhError(1724)
+        Raise this exception when at least one of the select fields is not valid.
+
+    Returns
+    -------
+    result_list : list
+        Filtered array of dicts with only the selected (and required) fields as keys.
+    """
+
+    def get_nested_fields(dikt, select_field):
+        split_select = select_field.split('.')
+        if len(split_select) == 1:
+            try:
+                last_field = {select_field: dikt[select_field]}
+            except (KeyError, TypeError):
+                last_field = None
+            return last_field
+        else:
+            try:
+                next_element = get_nested_fields(dikt[split_select[0]], '.'.join(split_select[1:]))
+            except (KeyError, TypeError):
+                next_element = None
+            return {split_select[0]: next_element} if next_element else None
+
+    def detect_nested_select(user_select):
+        nested = set()
+        no_nested = set()
+        for element in user_select:
+            no_nested.add(element) if '.' not in element else nested.add(element)
+
+        return nested, no_nested
+
+    if required_fields is None:
+        required_fields = set()
+
+    select_nested, select_no_nested = detect_nested_select(set(select))
+    if allowed_select_fields:
+        # A nested field must hang from an allowed field: every select field is looked up in every item, so an
+        # unchecked dotted name would cost one lookup per item without ever being able to return anything.
+        invalid_fields = {field for field in select_no_nested if field not in allowed_select_fields} | \
+                         {field for field in select_nested if field not in allowed_select_fields and
+                          field.split('.', 1)[0] not in allowed_select_fields}
+        if invalid_fields:
+            raise WazuhError(1724, "{}".format(', '.join(sorted(invalid_fields))))
+    select = select_nested.union(select_no_nested)
+
+    result_list = list()
+    for item in array:
+        selected_fields = dict()
+        # Build an entry with the filtered values
+        for sel in select:
+            candidate = get_nested_fields(item, sel)
+            if candidate:
+                selected_fields.update(candidate)
+        # Add required fields if the entry is not empty
+        if array and not allowed_select_fields and not selected_fields:
+            raise WazuhError(1724, "{}".format(', '.join(select)))
+        selected_fields.update({req_field: item[req_field] for req_field in required_fields})
+        result_list.append(selected_fields)
+
+    return result_list
+
+
+def tail(filename: str, n: int = 20) -> list:
+    """Returns last 'n' lines of the file 'filename'.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the file.
+    n : int
+        Number of lines.
+
+    Returns
+    -------
+    list
+        Array of last lines.
+    """
+    with open(filename, 'rb') as f:
+        total_lines_wanted = n
+
+        BLOCK_SIZE = 1024
+        f.seek(0, 2)
+        block_end_byte = f.tell()
+        lines_to_go = total_lines_wanted
+        block_number = -1
+        blocks = []  # blocks of size BLOCK_SIZE, in reverse order starting from the end of the file
+        while lines_to_go > 0 and block_end_byte > 0:
+            if (block_end_byte - BLOCK_SIZE > 0):
+                # read the last block we haven't yet read
+                f.seek(block_number * BLOCK_SIZE, 2)
+                blocks.append(f.read(BLOCK_SIZE).decode('utf-8', errors='replace'))
+            else:
+                # file too small, start from beginning
+                f.seek(0, 0)
+                # only read what was not read
+                blocks.append(f.read(block_end_byte).decode('utf-8', errors='replace'))
+            lines_found = blocks[-1].count('\n')
+            lines_to_go -= lines_found
+            block_end_byte -= BLOCK_SIZE
+            block_number -= 1
+        all_read_text = ''.join(reversed(blocks))
+
+    return all_read_text.splitlines()[-total_lines_wanted:]
+
+
+def chmod_r(file_path: str, mode: int):
+    """Recursive chmod.
+
+    Parameters
+    ----------
+    file_path: str
+        Path to the file.
+    mode: int
+        File mode in octal.
+    """
+
+    if path.isdir(file_path):
+        for item in listdir(file_path):
+            item_path = path.join(file_path, item)
+            if path.isfile(item_path):
+                chmod(item_path, mode)
+            elif path.isdir(item_path):
+                chmod_r(item_path, mode)
+
+    chmod(file_path, mode)
+
+
+def chown_r(file_path: str, uid: int, gid: int):
+    """Recursive chown.
+
+    Parameters
+    ----------
+    file_path: str
+        Path to the file.
+    uid: int
+        User ID.
+    gid: int
+        Group ID.
+    """
+    chown(file_path, uid, gid)
+
+    if path.isdir(file_path):
+        for item in listdir(file_path):
+            item_path = path.join(file_path, item)
+            if path.isfile(item_path):
+                chown(item_path, uid, gid)
+            elif path.isdir(item_path):
+                chown_r(item_path, uid, gid)
+
+
+def safe_move(source: str, target: str, ownership: tuple = None, time: tuple = None, permissions: int = None):
+    """Move a file even between filesystems
+
+    This function is useful to move files even when target directory is in a different filesystem from the source.
+    Write permissions are required on target directory.
+
+    Parameters
+    ----------
+    source : str
+        Full path to source file.
+    target : str
+        Full path to target file.
+    ownership : tuple
+        Tuple in the form (user, group) to be set up after the file is moved.
+    time : tuple
+        Tuple in the form (addition_timestamp, modified_timestamp).
+    permissions : int
+        String mask in octal notation. I.e.: 0o640.
+    """
+    # Create temp file. Move between
+    tmp_path, tmp_filename = path.split(target)
+    tmp_target = path.join(tmp_path, f".{tmp_filename}.tmp")
+    move(source, tmp_target, copy_function=full_copy)
+
+    # Set up metadata
+    if ownership is not None:
+        chown(tmp_target, *ownership)
+    if permissions is not None:
+        chmod(tmp_target, permissions)
+    if time is not None:
+        utime(tmp_target, time)
+
+    try:
+        # Overwrite the file atomically.
+        rename(tmp_target, target)
+    except OSError:
+        # This is the last try when target is still in a different filesystem.
+        # For example, when target is a mounted file in a Docker container
+        # However, this is not an atomic operation and could lead to race conditions
+        # if the file is read/written simultaneously with other processes
+        move(tmp_target, target, copy_function=full_copy)
+
+
+def mkdir_with_mode(name: str, mode: int = 0o770):
+    """Create a directory with specified permissions.
+
+    Parameters
+    ----------
+    name : str
+        Directory path.
+    mode : int
+        Permissions to set to the directory.
+    """
+    head, tail = path.split(name)
+    if not tail:
+        head, tail = path.split(head)
+    if head and tail and not path.exists(head):
+        try:
+            mkdir_with_mode(head, mode)
+        except OSError as e:
+            # be happy if someone already created the path
+            if e.errno != errno.EEXIST:
+                raise
+        if tail == curdir:  # xxx/newdir/. exists if xxx/newdir exists
+            return
+    try:
+        mkdir(name, mode)
+    except OSError as e:
+        # be happy if someone already created the path
+        if e.errno != errno.EEXIST:
+            raise
+
+    chmod(name, mode)
+
+
+def md5(fname):
+    hash_md5 = hashlib.md5()
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def blake2b(fname):
+    hash_blake2b = hashlib.blake2b()
+    with open(fname, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_blake2b.update(chunk)
+    return hash_blake2b.hexdigest()
+
+
+def _get_hashing_algorithm(hash_algorithm):
+    # check hash algorithm
+    algorithm_list = hashlib.algorithms_available
+    if hash_algorithm not in algorithm_list:
+        raise WazuhError(1723, "Available algorithms are {0}.".format(', '.join(algorithm_list)))
+
+    return hashlib.new(hash_algorithm)
+
+
+def get_hash(filename, hash_algorithm='md5', return_hex=True):
+    hashing = _get_hashing_algorithm(hash_algorithm)
+
+    try:
+        with open(filename, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                hashing.update(chunk)
+    except (IOError, OSError):
+        return None
+
+    return hashing.hexdigest() if return_hex else hashing.digest()
+
+
+def get_fields_to_nest(fields, force_fields=[], split_character="_"):
+    nest = {k: set(filter(lambda x: x != k, chain.from_iterable(g)))
+            for k, g in groupby(map(lambda x: x.split(split_character), sorted(fields)),
+                                key=lambda x: x[0])}
+    nested = filter(lambda x: len(x[1]) > 1 or x[0] in force_fields, nest.items())
+    nested = [(field, {(subfield, split_character.join([field, subfield])) for subfield in subfields}) for
+              field, subfields in nested]
+    non_nested = set(filter(lambda x: x.split(split_character)[0] not in map(operator.itemgetter(0), nested), fields))
+    return nested, non_nested
+
+
+def plain_dict_to_nested_dict(data, nested=None, non_nested=None, force_fields=[], split_character='_'):
+    """
+    Turns an input dictionary with "nested" fields in form
+                field_subfield
+    into a real nested dictionary in form
+                field {subfield}
+    For example, the following input dictionary
+    data = {
+       "ram_free": "1669524",
+       "board_serial": "BSS-0123456789",
+       "cpu_name": "Intel(R) Core(TM) i7-4700MQ CPU @ 2.40GHz",
+       "cpu_cores": "4",
+       "ram_total": "2045956",
+       "cpu_mhz": "2394.464"
+    }
+    will output this way:
+    data = {
+      "ram": {
+         "total": "2045956",
+         "free": "1669524"
+      },
+      "cpu": {
+         "cores": "4",
+         "mhz": "2394.464",
+         "name": "Intel(R) Core(TM) i7-4700MQ CPU @ 2.40GHz"
+      },
+      "board_serial": "BSS-0123456789"
+    }
+    :param data: dictionary to nest
+    :param nested: fields to nest
+    :param force_fields: fields to force nesting in
+    """
+    # separate fields and subfields:
+    # nested = {'board': ['serial'], 'cpu': ['cores', 'mhz', 'name'], 'ram': ['free', 'total']}
+    nested = {k: list(filter(lambda x: x != k, chain.from_iterable(g)))
+              for k, g in groupby(map(lambda x: x.split(split_character), sorted(data.keys())),
+                                  key=lambda x: x[0])}
+
+    # create a nested dictionary with those fields that have subfields
+    # (board_serial won't be added because it only has one subfield)
+    #  nested_dict = {
+    #       'cpu': {
+    #           'cores': '4',
+    #           'mhz': '2394.464',
+    #           'name': 'Intel(R) Core(TM) i7-4700MQ CPU @ 2.40GHz'
+    #       },
+    #       'ram': {
+    #           'free': '1669524',
+    #           'total': '2045956'
+    #       }
+    #    }
+    nested_dict = {f: {sf: data['{0}{2}{1}'.format(f, sf, split_character)] for sf in sfl} for f, sfl
+                   in nested.items() if len(sfl) > 1 or f in force_fields}
+
+    # create a dictionary with the non nested fields
+    # non_nested_dict = {'board_serial': 'BSS-0123456789'}
+    non_nested_dict = {f: data[f] for f in data.keys() if f.split(split_character)[0]
+                       not in nested_dict.keys()}
+
+    # append both dictionaries
+    nested_dict.update(non_nested_dict)
+
+    return nested_dict
+
+
+def load_wazuh_xml(xml_path, data=None):
+    if not data:
+        with open(xml_path) as f:
+            try:
+                data = f.read()
+            except Exception as e:
+                raise WazuhError(1113, extra_message=str(e))
+
+    # -- characters are not allowed in XML comments. Rewrite each comment in place in a single pass:
+    # replacing every comment body over the whole document is quadratic in the number of comments,
+    # and also rewrites any text outside a comment that happens to match a comment body.
+    data = re.sub(r"<!--(.*?)-->", lambda comment: f"<!--{comment.group(1).replace('--', '..')}-->", data,
+                  flags=re.DOTALL)
+
+    # Replace &lt; and &gt; currently present in the config
+    data = data.replace('&lt;', '_custom_amp_lt_').replace('&gt;', '_custom_amp_gt_')
+
+    custom_entities = {
+        'backslash': '\\'
+    }
+
+    # replace every custom entity
+    for character, replacement in custom_entities.items():
+        data = re.sub(replacement.replace('\\', '\\\\'), f'&{character};', data)
+
+    # < characters should be escaped as &lt; unless < is starting a <tag> or a comment. A <tag> is a name
+    # followed by at least one character and a > later on the same line. Each line's last > is located
+    # once: a lookahead scanning to the end of the line for every < is quadratic in the line length.
+    lt_candidate = re.compile(r"<(?!!--)(/?\w)?")
+
+    def escape_lt(line):
+        last_gt = line.rfind('>')
+        return lt_candidate.sub(
+            lambda lt: lt.group(0) if lt.group(1) and last_gt > lt.end() else f"&lt;{lt.group(1) or ''}", line)
+
+    data = '\n'.join(escape_lt(line) for line in data.split('\n'))
+
+    # replace \< by &lt, only outside xml tags;
+    data = re.sub(r'^&backslash;<(.*[^>])$', r'&backslash;&lt;\g<1>', data)
+
+    # replace \> by &gt;
+    data = re.sub(r'&backslash;>', '&backslash;&gt;', data)
+
+    # default entities
+    default_entities = ['amp', 'lt', 'gt', 'apos', 'quot']
+
+    # & characters should be escaped if they don't represent an &entity;
+    data = re.sub(f"&(?!({'|'.join(default_entities + list(custom_entities))});)", "&amp;", data)
+
+    entities = '<!DOCTYPE xmlfile [\n' + \
+               '\n'.join([f'<!ENTITY {name} "{value}">' for name, value in custom_entities.items()]) + \
+               '\n]>\n'
+
+    return fromstring(f"{entities}<root_tag>{data}</root_tag>", forbid_entities=False)
+
+
+class WazuhVersion:
+
+    def __init__(self, version, treat_as_empty: list = None, no_version_string: str = 'N/A'):
+
+        pattern = r"(?:Wazuh )?v?(\d+)\.(\d+)\.(\d+)\-?(alpha|beta|rc)?(\d*)"
+
+        self.__empty_string = no_version_string
+
+        treat_as_empty = treat_as_empty or []
+
+        if version in treat_as_empty:
+            self.__mayor = 0
+            self.__minor = 0
+            self.__patch = 0
+            self.__dev = None
+            self.__dev_ver = None
+            return
+
+        m = re.match(pattern, version)
+
+        if m:
+            self.__mayor = int(m.group(1))
+            self.__minor = int(m.group(2))
+            self.__patch = int(m.group(3))
+            self.__dev = m.group(4)
+            self.__dev_ver = m.group(5)
+        else:
+            raise ValueError("Invalid version format.")
+
+    def __to_string(self):
+        if self.__mayor == 0 and self.__minor == 0 and self.__patch == 0:
+            return self.__empty_string
+        ver_string = "v{0}.{1}.{2}".format(self.__mayor, self.__minor, self.__patch)
+        if self.__dev:
+            ver_string = "{0}-{1}{2}".format(ver_string, self.__dev, self.__dev_ver)
+        return ver_string
+
+    def __str__(self):
+        return self.__to_string()
+
+    def __eq__(self, new_version):
+        return (self.__to_string() == new_version.__to_string())
+
+    def __ne__(self, new_version):
+        return (self.__to_string() != new_version.__to_string())
+
+    def __ge__(self, new_version):
+        if self.__mayor < new_version.__mayor:
+            return False
+        elif self.__mayor == new_version.__mayor:
+            if self.__minor < new_version.__minor:
+                return False
+            elif self.__minor == new_version.__minor:
+                if self.__patch < new_version.__patch:
+                    return False
+                elif self.__patch == new_version.__patch:
+                    if (self.__dev) and not (new_version.__dev):
+                        return False
+                    elif (self.__dev) and (new_version.__dev):
+                        if ord(self.__dev[0]) < ord(new_version.__dev[0]):
+                            return False
+                        elif ord(self.__dev[0]) == ord(new_version.__dev[0]) and self.__dev_ver < new_version.__dev_ver:
+                            return False
+
+        return True
+
+    def __lt__(self, new_version):
+        return not (self >= new_version)
+
+    def __gt__(self, new_version):
+        return (self >= new_version and self != new_version)
+
+    def __le__(self, new_version):
+        return (not (self > new_version) or self == new_version)
+
+
+def get_timeframe_in_seconds(timeframe: str) -> int:
+    """Get number of seconds from a timeframe.
+
+    Parameters
+    ----------
+    timeframe : str
+        Time in seconds | "[n_days]d" | "[n_hours]h" | "[n_minutes]m" | "[n_seconds]s".
+
+    Raises
+    ------
+    WazuhError(1411)
+        The timeframe value is not valid.
+
+    Returns
+    -------
+    int
+        Time in seconds.
+    """
+    if not timeframe.isdigit():
+        if not re.fullmatch(r'(\d+[dhms])+', timeframe):
+            raise WazuhError(1411, timeframe)
+
+        seconds = 0
+        time_equivalence_seconds = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+        for time, unit in re.findall(r'(\d+)([dhms])', timeframe):
+            seconds += int(time) * time_equivalence_seconds[unit]
+    else:
+        seconds = int(timeframe)
+
+    return seconds
+
+
+def filter_array_by_query(q: str, input_array: typing.List) -> typing.List:
+    """Filter a list of dictionaries by 'q' parameter, like as a SQL query.
+
+    Parameters
+    ----------
+    input_array : list
+        List to be filtered.
+    q : str
+        query for filtering a list.
+
+    Returns
+    -------
+    list
+        List with processed query.
+    """
+
+    def check_date_format(element: str) -> typing.Union[str, datetime]:
+        """Check if a given field is a date. If so, transform the date to the standard API format (ISO 8601).
+        If not, return the field.
+
+        Parameters
+        ----------
+        element : str
+            Item to check.
+
+        Returns
+        -------
+        str or datetime
+            In case of a date, return the element after its conversion. Otherwise it return the element.
+        """
+        date_patterns = ['%Y-%m-%d', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S.%fZ']
+        # The same timestamps carrying a numeric UTC offset (`+00:00`, `-0300`), as response bodies render
+        # them: parsed as aware datetimes and converted to UTC, never relabelled.
+        offset_date_patterns = ['%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%S.%f%z', '%Y-%m-%d %H:%M:%S%z',
+                                '%Y-%m-%d %H:%M:%S.%f%z']
+
+        for pattern in date_patterns:
+            try:
+                return get_utc_strptime(element, pattern)
+            except (ValueError, TypeError):
+                pass
+
+        for pattern in offset_date_patterns:
+            try:
+                return datetime.strptime(element, pattern).astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                pass
+
+        return element
+
+    # Every clause is checked against every element, so the same literal and the same field value are
+    # converted many times. The type is part of the key: 1, 1.0 and True are equal keys to a dict.
+    converted_dates = {}
+
+    def to_date(element: typing.Any) -> typing.Any:
+        """Memoized check_date_format. Unhashable values are converted every time.
+
+        Parameters
+        ----------
+        element : any
+            Item to check.
+
+        Returns
+        -------
+        any
+            Result of check_date_format for the element.
+        """
+        key = (type(element), element)
+        try:
+            return converted_dates[key]
+        except KeyError:
+            converted_dates[key] = check_date_format(element)
+            return converted_dates[key]
+        except TypeError:
+            return check_date_format(element)
+
+    def check_clause(value1: typing.Union[str, int], op: str, value2: str) -> bool:
+        """Check an operation between value1 and value2. 'value1' could be an integer, it is necessary cast value2 to
+        integer if this happens
+
+        Parameters
+        ----------
+        value1 : str or int
+            First value of the operation.
+        op : str
+            Operation to be done.
+        value2 : str
+            Second value of the operation.
+
+        Returns
+        -------
+        bool
+            True if operation is satisfied, False otherwise.
+        """
+        operators = {'=': operator.eq,
+                     '!=': operator.ne,
+                     '<': operator.lt,
+                     '>': operator.gt}
+        value1 = [value1] if not isinstance(value1, list) else value1
+        for val in value1:
+            if op == '~':
+                # value1 should be str if operator is '~'. None never matches a substring search,
+                # and a dict/list keeps its own '~' semantics (key/element membership) -- only the
+                # scalar types that would otherwise raise inside `in` (bool, int, float, datetime)
+                # need casting to str.
+                if val is None:
+                    continue
+                if isinstance(val, (bool, int, float, datetime)):
+                    val = str(val)
+                if value2 in val:
+                    return True
+            else:
+                if val is None and op in ('<', '>'):
+                    # a present-but-null field can never satisfy an ordering comparison; skip it
+                    # instead of letting operator.lt/gt raise and failing the whole query for every
+                    # other, well-typed record. `=`/`!=` don't need this -- None == x / None != x
+                    # never raise, they just correctly evaluate to False/True.
+                    continue
+                # cast value2 to integer if value1 is integer
+                value2 = to_date(value2)
+                if type(value2) == datetime:
+                    val = to_date(val)
+                value2 = int(value2) if type(val) == int else value2
+                if type(val) == bool and isinstance(value2, str):
+                    if value2.lower() not in ('true', 'false', '1', '0'):
+                        raise ValueError(f"'{value2}' is not a boolean")
+                    value2 = value2.lower() in ('true', '1')
+                if operators[op](val, value2):
+                    return True
+
+        return False
+
+    def get_match_candidates(iterable: typing.Union[dict, list], key_list: list, candidates: list) -> bool:
+        """Get the match candidates following a list of keys.
+
+        Parameters
+        ----------
+        iterable : dict or list
+            Iterable object to be iterated over.
+        key_list : list
+            List of keys.
+        candidates : list
+            Empty list that will be filled
+
+        Raises
+        ------
+        WazuhError(1407)
+            Parameter q is not valid.
+
+        Returns
+        -------
+        bool
+            True if there is one match at least. False otherwise.
+        """
+        for index, key in enumerate(key_list):
+            if isinstance(iterable, list):
+                candidate_list = list()
+                for element in list(iterable):
+                    candidate_list.append(get_match_candidates(element, key_list[index:], candidates))
+                if True in candidate_list:
+                    return True
+                else:
+                    return False
+            else:
+                if key in iterable:
+                    iterable = iterable[key]
+                else:
+                    return False
+        else:
+            candidates.append(iterable)
+            return True
+
+    # compile regular expression only one time when function is called
+    # get elements in a clause
+    operators = ['=', '!=', '<', '>', '~']
+    re_get_elements = re.compile(
+        r"\(?" +
+        # Field name: name of the field to look on DB.
+        r"([\w]+)" +
+        # New capturing group for text after the first dot.
+        r"\.?([\w.]*)?" +
+        # Operator: looks for '=', '!=', '<', '>' or '~'.
+        rf"([{''.join(operators)}]{{1,2}})" +
+        # Value: A string. `+` is accepted for the UTC offset of a timestamp literal.
+        r"((?:(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}+]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}+]*)\))*"
+        r"(?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}+]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}+]+)"
+        r"(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}+]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}+]*)\))*)+)" +
+        r"\)?"
+    )
+
+    def parse_clause(and_clause: str) -> tuple:
+        """Split an AND clause into its field, subfields, operator and value.
+
+        Parameters
+        ----------
+        and_clause : str
+            Clause to parse.
+
+        Raises
+        ------
+        WazuhError(1407)
+            Parameter q is not valid.
+
+        Returns
+        -------
+        tuple
+            The clause itself, field name, nested field names, operator and value.
+        """
+        try:
+            field_name, field_subnames, op, value = re_get_elements.match(and_clause).groups()
+        except AttributeError:
+            raise WazuhError(1407, extra_message=f"Parameter 'q' is not valid: '{and_clause}'")
+
+        # The regex matches any two of the operator characters, so `>=`, `<=` or `==` parse
+        # as an operator that check_clause has no entry for. That is a malformed query, not
+        # a record that fails to match, so it is reported whatever the collection holds.
+        if op not in operators:
+            raise WazuhError(1407, extra_message=f"Parameter 'q' is not valid: '{and_clause}'")
+
+        return and_clause, field_name, field_subnames, op, value
+
+    # get a list with OR clauses, each one a list of parsed AND clauses. The query is parsed once, before
+    # the array is walked, so its cost does not grow with the number of elements and a malformed clause
+    # is reported whatever the collection holds.
+    or_clauses = [[parse_clause(and_clause) for and_clause in or_clause.split(';')] for or_clause in q.split(',')]
+    output_array = []
+    # A literal the field's type cannot address is a property of the record, not of the query: the
+    # same clause evaluates fine against a differently-typed record. So a mismatch only excludes its
+    # own record, and a clause is reported invalid once, after the whole array, and only if no
+    # record could evaluate that clause. Tracked per clause: one malformed clause must not be
+    # excused by a different, well-formed one.
+    mismatched_clauses = set()
+    evaluated_clauses = set()
+    # process elements of input_array
+    for elem in input_array:
+        # if an element matches an OR clause, it will be added to output
+        for and_clauses in or_clauses:
+            # all AND clauses should match for adding an element to output
+            match = True  # flag for checking clauses
+            for and_clause, field_name, field_subnames, op, value in and_clauses:
+                # check if a clause is satisfied
+                match_candidates = list()
+                # get_match_candidates/deepcopy run outside the try below: a failure here is a bug
+                # in candidate lookup itself, not a type-mismatched query literal, so it must not be
+                # relabeled as a WazuhError(1407) client error.
+                has_nested_match = field_subnames and field_name in elem and \
+                    get_match_candidates(deepcopy(elem[field_name]), field_subnames.split('.'), match_candidates)
+                try:
+                    if has_nested_match:
+                        matched = False
+                        for candidate in match_candidates:
+                            if candidate is None:
+                                continue
+                            try:
+                                candidate_matches = check_clause(candidate, op, value)
+                            except (TypeError, ValueError):
+                                mismatched_clauses.add(and_clause)
+                                continue
+                            evaluated_clauses.add(and_clause)
+                            if candidate_matches:
+                                matched = True
+                                break
+                        if matched:
+                            continue
+                    elif field_name in elem:
+                        elem_matches = check_clause(elem[field_name], op, value)
+                        evaluated_clauses.add(and_clause)
+                        if elem_matches:
+                            continue
+                except (TypeError, ValueError):
+                    mismatched_clauses.add(and_clause)
+                match = False
+                break
+
+            # if match = True, add element to output and break the loop
+            if match:
+                output_array.append(elem)
+                break
+
+    for clause in mismatched_clauses - evaluated_clauses:
+        raise WazuhError(1407, extra_message=f"Parameter 'q' is not valid: '{clause}'")
+
+    return output_array
+
+
+class AbstractDatabaseBackend:
+    """
+    This class describes an abstract database backend that executes database queries.
+    """
+
+    def __init__(self):
+        self.conn = self.connect_to_db()
+
+    def connect_to_db(self):
+        raise NotImplementedError
+
+    def execute(self, query, request, count=False):
+        raise NotImplementedError
+
+
+class WazuhDBBackend(AbstractDatabaseBackend):
+    """
+    This class describes a wazuh db backend that executes database queries.
+    """
+
+    def __init__(self, agent_id=None, query_format='agent', request_slice=500):
+        if query_format == 'agent' and not path.exists(path.join(common.WDB_PATH, f"{agent_id}.db")):
+            raise WazuhError(2007, extra_message=f"There is no database for agent {agent_id}. "
+                                                 "Please check if the agent has connected to the manager")
+
+        self.agent_id = agent_id
+        self.query_format = query_format
+        self.request_slice = request_slice
+
+        super().__init__()
+
+    def connect_to_db(self):
+        return WazuhDBConnection(request_slice=self.request_slice)
+
+    def close_connection(self):
+        self.conn.close()
+
+    def _substitute_params(self, query, request):
+        """Substitute request parameters in query.
+
+        This is only necessary when the backend is wdb. Sqlite substitutes parameters by itself.
+
+        All placeholders are replaced in a single pass, so a value that happens to match another
+        parameter's placeholder name is not substituted a second time, and single quotes inside string
+        values are doubled so each value renders as a well-formed SQL string literal.
+        """
+        def quote(element):
+            return "'" + str(element).replace("'", "''") + "'"
+
+        rendered = {}
+        for k, v in request.items():
+            if isinstance(v, list):
+                rendered[str(k)] = ','.join(str(e) if isinstance(e, (int, float)) else quote(e) for e in v)
+            elif isinstance(v, (int, float)):
+                rendered[str(k)] = f"{v}"
+            elif isinstance(v, str):
+                rendered[str(k)] = quote(v)
+            else:
+                raise TypeError(f'Invalid type for request parameters: {type(v)}')
+
+        if not rendered:
+            return query
+
+        # Match longest keys first so a key that is a prefix of another (e.g. :search vs :search_id) is not
+        # matched partially. The callback replacement is used verbatim, so backslashes need no escaping.
+        pattern = re.compile(r':\b(' + '|'.join(re.escape(k) for k in sorted(rendered, key=len, reverse=True)) + r')\b')
+        return pattern.sub(lambda m: rendered[m.group(1)], query)
+
+    def _render_query(self, query):
+        """Render query attending the format."""
+        if self.query_format == 'mitre':
+            return f'mitre sql {query}'
+        elif self.query_format == 'task':
+            return f'task sql {query}'
+        elif self.query_format == 'global':
+            return f'global sql {query}'
+        else:
+            return f'agent {self.agent_id} sql {query}'
+
+    def execute(self, query, request, count=False):
+        """Execute SQL query through WazuhDB socket."""
+        query = self._substitute_params(query, request)
+        return self.conn.execute(query=self._render_query(query), count=count)
+
+
+QUERY_OPERATORS = {"=": "=", "!=": "!=", "<": "<", ">": ">", "~": 'LIKE'}
+QUERY_SEPARATORS = {',': 'OR', ';': 'AND', '': ''}
+# To correctly turn a query into SQL, a regex is used. This regex will extract all necessary information:
+# For example, the following regex -> (name!=wazuh;id>5),group=webserver <- would return 3 different matches:
+#   (name != wazuh ;
+#    id   > 5      ),
+#    group=webserver
+QUERY_REGEX = re.compile(
+    # One or more ( characters.
+    r"(\(+)?" +
+    # Field name: name of the field to look on DB.
+    r"([\w.]+)" +
+    # Operator: looks for '=', '!=', '<', '>' or '~'.
+    rf"([{''.join(QUERY_OPERATORS.keys())}]{{1,2}})" +
+    # Value: A string.
+    r"((?:(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}$]*)\))*"
+    r"(?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}$]+)"
+    r"(?:\((?:\[[\[\]\w _\-.,:?\\/'\"=@%<>{}]*]|[\[\]\w _\-.:?\\/'\"=@%<>{}$]*)\))*)+)"
+    # One or more ) characters.
+    r"(\)+)?" +
+    # Separator: looks for ';', ',' or nothing.
+    rf"([{''.join(QUERY_SEPARATORS.keys())}])?"
+)
+
+
+def validate_query(q: str):
+    """Check that a q query is a sequence of terms joined by separators, and that every group in it is closed,
+    and closed after it was opened.
+
+    QUERY_REGEX describes a single term, and findall skips whatever it cannot match. A fragment that is not a term
+    (e.g. ` 2023` in `name~Linux, 2023`) would be dropped silently, leaving the previous term's separator dangling
+    in the SQL, so the terms must cover the whole query, each one but the last ending in a separator.
+
+    WazuhDBQuery renders the q terms as one parenthesised group ANDed with the RBAC and legacy filters, and callers
+    wrap the user's q the same way (e.g. `group=X;(q)`). A ')' closing a group the query never opened would close
+    that enclosing group instead, letting an OR in q escape the conditions ANDed with it. Callers that wrap a q must
+    validate it before wrapping it, since the wrapped query can be balanced when the user's part is not.
+
+    Parameters
+    ----------
+    q : str
+        Query to check.
+
+    Raises
+    ------
+    WazuhError(1407)
+        If the query is not a sequence of terms or its parentheses are not balanced.
+    """
+    level = 0
+    end = 0
+    separator = ''
+    for term in QUERY_REGEX.finditer(q):
+        if term.start() != end or (end and not separator):
+            raise WazuhError(1407, q)
+        open_level, _, _, _, close_level, separator = term.groups(default='')
+        end = term.end()
+        level += len(open_level) - len(close_level)
+        if level < 0:
+            raise WazuhError(1407, q)
+
+    if end != len(q) or separator or level != 0:
+        raise WazuhError(1407, q)
+
+
+class WazuhDBQuery(object):
+    """This class describes a database query for wazuh."""
+
+    # Field holding the RBAC resource, used by oversized_run. None means the query does not support that path.
+    oversized_rbac_field = None
+    # Whether the RBAC resources are agent IDs, compared zero-padded to three digits.
+    oversized_rbac_zfill = False
+
+    def __init__(self, offset: int, limit: int, table: str, sort: dict, search: dict, select: list, query: str,
+                 fields: dict, default_sort_field: str, count: bool, get_data: bool, backend: str,
+                 default_sort_order: str = 'ASC', filters: dict = {}, min_select_fields: set = set(),
+                 date_fields: set = set(), extra_fields=set(), distinct: bool = False, rbac_negate: bool = True):
+        """Wazuh DB Query constructor.
+
+        Parameters
+        ----------
+        offset : int
+            First item to return.
+        limit : int
+            Maximum number of items to return.
+        table : str
+            Table to do the query.
+        sort : dict
+            Sorts the items. Format: {"fields":["field1","field2"],"order":"asc|desc"}.
+        select : list
+            Select fields to return. Format: ["field1","field2"].
+        filters : dict
+            Defines field filters required by the user. Format: {"field1":"value1", "field2":["value2","value3"]}
+        query : str
+            Query to filter in database. Format: field operator value.
+        fields : dict
+            All available fields.
+        search : dict
+            Looks for items with the specified string. Format: {"fields": ["field1","field2"]}
+        default_sort_field : str
+            By default, return elements sorted by this field.
+        default_sort_order : str
+            By default, return elements sorted in this order
+        min_select_fields : set
+            Fields that must be always be selected because they're necessary to compute other fields.
+        date_fields : set
+            Database fields that represent a date.
+        extra_fields : set
+            Extra fields.
+        count : bool
+            Whether to compute totalItems or not.
+        get_data : bool
+            Whether to return data or not.
+        distinct : bool
+            Look for distinct values.
+        rbac_negate : bool
+            Whether to use IN or NOT IN on RBAC resources.
+        backend : str
+            Database engine to use. Possible options are 'wdb' and 'sqlite3'.
+        """
+        self.offset = offset
+        self.limit = limit
+        self.table = table
+        self.sort = sort
+        self.search = search
+        self.select = None if not select else select.copy()
+        self.fields = fields.copy()
+        self.distinct = distinct
+        self.query = self._default_query()
+        self.request = {}
+        self.default_sort_field = default_sort_field
+        self.default_sort_order = default_sort_order
+        self.query_filters = []
+        self._q_filters_start = 0
+        self.count = count
+        self.data = get_data
+        self.total_items = 0
+        # Do not include any fields when we are looking for distinct values
+        self.min_select_fields = set() if distinct else min_select_fields
+        self.query_operators = QUERY_OPERATORS
+        self.query_separators = QUERY_SEPARATORS
+        self.special_characters = "\'\""
+        self.wildcard_equal_fields = set()
+        self.query_regex = QUERY_REGEX
+        self.date_fields = date_fields
+        self.extra_fields = extra_fields
+        self.q = query
+        self.legacy_filters = filters.copy() if filters else filters
+        self.inverse_fields = {v: k for k, v in self.fields.items()}
+        self.backend = backend
+        self.rbac_negate = rbac_negate
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        isinstance(self.backend, WazuhDBBackend) and self.backend.close_connection()
+
+    def _clean_filter(self, query_filter):
+        if isinstance(query_filter['value'], str):
+            try:
+                query_filter['value'] = json.dumps(json.loads(query_filter['value']), separators=(',', ':'))
+            except ValueError:
+                pass
+
+        # Replace special characters with wildcards
+        for sp_char in self.special_characters:
+            if isinstance(query_filter['value'], str) and sp_char in query_filter['value']:
+                if query_filter['operator'] != 'LIKE':
+                    # If original operator was not LIKE, do not append % at the beginning and end of the string
+                    self.wildcard_equal_fields.add(query_filter['field'])
+
+                query_filter['value'] = query_filter['value'].replace(sp_char, '_')
+                query_filter['operator'] = 'LIKE'
+
+    def _add_limit_to_query(self):
+        if self.limit:
+            if self.limit > common.MAXIMUM_DATABASE_LIMIT:
+                raise WazuhError(1405, extra_message=str(self.limit))
+            self.query += ' LIMIT :limit OFFSET :offset'
+            self.request['offset'] = self.offset
+            self.request['limit'] = self.limit
+        elif self.limit == 0:  # 0 is not a valid limit
+            raise WazuhError(1406)
+
+    def _sort_query(self, field):
+        return '{} {}'.format(self.fields[field], self.sort['order'])
+
+    def _add_sort_to_query(self):
+        if self.sort:
+            if self.sort['fields']:
+                sort_fields, allowed_sort_fields = self.sort['fields'], set(self.fields.keys()) - self.extra_fields
+                # Check every element in sort['fields'] is in allowed_sort_fields
+                if not set(sort_fields).issubset(allowed_sort_fields):
+                    raise WazuhError(1403, "Allowed sort fields: {}. Fields: {}".format(
+                        ', '.join(sorted(allowed_sort_fields)),
+                        ', '.join(set(sort_fields) - allowed_sort_fields)
+                    ))
+                self.query += ' ORDER BY ' + ','.join([self._sort_query(i) for i in sort_fields])
+            else:
+                self.query += ' ORDER BY {0} {1}'.format(self.default_sort_field, self.sort['order'])
+        else:
+            self.query += ' ORDER BY {0} {1}'.format(self.default_sort_field, self.default_sort_order)
+
+    def _add_search_to_query(self):
+        if self.search:
+            self.query += " AND NOT" if bool(self.search['negation']) else ' AND'
+            self.query += " (" + " OR ".join(
+                f'({x.split(" as ")[0]} LIKE :search AND {x.split(" as ")[0]} IS NOT NULL)'
+                for k, x in self.fields.items() if k not in self.extra_fields) + ')'
+            self.query = self.query.replace('WHERE  AND', 'WHERE')
+            self.request['search'] = "%{0}%".format(re.sub(f"[{self.special_characters}]", '_', self.search['value']))
+
+    def _parse_select_filter(self, select_fields):
+
+        if select_fields:
+            select_fields_set = set(select_fields)
+            allowed_select_fields = set(self.fields.keys()) - self.extra_fields
+
+            # if select is empty, it will be a subset of any set
+            if not select_fields_set or not select_fields_set.issubset(allowed_select_fields):
+                raise WazuhError(1724, "Allowed select fields: {0}. Fields: {1}". \
+                                 format(', '.join(sorted(allowed_select_fields)),
+                                        ', '.join(select_fields_set - allowed_select_fields)))
+
+            select_fields = select_fields_set
+        else:
+            select_fields = self.fields.keys()
+
+        return select_fields
+
+    def _add_select_to_query(self):
+        self.select = self._parse_select_filter(self.select)
+
+    def _parse_query(self):
+        """A query has the following pattern: field operator value separator field operator value...
+
+        An example of query: status=never_connected;name!=pepe
+            * Field must be a database field (it must be contained in self.fields variable)
+            * operator must be one of = != < >
+            * value can be anything
+            * Separator can be either ; for 'and' or , for 'or'.
+        """
+        validate_query(self.q)
+
+        level = 0
+        allowed_query_fields = set(self.fields.keys()) - self.extra_fields
+        for open_level, field, operator, value, close_level, separator in self.query_regex.findall(self.q):
+            if field not in allowed_query_fields:
+                raise WazuhError(1408, "Available fields: {}. Field: {}".format(
+                    ', '.join(sorted(allowed_query_fields)), field)
+                )
+            if operator not in self.query_operators:
+                raise WazuhError(1409,
+                                 "Valid operators: {}. Used operator: {}".format(', '.join(self.query_operators),
+                                                                                 operator))
+
+            if open_level:
+                level += len(open_level)
+            if close_level:
+                level -= len(close_level)
+
+            if not self._pass_filter(field, value):
+                op_index = len(list(filter(lambda x: field in x['field'], self.query_filters)))
+                self.query_filters.append({'value': None if value == "null" else value,
+                                           'operator': self.query_operators[operator],
+                                           'field': '{}${}'.format(field, op_index),
+                                           'separator': self.query_separators[separator], 'level': level})
+
+    def _parse_legacy_filters(self):
+        """Parse legacy filters."""
+        # some legacy filters can contain multiple values to filter separated by commas. That must split in a list.
+        self.legacy_filters.get('older_than', None) == '0s' and self.legacy_filters.pop('older_than')
+        legacy_filters_as_list = {
+            name: value if isinstance(value, list) else [value] for name, value in self.legacy_filters.items()
+        }
+        # each filter is represented using a dictionary containing the following fields:
+        #   * Value     -> Value to filter by
+        #   * Field     -> Field to filter by. Since there can be multiple filters over the same field, a numeric ID
+        #                  must be added to the field name.
+        #   * Operator  -> Operator to use in the database query. In legacy filters the only available one is =.
+        #   * Separator -> Logical operator used to join queries. In legacy filters, the AND operator is used when
+        #                  different fields are filtered and the OR operator is used when filtering by the same field
+        #                  multiple times.
+        #   * Level     -> The level defines the number of parenthesis the query has. In legacy filters, no
+        #                  parenthesis are used except when filtering over the same field.
+        self.query_filters += [{'value': None if subvalue == "null" else subvalue,
+                                'field': '{}${}'.format(name, i),
+                                'operator': '=',
+                                'separator': 'AND' if len(value) <= 1 or len(value) == i + 1 else 'OR',
+                                'level': 0 if i == len(value) - 1 else 1}
+                               for name, value in legacy_filters_as_list.items()
+                               for i, subvalue in enumerate(value) if not self._pass_filter(name, subvalue)]
+
+        if self.query_filters:
+            # if only traditional filters have been defined, remove last AND from the query.
+            self.query_filters[-1]['separator'] = '' if not self.q else 'AND'
+
+    def _parse_filters(self):
+        if self.legacy_filters:
+            self._parse_legacy_filters()
+        # q filters are rendered as one parenthesised group, so an OR inside q cannot escape the legacy and RBAC
+        # filters ANDed before it
+        self._q_filters_start = len(self.query_filters)
+        if self.q:
+            self._parse_query()
+        if self.search or self.query_filters:
+            self.query += " WHERE " if 'WHERE' not in self.query else ' AND '
+
+    def _process_filter(self, field_name, field_filter, q_filter):
+        if field_name in self.date_fields and not isinstance(q_filter['value'], (int, float)):
+            # Filter a date, only if it is a string and it can be derived into a date.
+            # If it matches the same format as DB (timestamp integer), filter directly by value (next if cond).
+            self._filter_date(q_filter, field_name)
+        elif 'rbac' in field_name:
+            self.query += f"{field_name.lstrip('rbac_')} {q_filter['operator']} (:{field_filter})"
+            self.request[field_filter] = q_filter['value']
+        else:
+            if q_filter['value'] is not None:
+                self.request[field_filter] = q_filter['value'] if field_name != "version" else re.sub(
+                    r'([a-zA-Z])([v])', r'\1 \2', q_filter['value'])
+                if q_filter['operator'] == 'LIKE' and q_filter['field'] not in self.wildcard_equal_fields:
+                    self.request[field_filter] = "%{}%".format(self.request[field_filter])
+                self.query += '{} {} :{}'.format(self.fields[field_name].split(' as ')[0], q_filter['operator'],
+                                                 field_filter)
+                if not field_filter.isdigit():
+                    # filtering without being uppercase/lowercase sensitive
+                    self.query += ' COLLATE NOCASE'
+            else:
+                self.query += '{} IS null'.format(self.fields[field_name])
+
+    def _add_filters_to_query(self):
+        self._parse_filters()
+
+        curr_level = 0
+        last_index = len(self.query_filters) - 1
+        for index, q_filter in enumerate(self.query_filters):
+            self._clean_filter(q_filter)
+            field_name = q_filter['field'].split('$', 1)[0]
+            field_filter = q_filter['field'].replace('.', '_')
+            level = q_filter['level']
+
+            if index == self._q_filters_start:
+                self.query += '('
+
+            # Each filter leaves exactly `level` parentheses open, so the q group is closed by its own ')'
+            repeat_open = max(level + 1 - curr_level, 1)
+
+            self.query += '(' * repeat_open
+
+            self._process_filter(field_name, field_filter, q_filter)
+
+            repeat_close = 1
+            if curr_level > level:
+                repeat_close += curr_level - level
+
+            self.query += ')' * repeat_close
+            if index == last_index and index >= self._q_filters_start:
+                self.query += ')'
+            self.query += ' {} '.format(q_filter['separator'])
+            curr_level = level
+
+        if self.distinct:
+            self.query += ' WHERE ' if not self.q and 'WHERE' not in self.query else ' AND '
+            self.query += ' AND '.join(
+                ["{0} IS NOT null AND {0} != ''".format(self.fields[field]) for field in self.select])
+
+    def _get_total_items(self):
+        query_with_select_fields = self.query.format(','.join(map(lambda x: f"{self.fields[x]} as '{x}'",
+                                                                  self.select | self.min_select_fields)))
+        self.total_items = self.backend.execute(self._default_count_query().format(query_with_select_fields),
+                                                self.request, True)
+
+    def _execute_data_query(self):
+        query_with_select_fields = self.query.format(','.join(map(lambda x: f"{self.fields[x]} as '{x}'",
+                                                                  set(self.select) | self.min_select_fields)))
+
+        self._data = self.backend.execute(query_with_select_fields, self.request)
+
+    def _format_data_into_dictionary(self):
+        return {'items': self._data, 'totalItems': self.total_items}
+
+    def _filter_status(self, status_filter):
+        raise NotImplementedError
+
+    def _filter_date(self, date_filter, filter_db_name):
+        # date_filter['value'] can be either a timeframe or a date in formats %Y-%m-%d, %Y-%m-%d %H:%M:%S or %Y-%m-%dT%H:%M:%SZ
+        if date_filter['value'].isdigit() or re.match(r'\d+[dhms]', date_filter['value']):
+            query_operator = '>' if date_filter['operator'] == '<' or date_filter['operator'] == '=' else '<'
+            self.request[date_filter['field']] = get_timeframe_in_seconds(date_filter['value'])
+            self.query += "{0} IS NOT NULL AND {0} {1}" \
+                          " strftime('%s', 'now') - :{2} ".format(self.fields[filter_db_name],
+                                                                  query_operator,
+                                                                  date_filter['field'])
+        elif re.match(r'\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}:\d{2}(.\d{1,6})?Z?)?', date_filter['value']):
+            self.query += "{0} IS NOT NULL AND {0} {1} strftime('%s', :{2})".format(
+                self.fields[filter_db_name], date_filter['operator'], date_filter['field'])
+            self.request[date_filter['field']] = date_filter['value']
+        else:
+            raise WazuhError(1412, date_filter['value'])
+
+    def general_run(self) -> dict:
+        """Build the query and runs it on the database.
+
+        Returns
+        -------
+        dict
+            Dictionary with the formatted data.
+        """
+        self._add_select_to_query()
+        self._add_filters_to_query()
+        self._add_search_to_query()
+        if self.count:
+            self._get_total_items()
+            if not self.data:
+                return {'totalItems': self.total_items}
+        self._add_sort_to_query()
+        self._add_limit_to_query()
+        if self.data:
+            self._execute_data_query()
+            return self._format_data_into_dictionary()
+
+    def oversized_run(self) -> dict:
+        """Method used when the size of the query exceeds the maximum available in the communication.
+        Builds the query and runs it on the database.
+
+        Returns
+        -------
+        dict
+            Dictionary with the formatted data.
+
+        Raises
+        ------
+        WazuhInternalError(1123)
+            Error communicating with socket. Query too long.
+        """
+        resource = self.oversized_rbac_field
+        if resource is None:
+            raise WazuhInternalError(1123)
+
+        def normalize(value) -> str:
+            return str(value).zfill(3) if self.oversized_rbac_zfill else str(value)
+
+        self._add_select_to_query()
+        original_select = self.select
+        rbac_ids = {normalize(item) for item in self.legacy_filters.pop('rbac_ids', set())}
+        self._add_filters_to_query()
+        self._add_search_to_query()
+        self._add_sort_to_query()
+
+        self.select = [resource]
+        self._add_select_to_query()
+        self._execute_data_query()
+        resources = [normalize(d[resource]) for d in self._data]
+
+        # Resolve the RBAC filter here, keeping only the allowed resources in the query's order. The second pass pages
+        # over this list with its own LIMIT/OFFSET, so it must hold every allowed resource up to the end of the page.
+        maximum_value = len(resources) if self.limit is None else min(self.offset + self.limit, len(resources))
+        final_ids = list()
+        for item in resources:
+            if len(final_ids) >= maximum_value:
+                break
+            if (item not in rbac_ids) if self.rbac_negate else (item in rbac_ids):
+                final_ids.append(item)
+
+        count = len(resources) - len(rbac_ids.intersection(resources)) if self.rbac_negate else \
+            len(rbac_ids.intersection(resources))
+
+        self.select = original_select
+        self.reset()
+
+        # Nothing is allowed. An empty filter would be dropped rather than match nothing, so do not run the query.
+        if not final_ids:
+            return {'items': [], 'totalItems': 0} if self.data else {'totalItems': 0}
+
+        # final_ids holds the allowed resources whatever the original filter was, so the second pass must use IN.
+        original_negate = self.rbac_negate
+        original_count = self.count
+        self.legacy_filters['rbac_ids'] = final_ids
+        self.rbac_negate = False
+        self.count = False
+        try:
+            result = self.general_run()
+        finally:
+            self.rbac_negate = original_negate
+            self.count = original_count
+        if original_count:
+            result['totalItems'] = count
+
+        return result
+
+    def run(self) -> dict:
+        """Generic function that will redirect the information to the function that needs to be used for the specific
+        case.
+
+        Returns
+        -------
+        dict
+            Dictionary with the formatted data.
+        """
+        if self.legacy_filters is None:
+            return self.general_run()
+
+        rbac_ids = set(self.legacy_filters.get('rbac_ids', set()))
+        return self.general_run() if len(','.join(rbac_ids)) < common.MAX_QUERY_FILTERS_RESERVED_SIZE else \
+            self.oversized_run()
+
+    def reset(self):
+        """Reset query to its initial value. Useful when doing several requests to the same DB."""
+        self.query = self._default_query()
+        self.query_filters = []
+        self.select -= self.extra_fields
+
+    def _default_query(self):
+        """Get default query.
+
+        Returns
+        -------
+        str
+            The default query.
+        """
+        return "SELECT {0} FROM " + self.table if not self.distinct else "SELECT DISTINCT {0} FROM " + self.table
+
+    def _default_count_query(self):
+        return "SELECT COUNT(*) FROM ({0})"
+
+    @staticmethod
+    def _pass_filter(field, value):
+        # field is used by child classes containing a field that may have a value equal to 'all'
+        return value == "all"
+
+
+class WazuhDBQueryGroupBy(WazuhDBQuery):
+    """Retrieve unique values for multiple fields using group by."""
+
+    def __init__(self, filter_fields, *args, **kwargs):
+        WazuhDBQuery.__init__(self, *args, **kwargs)
+        self.filter_fields = filter_fields
+
+    def _get_total_items(self):
+        # take total items without grouping, and add the group by clause just after getting total items
+        WazuhDBQuery._get_total_items(self)
+        self.select.add('count')
+        self.inverse_fields['COUNT(*)'] = 'count'
+        self.fields['count'] = 'COUNT(*)'
+        self.query += ' GROUP BY ' + ','.join(map(lambda x: self.fields[x], self.filter_fields['fields']))
+
+    def _add_select_to_query(self):
+        WazuhDBQuery._add_select_to_query(self)
+        self.filter_fields = self._parse_select_filter(self.filter_fields)
+        if not isinstance(self.filter_fields, dict):
+            self.filter_fields = {
+                'fields': set(self.filter_fields)
+            }
+        self.select = self.select & self.filter_fields['fields']
+
+
+def to_relative_path(full_path: str, prefix: str = common.WAZUH_PATH) -> str:
+    """Return a relative path from the Wazuh base directory.
+
+    Parameters
+    ----------
+    full_path : str
+        Absolute path.
+    prefix : str, opt
+        Prefix to strip from the absolute path. Default `common.WAZUH_PATH`
+
+    Returns
+    -------
+    str
+        Relative path to `full_path` from `prefix`.
+    """
+    return path.relpath(full_path, prefix)
+
+
+def clear_temporary_caches():
+    """Clear all saved temporary caches."""
+    t_cache.clear()
+
+
+def temporary_cache():
+    """Apply cache depending on whether function has its `cache` parameter set to `True` or not.
+
+    Returns
+    -------
+    Requested function.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            apply_cache = kwargs.pop('cache', None)
+
+            @cached(cache=t_cache)
+            def f(*_args, **_kwargs):
+                return func(*_args, **_kwargs)
+
+            if apply_cache:
+                return f(*args, **kwargs)
+
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def full_copy(src: str, dst: str, follow_symlinks: bool = True) -> None:
+    """Copy a file maintaining all metadata if possible.
+
+    Parameters
+    ----------
+    src: str
+        Source absolute path.
+    dst: str
+        Destination absolute path.
+    follow_symlinks: bool
+        Make `copy2` follow symbolic links. False otherwise.
+    """
+    file_stat = os.stat(src)
+    copy2(src, dst, follow_symlinks=follow_symlinks)
+    try:
+        # copy2 does not always copy the correct ownership
+        chown(dst, file_stat.st_uid, file_stat.st_gid)
+    except PermissionError:
+        # Tried to assign 'root' ownership without being root. Default API permissions will be applied
+        pass
+
+
+class Timeout:
+    """Raise TimeoutError after n seconds."""
+
+    def __init__(self, seconds, error_message=''):
+        self.seconds = seconds
+        self.error_message = error_message
+
+    def handle_timeout(self, signum, frame):
+        raise TimeoutError(self.error_message)
+
+    def __enter__(self):
+        signal(SIGALRM, self.handle_timeout)
+        alarm(self.seconds)
+
+    def __exit__(self, type, value, traceback):
+        alarm(0)
+
+
+def get_date_from_timestamp(timestamp: float) -> datetime:
+    """Function to return the date in datetime format and UTC timezone.
+
+    Parameters
+    ----------
+    timestamp: float
+        The timestamp.
+
+    Returns
+    -------
+    date: datetime
+        The default date.
+    """
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+
+def get_localtime() -> tzinfo:
+    """Function to return the localtime timezone.
+
+    Returns
+    -------
+    timezone : tzinfo
+        The system localtime timezone. If none is found, UTC is returned.
+    """
+    if (tz := gettz()) is not None:
+        return tz
+
+    return timezone.utc
+
+
+def get_utc_now() -> datetime:
+    """Function to return the current date.
+
+    Returns
+    -------
+    date: datetime
+        The current date.
+    """
+    return datetime.now(timezone.utc)
+
+
+def get_utc_strptime(date: str, datetime_format: str, date_is_at_utc: bool = True) -> datetime:
+    """Function to transform str to date.
+
+    Parameters
+    ----------
+    date: str
+        String to be transformed.
+    datetime_format: str
+        Datetime pattern.
+    date_is_at_utc: bool
+        Whether the input date string is in UTC or not.
+
+    Returns
+    -------
+    date: datetime
+        The current date.
+    """
+
+    dt = datetime.strptime(date, datetime_format)
+
+    if date_is_at_utc:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.replace(tzinfo=get_localtime()).astimezone(timezone.utc)
+
+    return dt

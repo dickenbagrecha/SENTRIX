@@ -1,0 +1,355 @@
+// Helpers for parsing CSV eval files, shared by frontend and backend. Cannot import native modules.
+import logger from './logger';
+import { BaseAssertionTypesSchema } from './types/index';
+import { isJavascriptFile } from './util/fileExtensions';
+import invariant from './util/invariant';
+import { parseCommaSeparatedValues } from './validation/parseCommaSeparatedValues';
+
+import type { Assertion, AssertionType, BaseAssertionTypes, CsvRow, TestCase } from './types/index';
+
+const DEFAULT_SEMANTIC_SIMILARITY_THRESHOLD = 0.8;
+
+let _assertionRegex: RegExp | null = null;
+function getAssertionRegex(): RegExp {
+  if (!_assertionRegex) {
+    // Longer names must be tried first. `similar` is a prefix of `similar:cosine`,
+    // `similar:dot`, and `similar:euclidean`, and the value is also introduced by `:`.
+    // Left-to-right alternation would accept the shorter type and swallow the metric.
+    const assertionTypesRegex = [...BaseAssertionTypesSchema.options]
+      .sort((a, b) => b.length - a.length)
+      .join('|');
+    _assertionRegex = new RegExp(
+      `^(not-)?(${assertionTypesRegex})(?:\\((\\d+(?:\\.\\d+)?)\\))?(?::([\\s\\S]*))?$`,
+    );
+  }
+  return _assertionRegex;
+}
+
+/**
+ * Parse a CSV cell into a finite number, returning `undefined` when the cell is empty
+ * or not a complete numeric literal. Used for threshold fields so that a meaningful `0`
+ * is preserved while a blank/garbage cell is treated as "unset" rather than leaking
+ * `NaN` into the TestCase.
+ */
+function parseFiniteNumber(value: string | undefined): number | undefined {
+  const trimmed = value?.trim() ?? '';
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+    return undefined;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export function assertionFromString(expected: string): Assertion {
+  // Legacy options
+  if (
+    expected.startsWith('javascript:') ||
+    expected.startsWith('fn:') ||
+    expected.startsWith('eval:') ||
+    (expected.startsWith('file://') && isJavascriptFile(expected.slice('file://'.length)))
+  ) {
+    // TODO(1.0): delete eval: legacy option
+    let sliceLength = 0;
+    if (expected.startsWith('javascript:')) {
+      sliceLength = 'javascript:'.length;
+    }
+    if (expected.startsWith('fn:')) {
+      sliceLength = 'fn:'.length;
+    }
+    if (expected.startsWith('eval:')) {
+      sliceLength = 'eval:'.length;
+    }
+
+    const functionBody = expected.slice(sliceLength).trim();
+    return {
+      type: 'javascript',
+      value: functionBody,
+    };
+  }
+  if (expected.startsWith('grade:') || expected.startsWith('llm-rubric:')) {
+    return {
+      type: 'llm-rubric',
+      value: expected.slice(expected.startsWith('grade:') ? 6 : 11),
+    };
+  }
+  if (
+    expected.startsWith('python:') ||
+    (expected.startsWith('file://') && (expected.endsWith('.py') || expected.includes('.py:')))
+  ) {
+    const sliceLength = expected.startsWith('python:') ? 'python:'.length : 'file://'.length;
+    const functionBody = expected.slice(sliceLength).trim();
+    return {
+      type: 'python',
+      value: functionBody,
+    };
+  }
+
+  const regexMatch = expected.match(getAssertionRegex());
+
+  if (regexMatch) {
+    const [_, notPrefix, type, thresholdStr, value] = regexMatch as [
+      string,
+      string,
+      BaseAssertionTypes,
+      string,
+      // Note: whether value is defined depends on the type of assertion.
+      string?,
+    ];
+    const fullType: AssertionType = notPrefix ? `not-${type}` : type;
+    const threshold = parseFiniteNumber(thresholdStr);
+
+    if (
+      type === 'contains-all' ||
+      type === 'contains-any' ||
+      type === 'icontains-all' ||
+      type === 'icontains-any'
+    ) {
+      return {
+        type: fullType as AssertionType,
+        value: value ? parseCommaSeparatedValues(value) : value,
+      };
+    } else if (type === 'contains-json' || type === 'is-json') {
+      return {
+        type: fullType as AssertionType,
+        value,
+      };
+    } else if (
+      type === 'answer-relevance' ||
+      type === 'classifier' ||
+      type === 'context-faithfulness' ||
+      type === 'context-recall' ||
+      type === 'context-relevance' ||
+      type === 'cost' ||
+      type === 'latency' ||
+      type === 'levenshtein' ||
+      type === 'perplexity-score' ||
+      type === 'perplexity' ||
+      type === 'rouge-l' ||
+      type === 'rouge-n' ||
+      type === 'rouge-s' ||
+      type === 'similar' ||
+      type === 'starts-with'
+    ) {
+      const defaultThreshold = type === 'similar' ? DEFAULT_SEMANTIC_SIMILARITY_THRESHOLD : 0.75;
+      return {
+        type: fullType as AssertionType,
+        value: value?.trim?.(),
+        threshold: threshold ?? defaultThreshold,
+      };
+    } else {
+      // Keep an explicit `type(threshold):value` threshold (e.g. llm-rubric, bleu,
+      // javascript) so the handler doesn't silently fall back to its default.
+      return {
+        type: fullType as AssertionType,
+        value: value?.trim?.(),
+        ...(threshold === undefined ? {} : { threshold }),
+      };
+    }
+  }
+
+  // Default to equality
+  return {
+    type: 'equals',
+    value: expected,
+  };
+}
+
+const uniqueErrorMessages = new Set<string>();
+
+export function testCaseFromCsvRow(row: CsvRow): TestCase {
+  const vars: Record<string, string> = {};
+  const asserts: Assertion[] = [];
+  const options: TestCase['options'] = {};
+  const metadata: Record<string, unknown> = {};
+  // Map from assertion index (or '*' for all) to config properties
+  const assertionConfigs: Record<string | number, Record<string, unknown>> = {};
+  let providerOutput: string | Record<string, unknown> | undefined;
+  let description: string | undefined;
+  let metric: string | undefined;
+  let threshold: number | undefined;
+
+  const specialKeys = [
+    'expected',
+    'prefix',
+    'suffix',
+    'description',
+    'providerOutput',
+    'metric',
+    'threshold',
+    'metadata',
+    'config',
+  ].map((k) => `_${k}`);
+
+  // Remove leading and trailing whitespace from keys, as leading/trailing whitespace interferes with
+  // meta key parsing.
+  const sanitizedRows = Object.entries(row).map(([key, value]) => [key.trim(), value]);
+
+  for (const [key, value] of sanitizedRows) {
+    // Check for single underscore usage with reserved keys
+    if (
+      !key.startsWith('__') &&
+      specialKeys.some((k) => key.startsWith(k)) &&
+      !uniqueErrorMessages.has(key)
+    ) {
+      const error = `You used a single underscore for the key "${key}". Did you mean to use "${key.replace('_', '__')}" instead?`;
+      uniqueErrorMessages.add(key);
+      logger.warn(error);
+    }
+    if (key.startsWith('__expected')) {
+      if (value.trim() !== '') {
+        asserts.push(assertionFromString(value.trim()));
+      }
+    } else if (key === '__prefix') {
+      options.prefix = value;
+    } else if (key === '__suffix') {
+      options.suffix = value;
+    } else if (key === '__description') {
+      description = value;
+    } else if (key === '__providerOutput') {
+      providerOutput = value;
+    } else if (key === '__metric') {
+      metric = value;
+    } else if (key === '__threshold') {
+      threshold = parseFiniteNumber(value);
+    } else if (key.startsWith('__metadata:')) {
+      const metadataKey = key.slice('__metadata:'.length);
+      if (metadataKey.endsWith('[]')) {
+        // Handle array metadata with comma splitting and escape support
+        const arrayKey = metadataKey.slice(0, -2);
+        if (value.trim() !== '') {
+          // Split by commas, but respect escaped commas (\,)
+          const values = value
+            .split(/(?<!\\),/)
+            .map((v) => v.trim())
+            .map((v) => v.replace(/\\,/g, ','));
+          metadata[arrayKey] = values;
+        }
+      } else {
+        // Handle single value metadata
+        if (value.trim() !== '') {
+          metadata[metadataKey] = value;
+        }
+      }
+    } else if (key === '__metadata' && !uniqueErrorMessages.has(key)) {
+      uniqueErrorMessages.add(key);
+      logger.warn(
+        'The "__metadata" column requires a key, e.g. "__metadata:category". This column will be ignored.',
+      );
+    } else if (key.startsWith('__config:')) {
+      // Parse __config columns
+      // Formats: __config:__expected:threshold or __config:__expected<N>:threshold
+      const configParts = key.slice('__config:'.length).split(':');
+      if (configParts.length === 2) {
+        const [expectedKey, configKey] = configParts;
+
+        // Parse the expected key to determine which assertion(s) to target
+        let targetIndex: number | undefined;
+        if (expectedKey === '__expected') {
+          // There is only one expected assertion, so we target it directly.
+          targetIndex = 0;
+        } else if (expectedKey.startsWith('__expected')) {
+          // Extract the numeric index (e.g., __expected1 -> 0, __expected2 -> 1)
+          const indexMatch = expectedKey.match(/^__expected(\d+)$/);
+          if (indexMatch) {
+            const oneBasedIndex = Number.parseInt(indexMatch[1], 10);
+            // Indices are 1-based (__expected1 -> 0). Reject 0 so it falls
+            // through to the "positive integer" error below instead of
+            // silently writing the config to assertionConfigs[-1].
+            if (oneBasedIndex >= 1) {
+              targetIndex = oneBasedIndex - 1;
+            }
+          }
+        }
+
+        if (targetIndex === undefined) {
+          logger.error(
+            `Invalid expected key "${expectedKey}" in __config column "${key}". ` +
+              `Must be __expected or __expected<N> where N is a positive integer.`,
+          );
+          throw new Error(`Invalid expected key "${expectedKey}" in __config column`);
+        }
+
+        // Validate the config key; currently only threshold is supported
+        if (!['threshold'].includes(configKey)) {
+          logger.error(
+            `Invalid config key "${configKey}" in __config column "${key}". ` +
+              `Valid config keys include: threshold`,
+          );
+          throw new Error(`Invalid config key "${configKey}" in __config column`);
+        }
+
+        // Initialize config object for this index if it doesn't exist
+        if (!assertionConfigs[targetIndex]) {
+          assertionConfigs[targetIndex] = {};
+        }
+
+        const parsedValue = parseFiniteNumber(value);
+        if (parsedValue === undefined) {
+          logger.error(
+            `Invalid numeric value "${value}" for config key "${configKey}" in column "${key}"`,
+          );
+          throw new Error(`Invalid numeric value for ${configKey}`);
+        }
+
+        assertionConfigs[targetIndex][configKey] = parsedValue;
+      } else {
+        logger.warn(
+          `Invalid __config column format: "${key}". Expected format: __config:__expected:threshold or __config:__expected<N>:threshold`,
+        );
+      }
+    } else {
+      vars[key] = value;
+    }
+  }
+
+  // Apply assertion configurations and metric to assertions
+  for (let i = 0; i < asserts.length; i++) {
+    const assert = asserts[i];
+    assert.metric = metric;
+
+    // Apply index-specific configuration (if exists) - overrides global
+    const indexConfig = assertionConfigs[i];
+    if (indexConfig) {
+      for (const [configKey, configValue] of Object.entries(indexConfig)) {
+        (assert as Record<string, unknown>)[configKey] = configValue;
+        // Include each key/value on the metadata object
+        metadata[configKey] = configValue;
+      }
+    }
+  }
+
+  return {
+    vars,
+    assert: asserts,
+    options,
+    ...(description ? { description } : {}),
+    ...(providerOutput ? { providerOutput } : {}),
+    // Gate on `=== undefined`, not a truthy check: a threshold of 0 is meaningful
+    // ("collect assertion scores without letting failures fail the test") and must
+    // be preserved. parseFiniteNumber already normalizes blank/invalid cells to undefined.
+    ...(threshold === undefined ? {} : { threshold }),
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+  };
+}
+
+/**
+ * Serialize a list of VarMapping objects as a CSV string.
+ * @param vars - The list of VarMapping objects to serialize.
+ * @returns A CSV string.
+ */
+export function serializeObjectArrayAsCSV(vars: object[]): string {
+  invariant(vars.length > 0, 'No variables to serialize');
+  const columnNames = Object.keys(vars[0]).join(',');
+  // This generated test-case dataset is intentionally not formula-escaped because
+  // prefixing a cell would corrupt vars on round-trip. Formula escaping is applied
+  // only by the eval result export path.
+  const rows = vars
+    .map(
+      (result) =>
+        `"${Object.values(result)
+          .map((value) => value.toString().replace(/"/g, '""'))
+          .join('","')}"`,
+    )
+    .join('\n');
+  return [columnNames, rows].join('\n') + '\n';
+}

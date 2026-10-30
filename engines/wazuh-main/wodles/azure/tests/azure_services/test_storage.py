@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is free software; you can redistribute
+# it and/or modify it under the terms of GPLv2
+
+import json
+import re
+import sys
+from datetime import datetime, timedelta
+from hashlib import md5
+from os.path import abspath, dirname, join, realpath
+from typing import Optional
+from unittest.mock import MagicMock, PropertyMock, call, patch
+
+import pytest
+import pytz
+from azure.core.exceptions import AzureError, ClientAuthenticationError, HttpResponseError, ResourceModifiedError
+from azure.storage.blob import BlobType
+from dateutil.parser import parse
+from sqlalchemy import create_engine
+
+sys.path.insert(0, dirname(dirname(dirname(abspath(__file__)))))
+
+from azure_services.storage import get_blobs, start_storage, download_blob
+from db import orm
+import os
+
+PAST_DATE = '2022-01-01T12:00:00.000000Z'
+PRESENT_DATE = '2022-06-15T12:00:00.000000Z'
+FUTURE_DATE = '2022-12-31T12:00:00.000000Z'
+
+TEST_DATA_PATH = join(dirname(dirname(realpath(__file__))), 'data')
+
+
+def create_mocked_blob(blob_name: str, last_modified: datetime = None, content_length: Optional[int] = None):
+    """Return a fake blob with name and creation time.
+
+    Parameters:
+    ----------
+    blob_name : str
+        The name of the fake blob.
+    last_modified : str
+        The last modified time property of the fake blob. datetime.now() will be used if no creation_time is provided.
+    content_length: Optional[int]
+        The content_length property of the fake blob. This property is only set if the length is not None
+
+    Returns
+    -------
+    MagicMock
+         A fake blob.
+    """
+    blob = MagicMock()
+    blob.name = blob_name
+    blob.last_modified = (last_modified if last_modified else datetime.now()).replace(tzinfo=pytz.UTC)
+
+    # Add Blob length property
+    if content_length is not None:
+        blob.size = content_length
+
+    return blob
+
+
+@pytest.mark.parametrize('auth_path, name, key, container_name', [
+    (os.environ.get('INSTALLDIR', '/var/wazuh-manager'), 'name', 'key', 'container')
+])
+@patch('azure_services.storage.get_blobs')
+@patch('azure_services.storage.create_new_row')
+@patch('azure_services.storage.orm.get_row', return_value=None)
+@patch('azure_services.storage.BlobServiceClient')
+@patch('azure_services.storage.read_auth_file')
+def test_start_storage(
+    mock_auth,
+    mock_blob,
+    mock_get_row,
+    mock_create,
+    mock_get_blobs,
+    auth_path,
+    name,
+    key,
+    container_name,
+):
+    """Test start_storage process blobs in bucket as expected."""
+    offset = '1d'
+    args = MagicMock(
+        storage_auth_path=auth_path,
+        account_name=name,
+        account_key=key,
+        container=container_name,
+        storage_time_offset=offset,
+    )
+    mock_create.return_value = MagicMock(min_processed_date=PRESENT_DATE, max_processed_date=PRESENT_DATE)
+    mock_auth.return_value = (name, key)
+    m = MagicMock()
+    m.list_containers.return_value = [MagicMock(name=container_name)]
+    mock_blob.return_value = m
+    start_storage(args)
+
+    mock_auth.assert_called_with(auth_path=auth_path, fields=('account_name', 'account_key'))
+
+    md5_hash = md5(name.encode()).hexdigest()
+    mock_blob.assert_called_with(
+        account_url=f'https://{name}.blob.core.windows.net/',
+        credential={'account_name': name, 'account_key': key}
+    )
+    mock_get_row.assert_called_with(orm.Storage, md5=md5_hash)
+    mock_create.assert_called_with(table=orm.Storage, query=name, md5_hash=md5_hash, offset=offset)
+    mock_get_blobs.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    'container_name, exception',
+    [
+        ('', None),
+        ('', AzureError('')),
+        ('*', ClientAuthenticationError),
+        ('*', AzureError('')),
+        ('*', None),
+    ],
+)
+@patch('azure_utils.logging.error')
+@patch('azure_services.storage.read_auth_file', return_value=('test', 'test'))
+@patch('azure_services.storage.create_new_row', side_effect=orm.AzureORMError)
+@patch('db.orm.get_row', return_value=None)
+@patch('azure_services.storage.BlobServiceClient')
+def test_start_storage_ko(mock_blob, mock_get, mock_create, mock_auth, mock_logging, container_name, exception):
+    """Test start_log_analytics shows error message if get_log_analytics_events returns an HTTP error."""
+    args = MagicMock(
+        storage_auth_path='test',
+        account_name='test',
+        account_key='test',
+        container=container_name,
+        storage_time_offset='',
+    )
+    m = MagicMock()
+    if container_name == '*':
+        m.list_containers.return_value = [MagicMock(name=container_name)]
+        m.list_containers.side_effect = exception
+    else:
+        m.exists.return_value = None
+        m.exists.side_effect = exception
+    mock_blob.return_value = m
+
+    with pytest.raises(SystemExit) as err:
+        start_storage(args)
+    assert err.value.code == 1
+    mock_logging.assert_called_once()
+
+
+@patch('azure_utils.logging.error')
+def test_start_storage_ko_credentials(mock_logging):
+    """Test start_storage stops its execution if no valid credentials are provided."""
+    args = MagicMock(storage_auth_path=None, account_name=None, account_key=None)
+    with pytest.raises(SystemExit) as err:
+        start_storage(args)
+    assert err.value.code == 1
+    mock_logging.assert_called_once()
+
+
+@patch('azure_utils.logging.error')
+def test_start_storage_ko_deprecated_credentials(mock_logging):
+    """Test start_storage stops its execution when deprecated credentials are provided instead of auth_path."""
+    args = MagicMock(storage_auth_path=None, account_name='test', account_key='test')
+    with pytest.raises(SystemExit) as err:
+        start_storage(args)
+    assert err.value.code == 1
+    mock_logging.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    'blob_date, min_date, max_date, desired_date, extension, reparse, json_file, inline, send_events',
+    [
+        # blob_date < desired_date - Blobs should be skipped
+        (
+            PRESENT_DATE,
+            PAST_DATE,
+            PAST_DATE,
+            FUTURE_DATE,
+            None,
+            False,
+            False,
+            False,
+            False,
+        ),
+        # blob_date > desired_date, min_date == blob_date and blob_date < max_date - Blobs should be skipped
+        (
+            PRESENT_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            PAST_DATE,
+            None,
+            False,
+            False,
+            False,
+            False,
+        ),
+        # blob_date > desired_date, min_date < blob_date and blob_date == max_date - Blobs should be skipped
+        (
+            FUTURE_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            PAST_DATE,
+            None,
+            False,
+            False,
+            False,
+            False,
+        ),
+        # blob_date > desired_date, min_date < blob_date and blob_date < max_date - Blobs should be skipped
+        (
+            PAST_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            PAST_DATE,
+            None,
+            False,
+            False,
+            False,
+            False,
+        ),
+        # blob_date < min_datetime - Blobs must be processed
+        (
+            PAST_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            PAST_DATE,
+            None,
+            False,
+            False,
+            False,
+            True,
+        ),
+        # blob_date > max_datetime - Blobs must be processed
+        (
+            FUTURE_DATE,
+            PAST_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            None,
+            False,
+            False,
+            True,
+            True,
+        ),
+        # Reparse old logs
+        (
+            FUTURE_DATE,
+            FUTURE_DATE,
+            FUTURE_DATE,
+            FUTURE_DATE,
+            None,
+            True,
+            False,
+            True,
+            True,
+        ),
+        # Only .json files must be processed
+        (
+            FUTURE_DATE,
+            PAST_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            '.json',
+            False,
+            False,
+            False,
+            True,
+        ),
+        (
+            FUTURE_DATE,
+            PAST_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            '.json',
+            False,
+            False,
+            True,
+            True,
+        ),
+        (
+            FUTURE_DATE,
+            PAST_DATE,
+            PRESENT_DATE,
+            FUTURE_DATE,
+            '.json',
+            False,
+            True,
+            False,
+            True,
+        ),
+    ],
+)
+@patch('azure_services.storage.update_row_object')
+@patch('azure_services.storage.send_message')
+def test_get_blobs(
+    mock_send,
+    mock_update,
+    blob_date,
+    min_date,
+    max_date,
+    desired_date,
+    extension,
+    reparse,
+    json_file,
+    inline,
+    send_events,
+):
+    """Test get_blobs obtains the blobs from a container and send their content to the socket."""
+    blob_date_str = parse(blob_date)
+    blob_list = [create_mocked_blob(blob_name=f'blob_{i}', last_modified=blob_date_str) for i in range(5)] + [
+        create_mocked_blob(blob_name=f'blob_{i}{extension}', last_modified=blob_date_str) for i in range(5)
+    ]
+
+    container_client = MagicMock(name='container_client_mock')
+    container_client.list_blobs.return_value = iter(blob_list)
+
+    if json_file:
+        test_file = 'storage_events_json'
+    elif inline:
+        test_file = 'storage_events_inline'
+    else:
+        test_file = 'storage_events_plain'
+
+    with open(join(TEST_DATA_PATH, test_file)) as f:
+        contents = f.read()
+        data_mock = MagicMock(name='data_mock')
+        data_mock.readall.return_value = contents
+        container_client.download_blob.return_value = data_mock
+
+    service_client = MagicMock(name='service_client_mock')
+    service_client.get_container_client.return_value = container_client
+
+    container_name = 'container'
+    md5_hash = 'hash'
+    tag = 'tag'
+    get_blobs(
+        container_name=container_name,
+        service_client=service_client,
+        md5_hash=md5_hash,
+        min_datetime=parse(min_date),
+        max_datetime=parse(max_date),
+        desired_datetime=parse(desired_date),
+        tag=tag,
+        reparse=reparse,
+        json_file=json_file,
+        json_inline=inline,
+        blob_extension=extension,
+    )
+
+    service_client.get_container_client.assert_called_with(container_name)
+    container_client.list_blobs.assert_called_with(name_starts_with=None)
+    container_client.download_blob.assert_has_calls(
+        [
+            call(blob, offset=None, encoding='UTF-8', max_concurrency=2)
+            for blob in blob_list if extension and extension in blob.name
+        ]
+    )
+    if send_events:
+        calls = list()
+        extension = extension if extension else ''
+        for blob in blob_list:
+            if extension in blob.name:
+                if json_file:
+                    for record in json.loads(contents)['records']:
+                        record['azure_tag'] = 'azure-storage'
+                        record['azure_storage_tag'] = tag
+                        calls.append(call(json.dumps(record)))
+                else:
+                    for line in [s for s in str(contents).splitlines() if s]:
+                        if inline:
+                            calls.append(
+                                call(f'{{"azure_tag": "azure-storage", "azure_storage_tag": "{tag}", {line[1:]}')
+                            )
+                        else:
+                            calls.append(call(f'azure_tag: azure-storage. azure_storage_tag: {tag}. {line}'))
+        mock_send.assert_has_calls(calls)
+        assert (
+            mock_update.call_count == len(blob_list)
+            if not extension
+            else len([blob.name for blob in blob_list if extension in blob.name])
+        )
+
+
+@patch('azure_utils.logging.debug')
+def test_that_empty_blobs_are_omitted(mock_logging):
+    """Test get_blobs checks the size of the blob and omits it if is is empty"""
+    # List of empty blobs to use
+    list_of_empty_blobs = [
+        create_mocked_blob('Example1', content_length=0),
+        create_mocked_blob('Example2', content_length=0),
+    ]
+
+    container_client = MagicMock(name='container_client_mock')
+    container_client.list_blobs.return_value = iter(list_of_empty_blobs)
+
+    # Mock for the service client
+    service_client = MagicMock(name='service_client_mock')
+    service_client.get_container_client.return_value = container_client
+
+    container_name = 'container'
+    md5_hash = 'hash'
+    get_blobs(
+        container_name=container_name,
+        service_client=service_client,
+        md5_hash=md5_hash,
+        min_datetime=parse(PRESENT_DATE),
+        max_datetime=parse(FUTURE_DATE),
+        desired_datetime=parse(FUTURE_DATE),
+        tag='storage_tag',
+        reparse=False,
+        json_file=False,
+        json_inline=False,
+        blob_extension=None,
+    )
+
+    expected_calls = [
+        call('Empty blob Example1, skipping'),
+        call('Empty blob Example2, skipping'),
+    ]
+    mock_logging.assert_has_calls(expected_calls, any_order=False)
+    container_client.download_blob.assert_not_called()
+
+
+@patch('azure_services.storage.update_row_object')
+@patch('azure_services.storage.send_message')
+def test_get_blobs_only_with_prefix(mock_send, mock_update):
+    """Test get_blobs process only the blobs corresponding to a specific prefix, ignoring the rest."""
+    MagicMock(blobs=None, json_file=False, json_inline=False, reparse=False)
+
+    prefix = 'test_prefix'
+    blob_date_str = parse(FUTURE_DATE)
+
+    blob_list = (
+        [create_mocked_blob(blob_name=f'blob_{i}', last_modified=blob_date_str) for i in range(5)]
+        + [create_mocked_blob(blob_name=f'{prefix}/blob_{i}', last_modified=blob_date_str) for i in range(5)]
+        + [create_mocked_blob(blob_name=f'other_prefix/blob_{i}', last_modified=blob_date_str) for i in range(5)]
+    )
+
+    container_client = MagicMock(name='container_client_mock')
+    container_client.list_blobs.return_value = iter(blob_list)
+
+    data_mock = MagicMock(name='data_mock')
+    data_mock.readall.return_value = ''
+    container_client.download_blob.return_value = data_mock
+
+    # Mock for the service client
+    service_client = MagicMock(name='service_client_mock')
+    service_client.get_container_client.return_value = container_client
+
+    container_name = 'container'
+    md5_hash = 'hash'
+
+    get_blobs(
+        container_name=container_name,
+        service_client=service_client,
+        md5_hash=md5_hash,
+        min_datetime=parse(PAST_DATE),
+        max_datetime=parse(PRESENT_DATE),
+        desired_datetime=parse(FUTURE_DATE),
+        prefix=prefix,
+        tag='storage_tag',
+        reparse=False,
+        json_file=False,
+        json_inline=False,
+        blob_extension=None,
+    )
+
+    container_client.list_blobs.assert_called_with(name_starts_with=prefix)
+    container_client.download_blob.assert_has_calls(
+        [call(blob, offset=None, encoding='UTF-8', max_concurrency=2) for blob in blob_list if prefix in blob.name]
+    )
+
+
+@patch('azure_utils.logging.error')
+def test_get_blobs_list_blobs_ko(mock_logging):
+    """Test get_blobs_list_blobs handles exceptions from 'list_blobs'."""
+    container_client = MagicMock(name='container_client_mock')
+    container_client.list_blobs.side_effect = AzureError('')
+    service_client = MagicMock(name='service_client_mock')
+    service_client.get_container_client.return_value = container_client
+
+    with pytest.raises(AzureError):
+        get_blobs(
+            container_name=None,
+            service_client=service_client,
+            md5_hash=None,
+            min_datetime=None,
+            max_datetime=None,
+            desired_datetime=None,
+            tag='storage_tag',
+            reparse=False,
+            json_file=False,
+            json_inline=False,
+            blob_extension=None,
+        )
+    mock_logging.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    'exception',
+    [
+        ValueError,
+        AzureError(''),
+        HttpResponseError,
+    ],
+)
+@patch('azure_services.storage.logging.error')
+@patch('azure_services.storage.update_row_object')
+def test_get_blobs_blob_data_ko(mock_update, mock_logging, exception):
+    """Test get_blobs_list_blobs handles exceptions from 'get_blob_to_text'."""
+    num_blobs = 5
+    blob_list = [create_mocked_blob(blob_name=f'blob_{i}') for i in range(num_blobs)]
+
+    container_client = MagicMock(name='container_client_mock')
+    container_client.list_blobs.return_value = iter(blob_list)
+
+    container_client.download_blob.side_effect = exception
+
+    # Mock for the service client
+    service_client = MagicMock(name='service_client_mock')
+    service_client.get_container_client.return_value = container_client
+
+
+    get_blobs(
+        container_name=None,
+        service_client=service_client,
+        md5_hash=None,
+        min_datetime=None,
+        max_datetime=None,
+        desired_datetime=None,
+        tag='storage_tag',
+        reparse=True,
+        json_file=False,
+        json_inline=False,
+        blob_extension=None,
+    )
+    assert mock_logging.call_count == num_blobs
+    mock_update.assert_not_called()
+
+
+@pytest.mark.parametrize('exception', [json.JSONDecodeError, TypeError, KeyError])
+@patch('azure_services.storage.logging.error')
+@patch('azure_services.storage.loads')
+@patch('azure_services.storage.update_row_object')
+def test_get_blobs_json_ko(mock_update, mock_loads, mock_logging, exception):
+    """Test get_blobs_list_blobs handles exceptions from 'json.loads'."""
+    num_blobs = 5
+    blob_list = [create_mocked_blob(blob_name=f'blob_{i}') for i in range(num_blobs)]
+
+    container_client = MagicMock(name='container_client_mock')
+    container_client.list_blobs.return_value = iter(blob_list)
+
+    data_mock = MagicMock(name='data_mock')
+    data_mock.readall.return_value = 'invalid'
+    container_client.download_blob.return_value = data_mock
+
+    # Mock for the service client
+    service_client = MagicMock(name='service_client_mock')
+    service_client.get_container_client.return_value = container_client
+
+    mock_loads.side_effect = exception
+
+    get_blobs(
+        container_name=None,
+        service_client=service_client,
+        md5_hash=None,
+        min_datetime=None,
+        max_datetime=None,
+        desired_datetime=None,
+        tag='storage_tag',
+        reparse=True,
+        json_file=True,
+        json_inline=False,
+        blob_extension=None,
+    )
+    assert mock_logging.call_count == num_blobs
+    mock_update.assert_not_called()
+
+@ pytest.mark.parametrize("retries", [1, 3])
+def test_download_blob_success(retries):
+    """Test download_blob download blob as expected."""
+    container = MagicMock()
+    blob = create_mocked_blob("blob1")
+    data_mock = MagicMock(name='data_mock', size=7)
+    data_mock.readall.return_value = 'content'
+
+    container.download_blob.return_value = data_mock
+
+    result = download_blob(container, blob, number_of_retries=retries)
+    assert result == ('content', 7)
+    container.download_blob.assert_called_once_with(blob, offset=None, encoding="UTF-8", max_concurrency=2)
+
+
+def test_download_blob_retry_then_success():
+    """Test download_blob retries download after a ResourceModifiedError is raised."""
+    container = MagicMock()
+    blob = create_mocked_blob("blob2")
+    data_mock = MagicMock(name='data_mock', size=7)
+    data_mock.readall.return_value = 'content'
+
+    container.download_blob.side_effect = [ResourceModifiedError("mod"), data_mock]
+
+    result = download_blob(container, blob, number_of_retries=3)
+    assert result == ('content', 7)
+    assert container.download_blob.call_count == 2
+
+
+@pytest.mark.parametrize("exc", [ValueError("bad"), AzureError("az"), HttpResponseError("http")])
+def test_download_blob_fails_immediately_on_other_exceptions(exc):
+    """Test download_blob handle and raise an exception on other exceptions."""
+    container = MagicMock()
+    blob = create_mocked_blob("blob3")
+
+    container.download_blob.side_effect = exc
+
+    with pytest.raises(type(exc)):
+        download_blob(container, blob, number_of_retries=5)
+    container.download_blob.assert_called_once()
+
+
+def test_download_blob_retry_when_modified_while_reading():
+    """Test download_blob retries the download if the blob changes while its contents are read."""
+    container = MagicMock()
+    blob = create_mocked_blob("blob4")
+    modified = MagicMock(name='modified_mock')
+    modified.readall.side_effect = ResourceModifiedError("mod")
+    data_mock = MagicMock(name='data_mock', size=7)
+    data_mock.readall.return_value = 'content'
+
+    container.download_blob.side_effect = [modified, data_mock]
+
+    assert download_blob(container, blob, number_of_retries=3) == ('content', 7)
+    assert container.download_blob.call_count == 2
+
+
+def test_download_blob_retry_then_fail():
+    """Test download_blob raises exception after multiple retries."""
+    container = MagicMock()
+    blob = create_mocked_blob("blob2")
+    data_mock = object()
+
+    container.download_blob.side_effect = [ResourceModifiedError("mod"), ResourceModifiedError("mod"),
+                                           ResourceModifiedError("mod")]
+
+    with pytest.raises(ResourceModifiedError):
+        result = download_blob(container, blob, number_of_retries=3)
+    assert container.download_blob.call_count == 3
+
+
+HOURLY_BLOB = 'tenantId=00000000-0000-0000-0000-000000000000/y=2026/m=10/d=07/h=08/m=00/PT1H.json'
+
+
+class FakeContainer:
+    """In-memory container that serves its blobs like Azure Storage does: every write updates the blob size and
+    last modified time, append blobs only grow, and a blob created again gets a new creation time."""
+
+    def __init__(self):
+        self.blobs = {}
+        self.downloads = []
+        self.failed_reads = 0
+        self.clock = datetime.now(pytz.UTC) - timedelta(hours=1)
+
+    def write(self, name: str, content: str, blob_type: str = BlobType.APPENDBLOB, append: bool = True,
+              keep_creation_time: bool = False):
+        self.clock += timedelta(minutes=1)
+        blob = self.blobs.get(name)
+        if append and blob:
+            blob.update(data=blob['data'] + content.encode(), last_modified=self.clock)
+        else:
+            creation_time = blob['creation_time'] if keep_creation_time and blob else self.clock
+            self.blobs[name] = {
+                'data': content.encode(), 'type': blob_type, 'creation_time': creation_time, 'last_modified': self.clock
+            }
+
+    def exists(self):
+        return True
+
+    def list_blobs(self, name_starts_with=None):
+        listed = []
+        for name, blob in self.blobs.items():
+            item = create_mocked_blob(name, last_modified=blob['last_modified'], content_length=len(blob['data']))
+            item.blob_type = blob['type']
+            item.creation_time = blob['creation_time']
+            listed.append(item)
+        return iter(listed)
+
+    def download_blob(self, blob, offset=None, encoding=None, max_concurrency=1):
+        self.downloads.append(offset)
+        data = self.blobs[blob.name]['data']
+        if offset is not None and offset >= len(data):
+            raise HttpResponseError('The range specified is invalid for the current size of the resource.')
+        data = data[offset or 0:]
+        downloader = MagicMock(name='downloader_mock', size=len(data))
+        if self.failed_reads:
+            # The blob changes while its chunks are downloaded
+            self.failed_reads -= 1
+            downloader.readall.side_effect = ResourceModifiedError('The condition specified was not met.')
+        else:
+            downloader.readall.return_value = data.decode(encoding) if encoding else data
+        return downloader
+
+
+def audit_records(*event_ids: str) -> str:
+    """Return Entra ID audit log records, one JSON object per line, as written to the hourly blobs."""
+    return ''.join(
+        json.dumps({'operationName': 'Add application', 'category': 'AuditLogs', 'properties': {'id': event_id}}) + '\n'
+        for event_id in event_ids
+    )
+
+
+def run_storage(container: FakeContainer, json_inline: bool = True, json_file: bool = False,
+                reparse: bool = False) -> list:
+    """Run the Storage integration once against the given container and return the ids of the events sent."""
+    args = MagicMock(
+        storage_auth_path='auth_path',
+        container='insights-logs-auditlogs',
+        storage_time_offset='24h',
+        prefix=None,
+        storage_tag='tag',
+        reparse=reparse,
+        json_file=json_file,
+        json_inline=json_inline,
+        blobs='.json',
+    )
+    service_client = MagicMock(name='service_client_mock')
+    service_client.get_container_client.return_value = container
+    with patch('azure_services.storage.read_auth_file', return_value=('account', 'key')), \
+            patch('azure_services.storage.BlobServiceClient', return_value=service_client), \
+            patch('azure_services.storage.send_message') as mock_send:
+        start_storage(args)
+    return [event_id for c in mock_send.call_args_list for event_id in re.findall(r'"id": "(\w+)"', c.args[0])]
+
+
+@pytest.fixture
+def in_memory_db():
+    """Point the ORM to an empty in-memory database during the test."""
+    engine = create_engine('sqlite:///', echo=False)
+    session = orm.sessionmaker(bind=engine)()
+    with patch.object(orm, 'engine', engine), patch.object(orm, 'session', session):
+        orm.create_db()
+        yield
+    session.close()
+
+
+@pytest.mark.parametrize('json_inline', [True, False])
+def test_append_blob_only_new_records_are_sent(in_memory_db, json_inline):
+    """Test records appended to a blob after a run are the only ones sent by the next run."""
+    container = FakeContainer()
+    container.write(HOURLY_BLOB, audit_records('E1'))
+    sent_per_run = [run_storage(container, json_inline=json_inline)]
+    container.write(HOURLY_BLOB, audit_records('E2'))
+    sent_per_run.append(run_storage(container, json_inline=json_inline))
+    container.write(HOURLY_BLOB, audit_records('E3'))
+    sent_per_run.append(run_storage(container, json_inline=json_inline))
+    sent_per_run.append(run_storage(container, json_inline=json_inline))
+
+    assert sent_per_run == [['E1'], ['E2'], ['E3'], []]
+
+
+def test_append_blob_reparse_sends_all_records(in_memory_db):
+    """Test the reparse option sends every record of an append blob again."""
+    container = FakeContainer()
+    container.write(HOURLY_BLOB, audit_records('E1'))
+    run_storage(container)
+    container.write(HOURLY_BLOB, audit_records('E2'))
+
+    assert run_storage(container, reparse=True) == ['E1', 'E2']
+
+
+@pytest.mark.parametrize('new_events', [['E9'], ['E7', 'E8', 'E9'], ['E6', 'E7', 'E8', 'E9']])
+def test_append_blob_created_again_is_read_from_the_start(in_memory_db, new_events):
+    """Test a blob deleted and created again with the same name is read from its start, whatever its new size."""
+    container = FakeContainer()
+    container.write(HOURLY_BLOB, audit_records('E1', 'E2', 'E3'))
+    run_storage(container)
+    container.write(HOURLY_BLOB, audit_records(*new_events), append=False)
+
+    assert run_storage(container) == new_events
+
+
+def test_append_blob_smaller_than_its_offset_is_read_from_the_start(in_memory_db):
+    """Test a blob replaced with less data than already processed is read from its start even if it keeps its
+    creation time."""
+    container = FakeContainer()
+    container.write(HOURLY_BLOB, audit_records('E1', 'E2', 'E3'))
+    run_storage(container)
+    container.write(HOURLY_BLOB, audit_records('E9'), append=False, keep_creation_time=True)
+
+    assert run_storage(container) == ['E9']
+
+
+def test_blob_modified_while_downloading_does_not_move_the_bookmark(in_memory_db):
+    """Test a blob that keeps changing while it is downloaded doesn't move the bookmark, so the next run can send it."""
+    container = FakeContainer()
+    container.write(HOURLY_BLOB, audit_records('E1'))
+    container.failed_reads = 3
+
+    assert run_storage(container) == []
+    assert run_storage(container) == ['E1']
+
+
+def test_append_blob_offset_removed_with_the_blob(in_memory_db):
+    """Test the offset of an append blob is removed once the blob is no longer in the container."""
+    container = FakeContainer()
+    next_hour_blob = HOURLY_BLOB.replace('/h=08/', '/h=09/')
+    container.write(HOURLY_BLOB, audit_records('E1'))
+    container.write(next_hour_blob, audit_records('E2'))
+    run_storage(container)
+    del container.blobs[HOURLY_BLOB]
+    run_storage(container)
+
+    assert [row.blob for row in orm.get_all_rows(table=orm.StorageBlobOffset)] == [next_hour_blob]
+
+
+def test_block_blob_replaced_is_sent_again(in_memory_db):
+    """Test a block blob replaced with new content is sent in full, as block blobs are not appended to."""
+    container = FakeContainer()
+    container.write(HOURLY_BLOB, audit_records('E1'), blob_type=BlobType.BLOCKBLOB)
+    run_storage(container)
+    container.write(HOURLY_BLOB, audit_records('E1', 'E2'), blob_type=BlobType.BLOCKBLOB, append=False)
+
+    assert run_storage(container) == ['E1', 'E2']
+
+
+def test_append_blob_json_file_is_read_whole(in_memory_db):
+    """Test blobs holding a single JSON document are always downloaded whole, as they cannot be parsed in parts."""
+    container = FakeContainer()
+    container.write(HOURLY_BLOB, json.dumps({'records': [{'properties': {'id': 'E1'}}]}))
+    assert run_storage(container, json_inline=False, json_file=True) == ['E1']
+    container.write(HOURLY_BLOB, '\n')
+    run_storage(container, json_inline=False, json_file=True)
+
+    assert container.downloads == [None, None]
+

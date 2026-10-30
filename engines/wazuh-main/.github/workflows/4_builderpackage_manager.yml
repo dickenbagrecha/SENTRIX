@@ -1,0 +1,104 @@
+run-name: Package - Build ${{ inputs.system }} wazuh-manager on ${{ inputs.architecture }} ${{ inputs.is_stage && '- is stage' || '' }} ${{ inputs.checksum && '- checksum' || '' }} ${{ inputs.debug && '- debug' || '' }} ${{ inputs.id }}
+name: 4.X - Package - Build Wazuh manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_package:
+        description: |
+          Set to true to upload the package to the S3 bucket. By default is 'true'
+        default: true
+        type: boolean
+        required: false
+      docker_image_tag:
+        description: |
+          Tag name of the Docker image to be downloaded.
+          Use 'developer' to set branch name as tag.
+          Use 'auto' to set branch version as tag.
+          If using a custom tag, use only '-', '_', '.' and alphanumeric characters.
+          Default is 'auto'.
+        default: "auto"
+        type: string
+        required: false
+      architecture:
+        description: |
+          Architecture of the package [amd64, x86_64, arm64, aarch64]
+        type: choice
+        options:
+          - amd64
+          - x86_64
+          - arm64
+          - aarch64
+        required: true
+      system:
+        description: "Package format [deb, rpm]"
+        type: choice
+        options:
+          - deb
+          - rpm
+        required: true
+      revision:
+        description: |
+          Set the value to "1" for packages in release format.
+          You can also add other values, such as issue numbers.
+          By default, it is set to "0" for development.
+        default: "0"
+        type: string
+        required: false
+      is_stage:
+        description: |
+          Build package with release format.
+          By default: false
+        type: boolean
+        required: false
+      debug:
+        description: |
+          Build the binaries as debug (without optimizations).
+          By default: false
+        type: boolean
+        required: false
+      checksum:
+        description: Generate package checksum.
+        type: boolean
+        required: false
+      id:
+        type: string
+        description: |
+          ID used to identify the workflow uniquely.
+        required: false
+
+  workflow_call:
+    inputs:
+      docker_image_tag:
+        required: false
+        default: "auto"
+        type: string
+      architecture:
+        type: string
+        required: true
+      system:
+        type: string
+        required: true
+      revision:
+        default: "0"
+        type: string
+        required: false
+      is_stage:
+        type: boolean
+        required: false
+      debug:
+        type: boolean
+        required: false
+      checksum:
+        type: boolean
+        required: false
+      id:
+        type: string
+        required: false
+
+jobs:
+  deprecated:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Warning
+        run: echo "This workflow is deprecated. Be careful, you have just run it from main."
